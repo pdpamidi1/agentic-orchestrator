@@ -1,0 +1,138 @@
+# ---------------------------------------------------------------------------
+# policy.yaml — governance for the agentic SDLC orchestrator
+# Agents propose and execute inside these boundaries; gates verify; humans approve high-impact
+# actions and own final quality. Every rule is enforced by engine/policy_engine.py and every
+# decision it makes is a POLICY_DECISION trace event, so the audit log explains itself.
+# ---------------------------------------------------------------------------
+version: 1
+
+autonomy:
+  default_level: propose_and_execute        # propose_only | propose_and_execute  (never: autonomous)
+  high_impact_actions:                      # always pause with AWAITING_APPROVAL
+    - plan.approve
+    - schema.migration
+    - api.contract.breaking_change
+    - dependency.major_version
+    - infrastructure.change                 # k8s manifests, helm, terraform, compose for non-local
+    - secrets.or_config
+    - release.config
+    - release.merge
+  auto_approve_in_replay: true              # replay mode only; live runs never auto-approve
+
+budgets:
+  max_tokens_per_run: 500000
+  max_cost_usd_per_run: 10.00
+  max_wall_clock_minutes: 60
+  max_attempts_per_task: 3
+  max_replans_per_run: 2
+  node_timeout_seconds: 900
+  parallelism: 4
+
+retries:
+  backoff: exponential
+  initial_delay_seconds: 3
+  max_delay_seconds: 60
+  retry_on: [gate.failed, executor.transient, llm.schema_invalid]
+  never_retry_on: [policy.violation, human.reject, budget.exceeded]
+  on_exhausted: fallback_or_rollback        # run node.fallback if defined, else rollback then continue
+
+rollback:
+  strategy: git_revert_task_commits         # one commit per task on branch run/<run_id>
+  preserve_rejected_diffs: true             # runs/<id>/rejected/<task>.patch
+
+safe_stop:
+  triggers: [budget.exceeded, policy.violation, gate.repeated_failure, human.reject, replan.limit_reached, diagnose.unrecoverable]
+  behaviour: persist_state_then_halt        # resumable after human review
+
+change_control:
+  allowed_paths:                            # agents may write here freely
+    - "src/**"
+    - "tests/**"
+    - "docs/**"
+    - "README.md"
+    - "openapi.yaml"
+    - "src/main/resources/openapi.yaml"
+  protected_paths:                          # writable only via a high-impact approval (action in brackets)
+    - "pom.xml"                             # [dependency.major_version] when a major changes; minor/patch allowed
+    - "pyproject.toml"                      # [dependency.major_version]
+    - "**/db/migration/**"                  # [schema.migration]
+    - "alembic/**"                          # [schema.migration]
+    - "Dockerfile"                          # [infrastructure.change]
+    - "k8s/**"                              # [infrastructure.change]
+    - "helm/**"                             # [infrastructure.change]
+    - ".github/workflows/**"                # [release.config]
+    - "**/application*.y*ml"                # [secrets.or_config]
+  forbidden_paths:                          # never writable by an agent under any approval
+    - ".env*"
+    - ".git/**"
+    - "**/*.pem"
+    - "**/*.key"
+    - "secrets/**"
+  max_files_changed_per_task: 15
+  max_lines_changed_per_task: 800
+  require_tests_for: ["src/**"]
+
+sandbox:
+  branch_prefix: "run/"
+  allowed_commands: ["mvn", "./mvnw", "pytest", "ruff", "mypy", "python", "git", "docker compose", "ls", "cat", "grep", "find"]
+  forbidden_commands: ["rm -rf", "curl", "wget", "ssh", "scp", "sudo", "chmod", "kubectl", "terraform"]
+  network: { default: deny, allow: ["repo.maven.apache.org", "pypi.org", "files.pythonhosted.org"] }
+  env_passthrough: []
+
+security:
+  secret_patterns:
+    - "AKIA[0-9A-Z]{16}"
+    - "-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----"
+    - "(?i)(password|secret|api[_-]?key|token)\\s*[:=]\\s*['\"][^'\"]{8,}"
+  banned_code_patterns:
+    java:   ["Runtime\\.getRuntime\\(\\)\\.exec", "ProcessBuilder", "createNativeQuery\\(.*\\+", "@CrossOrigin\\(\\s*\"\\*\"", "TrustAllCerts", "System\\.exit"]
+    python: ["\\beval\\(", "\\bexec\\(", "subprocess\\.(run|Popen)\\(.*shell=True", "pickle\\.loads", "verify=False", "allow_origins=\\[\\\"\\*\\\"\\]"]
+  dependency_allowlist:
+    java:   ["org.springframework*", "org.flywaydb:*", "org.postgresql:*", "io.lettuce:*", "org.testcontainers:*", "com.tngtech.archunit:*", "org.junit*", "org.assertj:*", "org.mockito:*", "io.micrometer:*", "org.springdoc:*", "com.bucket4j:*", "org.apache.kafka:*"]
+    python: ["fastapi", "uvicorn", "pydantic*", "sqlalchemy", "asyncpg", "alembic", "redis", "aiokafka", "httpx", "pytest*", "testcontainers*", "structlog"]
+  license_allowlist: ["Apache-2.0", "MIT", "BSD-3-Clause", "EPL-2.0", "PSF-2.0"]
+
+compliance:
+  pii:
+    forbidden_in_persistence: ["raw_ip_address", "full_user_agent"]
+    required_transforms: { ip_address: "sha256_salted" }
+  logging:
+    forbidden_in_logs: ["long_url_query_params", "raw_ip_address", "authorization_header"]
+  data_retention_days: { click_events: 90 }
+
+# Gate commands per target stack. `internal:` gates are implemented in engine/gates.py.
+# required=true blocks; required=false warns and surfaces at the next approval.
+gates:
+  scope:        { required: true,  cmd: "internal:diff_scope" }
+  security:     { required: true,  cmd: "internal:secret_and_pattern_scan" }
+  contract:     { required: true,  cmd: "internal:openapi_diff" }
+  acceptance:   { required: false, cmd: "internal:llm_acceptance_review" }
+  release:      { required: true,  cmd: "internal:release_checklist" }
+  compile:
+    java:   { required: true,  cmd: "./mvnw -q -DskipTests compile" }
+    python: { required: true,  cmd: "python -m compileall -q src" }
+  style:
+    java:   { required: false, cmd: "./mvnw -q spotless:check" }
+    python: { required: false, cmd: "ruff check src tests && mypy src" }
+  architecture:
+    java:   { required: true,  cmd: "./mvnw -q -Dtest=ArchitectureTest test" }
+    python: { required: true,  cmd: "pytest -q tests/test_architecture.py" }   # import-linter style rules
+  unit:
+    java:   { required: true,  cmd: "./mvnw -q test", coverage_floor_changed: 0.60 }
+    python: { required: true,  cmd: "pytest -q tests/unit --cov=src --cov-fail-under=60" }
+  integration:
+    java:   { required: true,  cmd: "./mvnw -q -Pit verify" }
+    python: { required: true,  cmd: "pytest -q tests/integration" }            # testcontainers
+
+observability:
+  trace_sinks: [jsonl, db]                  # jsonl: runs/<id>/trace.jsonl ; db: trace_event table
+  kafka_topic: sdlc.trace.events            # only when profile kafka is active
+  metrics: [task_success_rate, retry_count, rollback_count, mttr_seconds, e2e_latency_seconds, llm_cost_usd, human_checkpoints, replans]
+  slo: { e2e_latency_seconds_p50: 1200, task_success_rate_min: 0.80 }
+
+claude_code:                                # ClaudeCodeCliExecutor settings
+  permission_mode: acceptEdits
+  max_turns: 25
+  allowed_tools: ["Read", "Edit", "Write", "Grep", "Glob", "Bash(./mvnw *)", "Bash(pytest*)", "Bash(git diff*)", "Bash(git status*)"]
+  disallowed_tools: ["Bash(rm *)", "Bash(curl *)", "Bash(git push*)", "WebFetch", "WebSearch"]
+  system_prompt_file: specs/templates/executor-system-prompt.md

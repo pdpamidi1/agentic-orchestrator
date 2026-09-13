@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+runs/*/sandbox/
+runs/sdlc.db
+workspace/
+.venv/
+*.egg-info/

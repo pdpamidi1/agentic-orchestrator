@@ -1,0 +1,149 @@
+# ---------------------------------------------------------------------------
+# workflow.yaml — the explicit SDLC dependency graph
+#
+# The engine loads this file; nothing about the graph is hard-coded in Python.
+# node kinds:
+#   agent      LLM-backed stage producing a typed artifact (structured output)
+#   executor   applies TaskSpecs to the sandbox (Claude Code CLI or SDK)
+#   gate       deterministic checks (commands + internal checks from policy.yaml)
+#   approval   pauses the run until a human decides (high-impact action)
+#   input      pauses the run until a human answers questions (ambiguity)
+# fields:
+#   depends_on     explicit edges; all must be PASSED before the node is READY
+#   produces       artifact names this node writes into cross-stage context
+#   invalidated_by artifact names whose change forces this node (and downstream) to re-run
+#   parallel_group nodes in the same group are run concurrently and joined by their dependents
+#   fallback       node id to run if this node exhausts retries (instead of halting)
+#   rollback       strategy the composition root's RollbackHook applies when retries are exhausted and no fallback
+#   high_impact    action name from policy.autonomy.high_impact_actions (adds an approval entry gate)
+# ---------------------------------------------------------------------------
+version: 1
+entry: requirement
+nodes:
+
+  requirement:
+    kind: agent
+    agent: requirements
+    depends_on: []
+    produces: [spec]
+    doc: "Intake + normalization: intent, ambiguities, acceptance criteria, non-goals, assumptions"
+
+  clarify:
+    kind: input
+    depends_on: [requirement]
+    when: "spec.ambiguities is non-empty"        # otherwise SKIPPED
+    produces: [spec]                              # emits spec v2 -> triggers invalidation downstream
+    invalidated_by: [requirement_text]
+
+  planning:
+    kind: agent
+    agent: planner
+    depends_on: [clarify]
+    produces: [plan]
+    invalidated_by: [spec]
+    doc: "Task DAG with dependencies, parallel groups, impact levels, allowed files, DoD"
+
+  architecture:
+    kind: agent
+    agent: architecture
+    depends_on: [planning]
+    produces: [design]                            # api_contract + data_model + class_structure
+    invalidated_by: [spec, plan]
+
+  impact:                                         # brownfield only; SKIPPED when workspace is empty
+    kind: agent
+    agent: impact
+    depends_on: [planning]
+    when: "workspace.has_code"
+    produces: [impact]
+    invalidated_by: [spec]
+
+  security_review:
+    kind: agent
+    agent: security
+    depends_on: [architecture]
+    parallel_group: pre_impl_review
+    produces: [security_findings]
+    invalidated_by: [design]
+
+  risk_analysis:
+    kind: agent
+    agent: risk
+    depends_on: [architecture, impact]
+    parallel_group: pre_impl_review
+    produces: [risk_register]
+    invalidated_by: [design, impact]
+
+  approval_design:
+    kind: approval
+    high_impact: plan.approve
+    depends_on: [security_review, risk_analysis]   # join of the parallel review group
+    summary_from: [plan, design, security_findings, risk_register]
+
+  implementation:
+    kind: executor
+    depends_on: [approval_design]
+    produces: [changeset]
+    invalidated_by: [plan, design]
+    retries: { max_attempts: 3, backoff: exponential }
+    rollback: git_revert_task_commits
+    doc: "Runs plan.tasks respecting task-level depends_on; tasks with impact_level=HIGH raise their own approval"
+
+  unit_tests:
+    kind: gate
+    gates: [scope, compile, style, security, architecture, unit]
+    depends_on: [implementation]
+    parallel_group: post_impl
+    invalidated_by: [changeset]
+
+  code_review:
+    kind: agent
+    agent: reviewer
+    depends_on: [implementation]
+    parallel_group: post_impl
+    produces: [review]
+    invalidated_by: [changeset]
+    advisory: true
+
+  integration_tests:
+    kind: gate
+    gates: [integration, contract]
+    depends_on: [implementation]
+    parallel_group: post_impl
+    invalidated_by: [changeset]
+
+  validation:
+    kind: gate
+    gates: [acceptance]                            # rolls up the three above + acceptance criteria check
+    depends_on: [unit_tests, code_review, integration_tests]
+    produces: [validation_result]
+    fallback: diagnose                             # FAIL path
+
+  diagnose:
+    kind: agent
+    agent: diagnoser
+    depends_on: [validation]
+    produces: [diagnosis]                          # decides: retry implementation | replan | halt
+    on_result:
+      retry:  { invalidate: [changeset] }          # implementation re-runs with structured feedback
+      replan: { invalidate: [plan] }               # planning and everything downstream re-run (bounded by max_replans)
+      halt:   { safe_stop: diagnose.unrecoverable }
+
+  documentation:
+    kind: agent
+    agent: documenter
+    depends_on: [validation]
+    produces: [docs]
+    invalidated_by: [changeset, design]
+
+  release_readiness:
+    kind: gate
+    gates: [release]                               # Dockerfile builds, CI workflow present, changelog, openapi committed, report generated
+    depends_on: [documentation, validation]
+    produces: [run_report]
+
+  approval_release:
+    kind: approval
+    high_impact: release.merge
+    depends_on: [release_readiness]
+    summary_from: [run_report, validation_result, review]
