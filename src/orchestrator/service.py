@@ -16,6 +16,7 @@ from .executors.base import CodeExecutor
 from .executors.claude_code_cli import ClaudeCodeCliExecutor
 from .executors.replay import ReplayExecutor
 from .llm.client import AnthropicClient, LLMClient, RecordingClient, ReplayClient
+from .llm.fake import FakeClient
 from .models import RunState, load_policy
 from .sandbox.git import GitSandbox
 from .store.file_store import FileStore
@@ -55,18 +56,40 @@ class OrchestratorService:
         self.trace = JsonlSink(self.s.runs_dir)
         self.runs: dict[str, LiveRun] = {}
 
-    def _runner(self, replay: bool, record: bool) -> Runner:
-        api_key = self.s.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
+    def _api_key(self) -> str | None:
+        return self.s.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
+
+    def _mode(self, replay: bool) -> str:
+        """How agents are backed for this run: --replay wins, then SDLC_LLM, then key presence.
+
+        Only "replay" enables replay semantics (auto-approve, default answers); "fake" is a live run
+        whose agents happen to be canned, so every human checkpoint still pauses.
+        """
+        if replay:
+            return "replay"
+        if self.s.llm != "auto":
+            return self.s.llm
+        return "anthropic" if self._api_key() else "replay"
+
+    def _runner(self, mode: str, record: bool) -> Runner:
         llm: LLMClient
         executor: CodeExecutor
-        if replay or not api_key:
+        if mode == "fake":
+            llm = FakeClient()
+            executor = ReplayExecutor(self.s.cache_dir / "changesets")  # TASKS T3 swaps in a fake executor
+        elif mode == "replay":
             llm = ReplayClient(self.s.cache_dir / "llm")
             executor = ReplayExecutor(self.s.cache_dir / "changesets")
-        else:
+        elif mode == "anthropic":
+            api_key = self._api_key()
+            if not api_key:
+                raise RuntimeError("SDLC_LLM=anthropic requires ANTHROPIC_API_KEY (or use SDLC_LLM=fake)")
             llm = AnthropicClient(self.s.model, api_key)
             if record:
                 llm = RecordingClient(llm, self.s.cache_dir / "llm")
             executor = ClaudeCodeCliExecutor()
+        else:
+            raise ValueError(f"unknown llm mode {mode!r}")
         return Runner(self.graph, build_handlers(llm, executor), self.store, GitRollback())
 
     async def start(
@@ -79,6 +102,7 @@ class OrchestratorService:
         extra: dict[str, str] | None = None,
     ) -> LiveRun:
         run_id = f"{scenario}-{uuid.uuid4().hex[:8]}"
+        mode = self._mode(replay)
         text = requirement_text or (self.s.specs_dir / f"{scenario}.md").read_text(encoding="utf-8")
         sandbox = self.s.runs_dir / run_id / "sandbox"
         sandbox.mkdir(parents=True, exist_ok=True)
@@ -89,7 +113,7 @@ class OrchestratorService:
             sandbox=sandbox,
             trace=self.trace,
             target_stack=self.s.target_stack,
-            replay=replay or not (self.s.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")),
+            replay=mode == "replay",
         )
         ctx.put("requirement_text", text, "intake")
         for k, v in (extra or {}).items():
@@ -97,7 +121,7 @@ class OrchestratorService:
         state = RunState(run_id=run_id, scenario=scenario, nodes=self.graph.initial_statuses())
         live = LiveRun(ctx, state)
         self.runs[run_id] = live
-        live.state = await self._runner(replay, record).run(ctx, state)
+        live.state = await self._runner(mode, record).run(ctx, state)
         await self._persist_artifacts(live)
         return live
 
@@ -106,14 +130,16 @@ class OrchestratorService:
         node = self.graph.nodes.get(node_id)
         action = node.high_impact if node is not None and node.high_impact else "task.high_impact"
         await self.store.record_approval(run_id, node_id, action, "APPROVED", who)
-        live.state = await self._runner(live.ctx.replay, False).approve(live.ctx, live.state, node_id, who)
+        live.state = await self._runner(self._mode(live.ctx.replay), False).approve(
+            live.ctx, live.state, node_id, who
+        )
         await self._persist_artifacts(live)
         return live
 
     async def reject(self, run_id: str, node_id: str, reason: str, who: str = "human") -> LiveRun:
         live = self.runs[run_id]
         await self.store.record_approval(run_id, node_id, "-", "REJECTED", who)
-        live.state = await self._runner(live.ctx.replay, False).reject(
+        live.state = await self._runner(self._mode(live.ctx.replay), False).reject(
             live.ctx, live.state, node_id, who, reason
         )
         return live
@@ -121,7 +147,7 @@ class OrchestratorService:
     async def answer(self, run_id: str, answers: dict[str, str], who: str = "human") -> LiveRun:
         live = self.runs[run_id]
         node_id = next(n for n, st in live.state.nodes.items() if st.value == "AWAITING_INPUT")
-        live.state = await self._runner(live.ctx.replay, False).answer(
+        live.state = await self._runner(self._mode(live.ctx.replay), False).answer(
             live.ctx, live.state, node_id, answers, who
         )
         await self._persist_artifacts(live)

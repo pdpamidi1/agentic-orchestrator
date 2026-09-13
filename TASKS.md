@@ -6,7 +6,7 @@ Status legend: [ ] todo · [~] in progress · [x] done
 ## Day 1 — make the loop real
 - [x] **T1 Bootstrap**: `make install && make test && make lint`. Fix anything the starter left broken (the engine tests in
       `tests/` are the spec for `engine/`). Do not weaken a test to make it pass; fix the engine.
-- [ ] **T2 Stub agents (offline loop)**: add `llm/fake.py` (`FakeClient`) returning canned artifacts per schema, and a
+- [x] **T2 Stub agents (offline loop)**: add `llm/fake.py` (`FakeClient`) returning canned artifacts per schema, and a
       `SDLC_LLM=fake` setting. `sdlc run --scenario greenfield` must reach `approval_design` with no network.
 - [ ] **T3 Sandbox executor for the fake loop**: `executors/fake.py` writes a trivial file + test into the sandbox and commits.
       Prove: implementation -> gates -> validation -> release_ready -> approval_release end to end with `SDLC_LLM=fake`.

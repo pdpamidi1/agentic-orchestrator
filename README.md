@@ -17,6 +17,8 @@ make install
 make test                                   # engine, policy, metrics tests
 make run                                    # API on :8080
 sdlc run --scenario greenfield --replay     # no API key; uses runs/cache
+SDLC_LLM=fake make run                      # API with canned agents (no key, no cache); then:
+sdlc run --scenario greenfield              #   pauses at approval_design like a live run
 sdlc approve <run_id> approval_design
 sdlc metrics <run_id>
 sdlc graph | pbcopy                         # mermaid of the DAG

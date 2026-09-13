@@ -13,6 +13,7 @@
 | Gates | Ordered validation: scope → compile → style → security → architecture → unit → integration → contract → acceptance(advisory) → release | `engine/gates.py`, `policy.yaml#gates` |
 | Agents | Requirements, planner, architecture, impact, security, risk, reviewer, diagnoser, documenter — prompt + schema | `agents/`, `prompts/` |
 | Executors | Claude Code CLI (primary), replay (recorded patches) | `executors/` |
+| LLM client | One `structured()` call shape, four backings: `anthropic` (tool-forced JSON + repair loop), `replay` (cached responses, replay semantics), `fake` (canned artifacts per schema, live semantics, no network), `recording` (anthropic + cache write). Chosen by `--replay`, then `SDLC_LLM`, then key presence | `llm/`, `service.py#_mode` |
 | Context | Versioned artifacts + lineage, feedback, answers, approvals | `engine/context.py` |
 | State | `RunState` persisted on every transition | `models/state.py`, `store/` |
 | Trace | Append-only events (jsonl, memory; Postgres/Kafka in TASKS) | `trace/` |
@@ -58,6 +59,7 @@ layering rules → ArchUnit/import-linter, acceptance criteria → test names.
 | Closed `Outcome` set + `match` | Exceptions / status strings | Every transition is enumerable and testable; a new behaviour is a new `case`, visible in review |
 | Claude Code CLI executor with policy-scoped tools; SDK client for agents | Only SDK diffs | Mirrors how engineers use Claude Code day to day; tool permissions are policy, not prompt |
 | Replay mode (recorded LLM responses + patches) | Live-only demo | Reproducible, key-less, CI-able golden runs |
+| Fake LLM (`SDLC_LLM=fake`, canned artifacts, live checkpoint semantics) | Mocking agents per test | Exercises the real graph, handlers and approvals offline before any prompt is recorded |
 | Metrics derived from trace | Counters / separate table | One source of truth; answers "why", not just "how many" |
 | git branch per run, commit per task, revert on rollback | FS snapshots | Native, inspectable, matches human rollback |
 | Frozen Pydantic artifacts with versions | Mutable shared dict | Lineage is free; invalidation is a version bump |
