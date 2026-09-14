@@ -26,6 +26,9 @@ from dataclasses import dataclass, field
 from ..models.policy import Policy
 from ..models.validation import Finding
 
+# files that are prose, not code: exempt from the persistence rule of the PII scan
+DOC_SUFFIXES = (".md", ".markdown", ".adoc", ".rst", ".txt")
+
 
 def matches(path: str, patterns: list[str]) -> bool:
     """Public alias of ``_match``: does ``path`` match any of the glob ``patterns``? (used by handlers)."""
@@ -272,6 +275,8 @@ class PolicyEngine:
         - ``compliance.pii`` when a ``compliance.pii.forbidden_in_persistence`` term appears anywhere in a
           file, case-insensitively and with ``_`` matching ``_``, a space or nothing (``raw_ip_address``
           also catches ``rawIpAddress``-style spellings only partially; ``raw ip address`` fully).
+          Documentation (``DOC_SUFFIXES``) is exempt: a README that says "raw_ip_address is never stored"
+          persists nothing, and the rule is about persistence.
 
         Returns every finding (no early exit) so the next attempt sees the complete list.
         """
@@ -303,6 +308,8 @@ class PolicyEngine:
                         )
         pii = (self.p.compliance.get("pii") or {}).get("forbidden_in_persistence", [])
         for path, content in files.items():
+            if path.lower().endswith(DOC_SUFFIXES):
+                continue  # prose cannot persist a field; only code, schemas and config can
             for term in pii:
                 if re.search(term.replace("_", "[_ ]?"), content, re.IGNORECASE):
                     out.append(

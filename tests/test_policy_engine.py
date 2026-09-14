@@ -34,6 +34,12 @@ def test_security_scan(policy) -> None:  # type: ignore[no-untyped-def]
     )
     rules = {x.rule for x in f}
     assert rules == {"security.secret", "security.banned_pattern", "compliance.pii"}
+    # documentation about the rule is not a violation of it (README.md tripped compliance.pii live)
+    docs = pe.scan({"README.md": "raw_ip_address is never persisted; only a salted hash is.\n"})
+    assert docs == []
+    assert [x.rule for x in pe.scan({"docs/x.md": "raw_ip_address", "src/m.py": "raw_ip_address"})] == [
+        "compliance.pii"
+    ]
 
 
 def test_command_allowlist(policy) -> None:  # type: ignore[no-untyped-def]
