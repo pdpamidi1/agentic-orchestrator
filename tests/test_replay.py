@@ -22,6 +22,7 @@ from orchestrator.models.trace import Kind
 from orchestrator.sandbox.git import GitSandbox
 from orchestrator.service import OrchestratorService
 from orchestrator.trace.metrics import compute
+from orchestrator.trace.sink import InMemorySink
 
 
 async def test_cache_key_ignores_run_ids(tmp_path: Path) -> None:
@@ -134,3 +135,33 @@ async def test_recording_executor_reuses_a_recorded_task(tmp_path: Path, ctx: Ru
     assert (other.sandbox / "src/shortener/t1.py").exists()
     ev = [e for e in ctx.trace.events("r2") if e.kind == Kind.EXECUTOR_CALL]
     assert ev and ev[-1].status == "REUSED" and ev[-1].payload["patch"] == "T1.attempt1.patch"
+
+
+async def test_relative_cache_dir_still_applies_patches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """runs/cache is a path relative to the orchestrator root; git apply runs inside the sandbox."""
+    monkeypatch.chdir(tmp_path)
+    plan, design = Plan.model_validate(CANNED["Plan"]), Design.model_validate(CANNED["Design"])
+    ctx = RunContext(
+        run_id="r1",
+        scenario="greenfield",
+        policy=OrchestratorService(settings(tmp_path)).policy,
+        sandbox=tmp_path / "runs" / "r1" / "sandbox",
+        trace=InMemorySink(),
+        target_stack="python",
+    )
+    await GitSandbox(ctx.sandbox).ensure_repo()
+    cache = Path("runs/cache/changesets")  # relative, as Settings.cache_dir is by default
+    assert isinstance(
+        await RecordingExecutor(FakeExecutor(plant=None), cache).execute(ctx, plan.tasks[0], design, None),
+        Done,
+    )
+    other = RunContext(
+        run_id="r2", scenario="greenfield", policy=ctx.policy, sandbox=tmp_path / "runs" / "r2" / "sandbox",
+        trace=ctx.trace, target_stack="python",
+    )  # fmt: skip
+    await GitSandbox(other.sandbox).ensure_repo()
+    replayed = await ReplayExecutor(cache).execute(other, plan.tasks[0], design, None)
+    assert isinstance(replayed, Done), replayed
+    assert (other.sandbox / "src/shortener/t1.py").exists()

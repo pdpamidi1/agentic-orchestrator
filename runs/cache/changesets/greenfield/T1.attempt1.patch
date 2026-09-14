@@ -1,9 +1,9 @@
 diff --git a/pom.xml b/pom.xml
 new file mode 100644
-index 0000000..b43f722
+index 0000000..f424658
 --- /dev/null
 +++ b/pom.xml
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,271 @@
 +<?xml version="1.0" encoding="UTF-8"?>
 +<project xmlns="http://maven.apache.org/POM/4.0.0"
 +         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -13,37 +13,45 @@ index 0000000..b43f722
 +  <parent>
 +    <groupId>org.springframework.boot</groupId>
 +    <artifactId>spring-boot-starter-parent</artifactId>
-+    <version>4.0.3</version>
++    <version>4.0.0</version>
 +    <relativePath/>
 +  </parent>
 +
 +  <groupId>com.example</groupId>
 +  <artifactId>url-shortener</artifactId>
 +  <version>0.1.0-SNAPSHOT</version>
-+  <packaging>jar</packaging>
 +  <name>url-shortener</name>
-+  <description>URL shortener service (Spring Boot 4 / Java 25, Postgres + Redis)</description>
++  <description>URL shortener service (Spring Boot 4 / Java 25)</description>
 +
 +  <properties>
 +    <java.version>25</java.version>
 +    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 +    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
 +
-+    <springdoc.version>3.0.1</springdoc.version>
++    <springdoc.version>3.0.0</springdoc.version>
 +    <springdoc-maven-plugin.version>1.5</springdoc-maven-plugin.version>
 +    <testcontainers-redis.version>2.2.4</testcontainers-redis.version>
-+    <spotless.version>2.46.1</spotless.version>
-+    <google-java-format.version>1.28.0</google-java-format.version>
++    <spotless.version>2.44.4</spotless.version>
++    <google-java-format.version>1.27.0</google-java-format.version>
 +
-+    <!-- Port used only by the `it` profile for the springdoc OpenAPI dump (avoids clashing with a local :8080). -->
-+    <it.server.port>18080</it.server.port>
-+    <!-- Tag of the official postgres image used by the Testcontainers JDBC URL (jdbc:tc:postgresql:<tag>:///...)
-+         when the `it` profile boots the app for the OpenAPI dump. -->
-+    <it.postgres.tag>17-alpine</it.postgres.tag>
++    <!--
++      Integration-test ("it") profile knobs. The application is started once from the *test*
++      classpath so that the springdoc OpenAPI dump can be taken from the running app. The
++      datasource defaults to a Testcontainers JDBC URL: the PostgreSQL container is started on
++      demand by org.testcontainers.jdbc.ContainerDatabaseDriver and reaped when the JVM stops.
++      Later tasks may point it.app.mainClass at a Testcontainers-backed test launcher instead
++      (e.g. com.example.shortener.it.TestUrlShortenerApplication) without touching the profile.
++    -->
++    <it.app.mainClass>com.example.shortener.UrlShortenerApplication</it.app.mainClass>
++    <it.app.port>8080</it.app.port>
++    <it.datasource.url>jdbc:tc:postgresql:17-alpine:///shortener</it.datasource.url>
++    <it.datasource.driver>org.testcontainers.jdbc.ContainerDatabaseDriver</it.datasource.driver>
++    <it.datasource.username>test</it.datasource.username>
++    <it.datasource.password>test</it.datasource.password>
 +  </properties>
 +
 +  <dependencies>
-+    <!-- Web (Spring Boot 4 name of spring-boot-starter-web: Spring MVC on the servlet stack, ADR-013) -->
++    <!-- Web / API -->
 +    <dependency>
 +      <groupId>org.springframework.boot</groupId>
 +      <artifactId>spring-boot-starter-webmvc</artifactId>
@@ -52,8 +60,13 @@ index 0000000..b43f722
 +      <groupId>org.springframework.boot</groupId>
 +      <artifactId>spring-boot-starter-validation</artifactId>
 +    </dependency>
++    <dependency>
++      <groupId>org.springdoc</groupId>
++      <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
++      <version>${springdoc.version}</version>
++    </dependency>
 +
-+    <!-- Persistence: JPA over Postgres, schema managed by Flyway (ADR-010) -->
++    <!-- Persistence -->
 +    <dependency>
 +      <groupId>org.springframework.boot</groupId>
 +      <artifactId>spring-boot-starter-data-jpa</artifactId>
@@ -76,17 +89,10 @@ index 0000000..b43f722
 +      <scope>runtime</scope>
 +    </dependency>
 +
-+    <!-- Redis: batched counter + read-through URL cache (ADR-001, ADR-006) -->
++    <!-- Cache / counter -->
 +    <dependency>
 +      <groupId>org.springframework.boot</groupId>
 +      <artifactId>spring-boot-starter-data-redis</artifactId>
-+    </dependency>
-+
-+    <!-- OpenAPI document served at /v3/api-docs(.yaml) and dumped by the `it` profile -->
-+    <dependency>
-+      <groupId>org.springdoc</groupId>
-+      <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
-+      <version>${springdoc.version}</version>
 +    </dependency>
 +
 +    <!-- Test -->
@@ -102,12 +108,12 @@ index 0000000..b43f722
 +    </dependency>
 +    <dependency>
 +      <groupId>org.testcontainers</groupId>
-+      <artifactId>testcontainers-junit-jupiter</artifactId>
++      <artifactId>testcontainers-postgresql</artifactId>
 +      <scope>test</scope>
 +    </dependency>
 +    <dependency>
 +      <groupId>org.testcontainers</groupId>
-+      <artifactId>testcontainers-postgresql</artifactId>
++      <artifactId>testcontainers-junit-jupiter</artifactId>
 +      <scope>test</scope>
 +    </dependency>
 +    <dependency>
@@ -125,7 +131,7 @@ index 0000000..b43f722
 +        <artifactId>spring-boot-maven-plugin</artifactId>
 +      </plugin>
 +
-+      <!-- Unit tests only: *IT classes are excluded so `./mvnw -q test` never needs Docker. -->
++      <!-- Unit tests only: `./mvnw test` never needs Docker. -->
 +      <plugin>
 +        <groupId>org.apache.maven.plugins</groupId>
 +        <artifactId>maven-surefire-plugin</artifactId>
@@ -139,8 +145,7 @@ index 0000000..b43f722
 +        </configuration>
 +      </plugin>
 +
-+      <!-- Style gate: `./mvnw -q spotless:check` (advisory). sdlc/ArchitectureTest.java is orchestrator-generated
-+           and must not be edited by hand, so it is excluded from formatting. -->
++      <!-- `./mvnw spotless:check` / `./mvnw spotless:apply` -->
 +      <plugin>
 +        <groupId>com.diffplug.spotless</groupId>
 +        <artifactId>spotless-maven-plugin</artifactId>
@@ -152,7 +157,8 @@ index 0000000..b43f722
 +              <include>src/test/java/**/*.java</include>
 +            </includes>
 +            <excludes>
-+              <exclude>src/test/java/sdlc/**</exclude>
++              <!-- Generated by the orchestrator from the design; never edited by hand. -->
++              <exclude>src/test/java/sdlc/**/*.java</exclude>
 +            </excludes>
 +            <googleJavaFormat>
 +              <version>${google-java-format.version}</version>
@@ -170,15 +176,12 @@ index 0000000..b43f722
 +
 +  <profiles>
 +    <!--
-+      Integration profile: `./mvnw -q -Pit verify`
-+        pre-integration-test  : spring-boot:start boots the application on ${it.server.port} using the test
-+                                classpath and a Testcontainers JDBC URL (jdbc:tc:postgresql:...) so Postgres is
-+                                started on demand without any extra code or committed credentials. Redis is not
-+                                required at startup (connections are lazy; the cache and counter degrade).
-+        integration-test      : springdoc-openapi-maven-plugin dumps /v3/api-docs.yaml to target/openapi.yaml,
-+                                then maven-failsafe-plugin runs **/*IT.java (Testcontainers Postgres + Redis).
-+        post-integration-test : spring-boot:stop.
-+        verify                : failsafe:verify fails the build on IT failures.
++      `./mvnw -Pit verify`
++        1. pre-integration-test : spring-boot:start boots the app (test classpath, Testcontainers PostgreSQL)
++        2. integration-test     : springdoc dumps target/openapi.json + target/openapi.yaml,
++                                  failsafe runs **/*IT.java
++        3. post-integration-test: spring-boot:stop
++        4. verify               : failsafe:verify fails the build on IT failures
 +    -->
 +    <profile>
 +      <id>it</id>
@@ -189,24 +192,27 @@ index 0000000..b43f722
 +            <artifactId>spring-boot-maven-plugin</artifactId>
 +            <executions>
 +              <execution>
-+                <id>start-app-for-openapi-dump</id>
++                <id>start-app-for-it</id>
 +                <phase>pre-integration-test</phase>
 +                <goals>
 +                  <goal>start</goal>
 +                </goals>
 +                <configuration>
++                  <mainClass>${it.app.mainClass}</mainClass>
 +                  <useTestClasspath>true</useTestClasspath>
-+                  <wait>1000</wait>
-+                  <maxAttempts>180</maxAttempts>
-+                  <arguments>
-+                    <argument>--server.port=${it.server.port}</argument>
-+                    <argument>--spring.datasource.url=jdbc:tc:postgresql:${it.postgres.tag}:///shortener</argument>
-+                    <argument>--spring.datasource.driver-class-name=org.testcontainers.jdbc.ContainerDatabaseDriver</argument>
-+                  </arguments>
++                  <maxAttempts>240</maxAttempts>
++                  <wait>500</wait>
++                  <systemPropertyVariables>
++                    <server.port>${it.app.port}</server.port>
++                    <spring.datasource.url>${it.datasource.url}</spring.datasource.url>
++                    <spring.datasource.driver-class-name>${it.datasource.driver}</spring.datasource.driver-class-name>
++                    <spring.datasource.username>${it.datasource.username}</spring.datasource.username>
++                    <spring.datasource.password>${it.datasource.password}</spring.datasource.password>
++                  </systemPropertyVariables>
 +                </configuration>
 +              </execution>
 +              <execution>
-+                <id>stop-app-after-openapi-dump</id>
++                <id>stop-app-after-it</id>
 +                <phase>post-integration-test</phase>
 +                <goals>
 +                  <goal>stop</goal>
@@ -221,19 +227,30 @@ index 0000000..b43f722
 +            <version>${springdoc-maven-plugin.version}</version>
 +            <executions>
 +              <execution>
-+                <id>dump-openapi</id>
++                <id>openapi-json</id>
 +                <phase>integration-test</phase>
 +                <goals>
 +                  <goal>generate</goal>
 +                </goals>
++                <configuration>
++                  <apiDocsUrl>http://localhost:${it.app.port}/v3/api-docs</apiDocsUrl>
++                  <outputDir>${project.build.directory}</outputDir>
++                  <outputFileName>openapi.json</outputFileName>
++                </configuration>
++              </execution>
++              <execution>
++                <id>openapi-yaml</id>
++                <phase>integration-test</phase>
++                <goals>
++                  <goal>generate</goal>
++                </goals>
++                <configuration>
++                  <apiDocsUrl>http://localhost:${it.app.port}/v3/api-docs.yaml</apiDocsUrl>
++                  <outputDir>${project.build.directory}</outputDir>
++                  <outputFileName>openapi.yaml</outputFileName>
++                </configuration>
 +              </execution>
 +            </executions>
-+            <configuration>
-+              <apiDocsUrl>http://localhost:${it.server.port}/v3/api-docs.yaml</apiDocsUrl>
-+              <outputFileName>openapi.yaml</outputFileName>
-+              <outputDir>${project.build.directory}</outputDir>
-+              <skip>false</skip>
-+            </configuration>
 +          </plugin>
 +
 +          <plugin>
@@ -246,7 +263,6 @@ index 0000000..b43f722
 +            </configuration>
 +            <executions>
 +              <execution>
-+                <id>integration-tests</id>
 +                <goals>
 +                  <goal>integration-test</goal>
 +                  <goal>verify</goal>
@@ -261,10 +277,10 @@ index 0000000..b43f722
 +</project>
 diff --git a/src/main/java/com/example/shortener/UrlShortenerApplication.java b/src/main/java/com/example/shortener/UrlShortenerApplication.java
 new file mode 100644
-index 0000000..61e3dc5
+index 0000000..d63c973
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/UrlShortenerApplication.java
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,16 @@
 +package com.example.shortener;
 +
 +import com.example.shortener.config.ShortenerProperties;
@@ -272,13 +288,7 @@ index 0000000..61e3dc5
 +import org.springframework.boot.autoconfigure.SpringBootApplication;
 +import org.springframework.boot.context.properties.EnableConfigurationProperties;
 +
-+/**
-+ * Spring Boot 4 entry point of the URL shortener.
-+ *
-+ * <p>Holds no business logic. The read and write surfaces live in one artifact and are selected
-+ * with the {@code read} / {@code write} Spring profiles (ADR-007); with no profile active both are
-+ * served.
-+ */
++/** Entry point of the URL shortener service. */
 +@SpringBootApplication
 +@EnableConfigurationProperties(ShortenerProperties.class)
 +public class UrlShortenerApplication {
@@ -289,172 +299,154 @@ index 0000000..61e3dc5
 +}
 diff --git a/src/main/java/com/example/shortener/config/ShortenerProperties.java b/src/main/java/com/example/shortener/config/ShortenerProperties.java
 new file mode 100644
-index 0000000..9395a52
+index 0000000..d1d0434
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/config/ShortenerProperties.java
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,58 @@
 +package com.example.shortener.config;
 +
-+import jakarta.validation.Valid;
 +import jakarta.validation.constraints.Min;
 +import jakarta.validation.constraints.NotBlank;
 +import jakarta.validation.constraints.NotNull;
-+import jakarta.validation.constraints.Pattern;
 +import java.time.Duration;
 +import org.springframework.boot.context.properties.ConfigurationProperties;
 +import org.springframework.boot.context.properties.bind.DefaultValue;
 +import org.springframework.validation.annotation.Validated;
 +
 +/**
-+ * Application settings bound from the {@code shortener.*} prefix.
++ * Application settings bound from the {@code shortener.*} namespace.
 + *
-+ * <p>This class is a leaf: it depends on nothing inside the application. Documented defaults:
++ * <p>This class is a configuration leaf: it depends on nothing inside the application.
 + *
-+ * <ul>
-+ *   <li>{@code shortener.base-url} = {@value #DEFAULT_BASE_URL}: prefix of every generated short
-+ *       URL.
-+ *   <li>{@code shortener.counter.batch-size} = {@value #DEFAULT_COUNTER_BATCH_SIZE}: size of the
-+ *       range reserved per Redis {@code INCRBY} (ADR-001).
-+ *   <li>{@code shortener.counter.seed-offset} = {@value #DEFAULT_COUNTER_SEED_OFFSET}: 62^3, added
-+ *       to every counter value so generated codes are at least three characters (AMB-11, ADR-004).
-+ *   <li>{@code shortener.cache.default-ttl} = 24h: upper bound of a cache entry's TTL when the
-+ *       mapping has no (or a later) expiry (AMB-9, ADR-005).
-+ *   <li>{@code shortener.cache.key-prefix} = {@value #DEFAULT_CACHE_KEY_PREFIX}: Redis key prefix
-+ *       of cached short-code to long-URL entries.
-+ * </ul>
-+ *
-+ * @param baseUrl public base URL used to build {@code short_url}; must not end with a slash
-+ * @param counter batched Redis counter settings
-+ * @param cache read-through URL cache settings
++ * @param baseUrl public base URL used to render short links (default {@code
++ *     http://localhost:8080}); a trailing slash is stripped by {@link #baseUrl()}
++ * @param counterBatchSize number of counter values reserved from Redis per batch (default 1000)
++ * @param cacheTtl default TTL of cached short-code lookups (default 24h, AMB-9)
++ * @param counterSeedOffset value added to the raw counter before encoding so the very first codes
++ *     are neither trivially short nor guessable (AMB-11); the default {@code 62^5 = 916_132_832}
++ *     yields base62 codes of at least six characters
 + */
 +@Validated
 +@ConfigurationProperties(prefix = "shortener")
 +public record ShortenerProperties(
-+    @DefaultValue(DEFAULT_BASE_URL) @NotBlank @Pattern(regexp = "^https?://.+[^/]$") String baseUrl,
-+    @DefaultValue @Valid @NotNull Counter counter,
-+    @DefaultValue @Valid @NotNull Cache cache) {
++    @NotBlank @DefaultValue(DEFAULT_BASE_URL) String baseUrl,
++    @Min(1) @DefaultValue("1000") int counterBatchSize,
++    @NotNull @DefaultValue("24h") Duration cacheTtl,
++    @Min(0) @DefaultValue("916132832") long counterSeedOffset) {
 +
-+  /** Default value of {@code shortener.base-url}. */
++  /** Default public base URL. */
 +  public static final String DEFAULT_BASE_URL = "http://localhost:8080";
 +
-+  /** Default value of {@code shortener.counter.batch-size}. */
++  /** Default size of a Redis counter batch. */
 +  public static final int DEFAULT_COUNTER_BATCH_SIZE = 1000;
 +
-+  /** Default value of {@code shortener.counter.seed-offset}: 62^3. */
-+  public static final long DEFAULT_COUNTER_SEED_OFFSET = 238_328L;
-+
-+  /** Default value of {@code shortener.cache.default-ttl} (AMB-9). */
++  /** Default cache TTL (AMB-9). */
 +  public static final Duration DEFAULT_CACHE_TTL = Duration.ofHours(24);
 +
-+  /** Default value of {@code shortener.cache.key-prefix}. */
-+  public static final String DEFAULT_CACHE_KEY_PREFIX = "shortener:url:";
++  /** Default counter seed offset (AMB-11): {@code 62^5}. */
++  public static final long DEFAULT_COUNTER_SEED_OFFSET = 916_132_832L;
 +
-+  /**
-+   * Settings of the short-code counter.
-+   *
-+   * @param batchSize number of counter values reserved per Redis {@code INCRBY}; at least 1
-+   * @param seedOffset value added to every counter value before base62 encoding; non-negative
-+   */
-+  public record Counter(
-+      @DefaultValue("" + DEFAULT_COUNTER_BATCH_SIZE) @Min(1) int batchSize,
-+      @DefaultValue("" + DEFAULT_COUNTER_SEED_OFFSET) @Min(0) long seedOffset) {}
++  /** Canonical constructor; normalises the base URL by removing any trailing slashes. */
++  public ShortenerProperties {
++    if (baseUrl != null) {
++      baseUrl = stripTrailingSlashes(baseUrl);
++    }
++  }
 +
-+  /**
-+   * Settings of the Redis read-through cache.
-+   *
-+   * @param defaultTtl TTL used when a mapping never expires, and the ceiling of the TTL otherwise
-+   * @param keyPrefix prefix of the Redis keys holding cached short-code to long-URL entries
-+   */
-+  public record Cache(
-+      @DefaultValue("24h") @NotNull Duration defaultTtl,
-+      @DefaultValue(DEFAULT_CACHE_KEY_PREFIX) @NotBlank String keyPrefix) {}
++  private static String stripTrailingSlashes(String value) {
++    String result = value;
++    while (result.endsWith("/")) {
++      result = result.substring(0, result.length() - 1);
++    }
++    return result;
++  }
 +}
 diff --git a/src/main/resources/application-read.yml b/src/main/resources/application-read.yml
 new file mode 100644
-index 0000000..78d896b
+index 0000000..51d6b55
 --- /dev/null
 +++ b/src/main/resources/application-read.yml
-@@ -0,0 +1,15 @@
-+# Profile "read": the redirect surface only.
+@@ -0,0 +1,22 @@
++# "read" deployment profile: the redirect surface.
 +#
-+#   ./mvnw spring-boot:run -Dspring-boot.run.profiles=read
-+#   SPRING_PROFILES_ACTIVE=read java -jar url-shortener.jar
-+#
-+# Registered under this profile: GET /{short_code} (redirectToLongUrl) and its Redis read-through cache.
-+# Not registered: POST /api/v1/urls (write controllers are @Profile("!read")), so a POST answers 404
-+# (AC-14). The read surface never allocates short codes and never writes to Postgres; it serves from
-+# the Redis cache first and falls back to Postgres on a miss or when Redis is unreachable.
-+#
-+# All connection settings are inherited from application.yml and overridable via SHORTENER_* variables.
++# Instances started with SPRING_PROFILES_ACTIVE=read only register the read-side beans
++# (@Profile("read")): short-code lookup, cache read-through and 3xx redirects.
++# They never allocate short codes, so no counter batches are reserved from Redis.
++# Scale these horizontally behind the public hostname configured in shortener.base-url.
 +
 +spring:
-+  application:
-+    name: url-shortener-read
++  config:
++    activate:
++      on-profile: read
++  jpa:
++    properties:
++      hibernate:
++        connection:
++          provider_disables_autocommit: true
++
++server:
++  # Redirect-heavy traffic; keep connections cheap.
++  tomcat:
++    threads:
++      max: 200
 diff --git a/src/main/resources/application-write.yml b/src/main/resources/application-write.yml
 new file mode 100644
-index 0000000..ca1e892
+index 0000000..d8ba462
 --- /dev/null
 +++ b/src/main/resources/application-write.yml
-@@ -0,0 +1,14 @@
-+# Profile "write": the link-creation surface only.
+@@ -0,0 +1,16 @@
++# "write" deployment profile: the short-link creation surface.
 +#
-+#   ./mvnw spring-boot:run -Dspring-boot.run.profiles=write
-+#   SPRING_PROFILES_ACTIVE=write java -jar url-shortener.jar
-+#
-+# Registered under this profile: POST /api/v1/urls (createShortUrl), the batched Redis counter and the
-+# Postgres sequence fallback (code_source = redis | db_sequence). Not registered: GET /{short_code}
-+# (read controllers are @Profile("!write")), so a redirect request answers 404 (AC-14).
-+#
-+# All connection settings are inherited from application.yml and overridable via SHORTENER_* variables.
++# Instances started with SPRING_PROFILES_ACTIVE=write only register the write-side beans
++# (@Profile("write")): URL validation, short-code allocation from the Redis counter (in batches
++# of shortener.counter-batch-size, seeded by shortener.counter-seed-offset) and persistence.
++# Fewer instances are needed here than on the read side; each one owns its counter batch.
 +
 +spring:
-+  application:
-+    name: url-shortener-write
++  config:
++    activate:
++      on-profile: write
++
++server:
++  tomcat:
++    threads:
++      max: 50
 diff --git a/src/main/resources/application.yml b/src/main/resources/application.yml
 new file mode 100644
-index 0000000..88ccebc
+index 0000000..3f6a64e
 --- /dev/null
 +++ b/src/main/resources/application.yml
-@@ -0,0 +1,58 @@
-+# Shared configuration of the URL shortener (all profiles).
-+#
-+# Deployment profiles (ADR-007):
-+#   (none)  - default: both the write surface (POST /api/v1/urls) and the read surface (GET /{short_code})
-+#   write   - only the write surface; read controllers are not registered  (see application-write.yml)
-+#   read    - only the read surface;  write controllers are not registered (see application-read.yml)
-+#
-+# Every connection setting can be overridden through the environment variables named below. The
-+# values after the ':' are local development defaults only; real deployments must supply their own.
+@@ -0,0 +1,46 @@
++# Shared configuration for every deployment surface.
++# Deployment-specific settings live in application-read.yml / application-write.yml
++# (activate with SPRING_PROFILES_ACTIVE=read or SPRING_PROFILES_ACTIVE=write).
++# Only local development defaults appear here; real credentials come from the environment.
 +
 +spring:
 +  application:
 +    name: url-shortener
-+
 +  datasource:
 +    url: ${SHORTENER_DB_URL:jdbc:postgresql://localhost:5432/shortener}
 +    username: ${SHORTENER_DB_USERNAME:shortener}
-+    password: ${SHORTENER_DB_PASSWORD:}
-+    hikari:
-+      maximum-pool-size: ${SHORTENER_DB_POOL_SIZE:10}
-+
++    password: ${SHORTENER_DB_PASSWORD:shortener}
 +  jpa:
 +    open-in-view: false
 +    hibernate:
-+      # The schema is owned by Flyway (ADR-010); Hibernate only validates the mapping.
 +      ddl-auto: validate
-+
 +  flyway:
 +    enabled: true
 +    locations: classpath:db/migration
-+
 +  data:
 +    redis:
 +      host: ${SHORTENER_REDIS_HOST:localhost}
 +      port: ${SHORTENER_REDIS_PORT:6379}
-+      timeout: ${SHORTENER_REDIS_TIMEOUT:500ms}
++      timeout: 2s
 +
 +server:
 +  port: ${SERVER_PORT:8080}
++  error:
++    include-message: never
++    include-stacktrace: never
 +
 +springdoc:
 +  api-docs:
@@ -463,125 +455,94 @@ index 0000000..88ccebc
 +    path: /swagger-ui.html
 +
 +shortener:
-+  # Public prefix of generated short URLs (no trailing slash).
++  # Public base URL used to build short links (no trailing slash).
 +  base-url: ${SHORTENER_BASE_URL:http://localhost:8080}
-+  counter:
-+    # Values reserved per Redis INCRBY (ADR-001). Unused values are discarded on restart (AMB-10).
-+    batch-size: ${SHORTENER_COUNTER_BATCH_SIZE:1000}
-+    # 62^3, so every generated code is at least three characters (AMB-11, ADR-004).
-+    seed-offset: ${SHORTENER_COUNTER_SEED_OFFSET:238328}
-+  cache:
-+    # TTL = min(remaining time to expires_at, default-ttl) (AMB-9, ADR-005).
-+    default-ttl: ${SHORTENER_CACHE_DEFAULT_TTL:24h}
-+    key-prefix: "shortener:url:"
++  # Counter values reserved from Redis per batch (INCRBY step).
++  counter-batch-size: 1000
++  # Default TTL for cached short-code lookups (AMB-9).
++  cache-ttl: 24h
++  # Offset added to the raw counter before base62 encoding (AMB-11); 62^5 => codes of >= 6 chars.
++  counter-seed-offset: 916132832
 diff --git a/src/test/java/com/example/shortener/config/ShortenerPropertiesTest.java b/src/test/java/com/example/shortener/config/ShortenerPropertiesTest.java
 new file mode 100644
-index 0000000..01652f7
+index 0000000..a6fd58f
 --- /dev/null
 +++ b/src/test/java/com/example/shortener/config/ShortenerPropertiesTest.java
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,77 @@
 +package com.example.shortener.config;
 +
 +import static org.assertj.core.api.Assertions.assertThat;
-+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 +
 +import java.time.Duration;
-+import java.util.Map;
 +import org.junit.jupiter.api.Test;
 +import org.springframework.boot.context.properties.EnableConfigurationProperties;
-+import org.springframework.boot.context.properties.bind.Binder;
-+import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
++import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 +import org.springframework.boot.test.context.runner.ApplicationContextRunner;
++import org.springframework.context.annotation.Configuration;
 +
 +/**
-+ * Unit tests of the documented defaults and binding of {@link ShortenerProperties}; no database.
++ * Verifies the documented defaults of {@link ShortenerProperties} using a plain application context
++ * (no web server, no database, no Redis).
 + */
 +class ShortenerPropertiesTest {
 +
-+  private static ShortenerProperties bind(Map<String, String> properties) {
-+    return new Binder(new MapConfigurationPropertySource(properties))
-+        .bindOrCreate("shortener", ShortenerProperties.class);
++  @EnableConfigurationProperties(ShortenerProperties.class)
++  @Configuration(proxyBeanMethods = false)
++  static class PropertiesConfig {}
++
++  private final ApplicationContextRunner runner =
++      new ApplicationContextRunner().withUserConfiguration(PropertiesConfig.class);
++
++  @Test
++  void codeDefaultsApplyWhenNothingIsConfigured() {
++    runner.run(
++        context -> {
++          ShortenerProperties props = context.getBean(ShortenerProperties.class);
++          assertThat(props.baseUrl()).isEqualTo("http://localhost:8080");
++          assertThat(props.counterBatchSize()).isEqualTo(1000);
++          assertThat(props.cacheTtl()).isEqualTo(Duration.ofHours(24));
++          assertThat(props.counterSeedOffset()).isEqualTo(916_132_832L);
++        });
 +  }
 +
 +  @Test
-+  void defaultsMatchTheDocumentedValues() {
-+    ShortenerProperties properties = bind(Map.of());
-+
-+    assertThat(properties.baseUrl()).isEqualTo("http://localhost:8080");
-+    assertThat(properties.counter().batchSize()).isEqualTo(1000);
-+    assertThat(properties.counter().seedOffset()).isEqualTo(238_328L);
-+    assertThat(properties.cache().defaultTtl()).isEqualTo(Duration.ofHours(24));
-+    assertThat(properties.cache().keyPrefix()).isEqualTo("shortener:url:");
-+  }
-+
-+  @Test
-+  void seedOffsetIsSixtyTwoCubed() {
-+    assertThat(ShortenerProperties.DEFAULT_COUNTER_SEED_OFFSET).isEqualTo(62L * 62L * 62L);
-+    assertThat(bind(Map.of()).counter().seedOffset())
-+        .isEqualTo(ShortenerProperties.DEFAULT_COUNTER_SEED_OFFSET);
-+  }
-+
-+  @Test
-+  void relaxedPropertyNamesOverrideEveryDefault() {
-+    ShortenerProperties properties =
-+        bind(
-+            Map.of(
-+                "shortener.base-url", "https://sho.rt",
-+                "shortener.counter.batch-size", "250",
-+                "shortener.counter.seed-offset", "0",
-+                "shortener.cache.default-ttl", "5m",
-+                "shortener.cache.key-prefix", "test:url:"));
-+
-+    assertThat(properties.baseUrl()).isEqualTo("https://sho.rt");
-+    assertThat(properties.counter().batchSize()).isEqualTo(250);
-+    assertThat(properties.counter().seedOffset()).isZero();
-+    assertThat(properties.cache().defaultTtl()).isEqualTo(Duration.ofMinutes(5));
-+    assertThat(properties.cache().keyPrefix()).isEqualTo("test:url:");
-+  }
-+
-+  @Test
-+  void partialOverrideKeepsTheRemainingDefaults() {
-+    ShortenerProperties properties = bind(Map.of("shortener.counter.batch-size", "50"));
-+
-+    assertThat(properties.counter().batchSize()).isEqualTo(50);
-+    assertThat(properties.counter().seedOffset()).isEqualTo(238_328L);
-+    assertThat(properties.baseUrl()).isEqualTo("http://localhost:8080");
-+    assertThat(properties.cache().defaultTtl()).isEqualTo(Duration.ofHours(24));
-+  }
-+
-+  @Test
-+  void beanIsRegisteredAndValidatedByTheApplicationContext() {
-+    new ApplicationContextRunner()
-+        .withUserConfiguration(PropertiesConfiguration.class)
++  void applicationYamlDocumentsTheSameDefaults() {
++    runner
++        .withInitializer(new ConfigDataApplicationContextInitializer())
 +        .run(
 +            context -> {
-+              assertThat(context).hasSingleBean(ShortenerProperties.class);
-+              ShortenerProperties properties = context.getBean(ShortenerProperties.class);
-+              assertThat(properties.baseUrl()).isEqualTo("http://localhost:8080");
-+              assertThat(properties.counter().batchSize()).isEqualTo(1000);
-+              assertThat(properties.cache().defaultTtl()).isEqualTo(Duration.ofHours(24));
++              ShortenerProperties props = context.getBean(ShortenerProperties.class);
++              assertThat(props.baseUrl()).isEqualTo(ShortenerProperties.DEFAULT_BASE_URL);
++              assertThat(props.counterBatchSize())
++                  .isEqualTo(ShortenerProperties.DEFAULT_COUNTER_BATCH_SIZE);
++              assertThat(props.cacheTtl()).isEqualTo(ShortenerProperties.DEFAULT_CACHE_TTL);
++              assertThat(props.counterSeedOffset())
++                  .isEqualTo(ShortenerProperties.DEFAULT_COUNTER_SEED_OFFSET);
 +            });
 +  }
 +
 +  @Test
-+  void invalidValuesAreRejectedByBeanValidation() {
-+    new ApplicationContextRunner()
-+        .withUserConfiguration(PropertiesConfiguration.class)
-+        .withPropertyValues("shortener.counter.batch-size=0")
-+        .run(context -> assertThat(context).hasFailed());
-+
-+    new ApplicationContextRunner()
-+        .withUserConfiguration(PropertiesConfiguration.class)
-+        .withPropertyValues("shortener.base-url=http://localhost:8080/")
-+        .run(context -> assertThat(context).hasFailed());
++  void propertiesOverrideDefaultsAndBaseUrlLosesTrailingSlash() {
++    runner
++        .withPropertyValues(
++            "shortener.base-url=https://sho.rt/",
++            "shortener.counter-batch-size=250",
++            "shortener.cache-ttl=15m",
++            "shortener.counter-seed-offset=42")
++        .run(
++            context -> {
++              ShortenerProperties props = context.getBean(ShortenerProperties.class);
++              assertThat(props.baseUrl()).isEqualTo("https://sho.rt");
++              assertThat(props.counterBatchSize()).isEqualTo(250);
++              assertThat(props.cacheTtl()).isEqualTo(Duration.ofMinutes(15));
++              assertThat(props.counterSeedOffset()).isEqualTo(42L);
++            });
 +  }
 +
 +  @Test
-+  void unparsableDurationFailsBinding() {
-+    assertThatThrownBy(() -> bind(Map.of("shortener.cache.default-ttl", "yesterday")))
-+        .isInstanceOf(RuntimeException.class);
++  void invalidValuesFailBinding() {
++    runner
++        .withPropertyValues("shortener.counter-batch-size=0")
++        .run(context -> assertThat(context).hasFailed());
 +  }
-+
-+  @EnableConfigurationProperties(ShortenerProperties.class)
-+  static class PropertiesConfiguration {}
 +}

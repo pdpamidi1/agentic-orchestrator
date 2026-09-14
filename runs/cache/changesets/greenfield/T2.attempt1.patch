@@ -1,23 +1,22 @@
 diff --git a/src/main/java/com/example/shortener/domain/CodeSource.java b/src/main/java/com/example/shortener/domain/CodeSource.java
 new file mode 100644
-index 0000000..cbc6c20
+index 0000000..93e4544
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/domain/CodeSource.java
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,43 @@
 +package com.example.shortener.domain;
 +
-+import jakarta.persistence.AttributeConverter;
-+import jakarta.persistence.Converter;
++import java.util.Objects;
 +
 +/**
-+ * Which counter produced a generated short code. The wire value is what is persisted in {@code
-+ * urls.code_source} and must stay in sync with the {@code urls_code_source_chk} constraint of
-+ * {@code V1__create_urls_table.sql}.
++ * Which counter produced a short code. The wire value is what is persisted in {@code
++ * urls.code_source} (constrained by {@code urls_code_source_chk}) and exposed in API responses.
 + */
 +public enum CodeSource {
-+  /** Batched Redis {@code INCRBY} counter (ADR-001). */
++  /** Code allocated from the batched Redis {@code INCRBY} counter. */
 +  REDIS("redis"),
-+  /** Postgres sequence {@code url_code_seq}, used when Redis is unavailable (ADR-002). */
++
++  /** Code allocated from the Postgres fallback sequence {@code url_code_seq} (AC-11). */
 +  DB_SEQUENCE("db_sequence");
 +
 +  private final String wireValue;
@@ -26,52 +25,40 @@ index 0000000..cbc6c20
 +    this.wireValue = wireValue;
 +  }
 +
-+  /** The value persisted in the database and exposed in logs. */
++  /** The persisted / serialised value, e.g. {@code "redis"}. */
 +  public String wireValue() {
 +    return wireValue;
 +  }
 +
 +  /**
-+   * Looks up the enum constant by its persisted value.
++   * Resolves an enum constant from its wire value.
 +   *
-+   * @param wireValue value read from {@code urls.code_source}
++   * @param wireValue persisted value such as {@code "db_sequence"}
 +   * @return the matching constant
-+   * @throws IllegalArgumentException when no constant has that wire value
++   * @throws IllegalArgumentException when no constant carries that wire value
 +   */
 +  public static CodeSource fromWire(String wireValue) {
++    Objects.requireNonNull(wireValue, "wireValue");
 +    for (CodeSource source : values()) {
 +      if (source.wireValue.equals(wireValue)) {
 +        return source;
 +      }
 +    }
-+    throw new IllegalArgumentException("Unknown code_source value: " + wireValue);
-+  }
-+
-+  /** JPA converter persisting {@link CodeSource} as its wire value; applied automatically. */
-+  @Converter(autoApply = true)
-+  public static final class WireConverter implements AttributeConverter<CodeSource, String> {
-+
-+    @Override
-+    public String convertToDatabaseColumn(CodeSource attribute) {
-+      return attribute == null ? null : attribute.wireValue();
-+    }
-+
-+    @Override
-+    public CodeSource convertToEntityAttribute(String dbData) {
-+      return dbData == null ? null : fromWire(dbData);
-+    }
++    throw new IllegalArgumentException("Unknown code_source wire value: " + wireValue);
 +  }
 +}
 diff --git a/src/main/java/com/example/shortener/domain/UrlMapping.java b/src/main/java/com/example/shortener/domain/UrlMapping.java
 new file mode 100644
-index 0000000..19cf43f
+index 0000000..7a535e2
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/domain/UrlMapping.java
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,150 @@
 +package com.example.shortener.domain;
 +
++import jakarta.persistence.AttributeConverter;
 +import jakarta.persistence.Column;
 +import jakarta.persistence.Convert;
++import jakarta.persistence.Converter;
 +import jakarta.persistence.Entity;
 +import jakarta.persistence.Id;
 +import jakarta.persistence.Table;
@@ -79,12 +66,10 @@ index 0000000..19cf43f
 +import java.util.Objects;
 +
 +/**
-+ * A short-code to long-URL mapping; one row of the {@code urls} table created by {@code
-+ * V1__create_urls_table.sql}. Columns map 1:1: short_code (PK), long_url, created_at, expires_at,
-+ * created_by (always null in this release), code_source.
++ * JPA entity mapped 1:1 to the {@code urls} table created by {@code V1__create_urls_table.sql}.
 + *
-+ * <p>The domain package knows only JPA and {@link CodeSource}; it never depends on web, service or
-+ * codegen classes.
++ * <p>{@code created_by} is reserved for a future auth scenario and is always left {@code null}
++ * here; it is deliberately not settable through the public constructor.
 + */
 +@Entity
 +@Table(name = "urls")
@@ -103,11 +88,10 @@ index 0000000..19cf43f
 +  @Column(name = "expires_at")
 +  private Instant expiresAt;
 +
-+  /** Reserved for a future auth scenario; never populated (and never PII) in this release. */
 +  @Column(name = "created_by", length = 255)
 +  private String createdBy;
 +
-+  @Convert(converter = CodeSource.WireConverter.class)
++  @Convert(converter = CodeSourceConverter.class)
 +  @Column(name = "code_source", nullable = false, length = 16)
 +  private CodeSource codeSource;
 +
@@ -115,12 +99,12 @@ index 0000000..19cf43f
 +  protected UrlMapping() {}
 +
 +  /**
-+   * Creates a mapping with {@code created_by} left null.
++   * Creates a new mapping.
 +   *
-+   * @param shortCode generated base62 code or custom alias (the primary key)
-+   * @param longUrl absolute target URL
++   * @param shortCode generated base62 code or custom alias (primary key)
++   * @param longUrl absolute http/https target URL
 +   * @param createdAt creation instant (UTC)
-+   * @param expiresAt expiry instant, or {@code null} when the mapping never expires
++   * @param expiresAt optional expiry instant; {@code null} means the link never expires
 +   * @param codeSource which counter produced the code
 +   */
 +  public UrlMapping(
@@ -133,19 +117,8 @@ index 0000000..19cf43f
 +    this.longUrl = Objects.requireNonNull(longUrl, "longUrl");
 +    this.createdAt = Objects.requireNonNull(createdAt, "createdAt");
 +    this.expiresAt = expiresAt;
++    this.createdBy = null;
 +    this.codeSource = Objects.requireNonNull(codeSource, "codeSource");
-+  }
-+
-+  /**
-+   * Whether this mapping has expired.
-+   *
-+   * @param now the reference instant
-+   * @return {@code true} only when {@code expires_at} is set and is at or before {@code now}; a
-+   *     mapping without an expiry never expires
-+   */
-+  public boolean isExpired(Instant now) {
-+    Objects.requireNonNull(now, "now");
-+    return expiresAt != null && !expiresAt.isAfter(now);
 +  }
 +
 +  public String getShortCode() {
@@ -160,10 +133,12 @@ index 0000000..19cf43f
 +    return createdAt;
 +  }
 +
++  /** Expiry instant, or {@code null} when the link never expires. */
 +  public Instant getExpiresAt() {
 +    return expiresAt;
 +  }
 +
++  /** Always {@code null} in this release (non-goal: no user attribution, no PII). */
 +  public String getCreatedBy() {
 +    return createdBy;
 +  }
@@ -172,75 +147,98 @@ index 0000000..19cf43f
 +    return codeSource;
 +  }
 +
++  /**
++   * Whether this mapping has expired at the given instant.
++   *
++   * @param now the reference instant
++   * @return {@code true} only when {@code expires_at} is non-null and not after {@code now}, i.e.
++   *     the link is expired exactly at and after its expiry instant
++   */
++  public boolean isExpired(Instant now) {
++    Objects.requireNonNull(now, "now");
++    return expiresAt != null && !expiresAt.isAfter(now);
++  }
++
 +  @Override
-+  public boolean equals(Object o) {
-+    return this == o || (o instanceof UrlMapping other && shortCode.equals(other.shortCode));
++  public boolean equals(Object other) {
++    if (this == other) {
++      return true;
++    }
++    if (!(other instanceof UrlMapping that)) {
++      return false;
++    }
++    return shortCode != null && shortCode.equals(that.shortCode);
 +  }
 +
 +  @Override
 +  public int hashCode() {
-+    return shortCode.hashCode();
++    return UrlMapping.class.hashCode();
 +  }
 +
 +  @Override
 +  public String toString() {
-+    return "UrlMapping[shortCode="
++    return "UrlMapping{shortCode='"
 +        + shortCode
-+        + ", createdAt="
++        + "', createdAt="
 +        + createdAt
 +        + ", expiresAt="
 +        + expiresAt
 +        + ", codeSource="
 +        + codeSource
-+        + "]";
++        + '}';
++  }
++
++  /** Persists {@link CodeSource} as its wire value ({@code 'redis'} / {@code 'db_sequence'}). */
++  @Converter
++  public static class CodeSourceConverter implements AttributeConverter<CodeSource, String> {
++
++    @Override
++    public String convertToDatabaseColumn(CodeSource attribute) {
++      return attribute == null ? null : attribute.wireValue();
++    }
++
++    @Override
++    public CodeSource convertToEntityAttribute(String dbData) {
++      return dbData == null ? null : CodeSource.fromWire(dbData);
++    }
 +  }
 +}
 diff --git a/src/main/java/com/example/shortener/domain/UrlMappingRepository.java b/src/main/java/com/example/shortener/domain/UrlMappingRepository.java
 new file mode 100644
-index 0000000..bbb413c
+index 0000000..38fb9a7
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/domain/UrlMappingRepository.java
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,22 @@
 +package com.example.shortener.domain;
 +
 +import java.util.Optional;
 +import org.springframework.data.jpa.repository.JpaRepository;
 +import org.springframework.data.jpa.repository.Query;
 +
-+/**
-+ * Spring Data JPA repository of {@link UrlMapping} rows, plus the fallback counter read (ADR-002).
-+ * Uniqueness of a short code is ultimately enforced by the primary key; {@link #existsByShortCode}
-+ * is only a pre-check.
-+ */
++/** Spring Data JPA repository for {@link UrlMapping} rows plus the fallback counter sequence. */
 +public interface UrlMappingRepository extends JpaRepository<UrlMapping, String> {
 +
-+  /** Finds the mapping with the given short code, if any. */
++  /** Looks up a mapping by its short code (primary key). */
 +  Optional<UrlMapping> findByShortCode(String shortCode);
 +
-+  /** Whether a mapping with the given short code already exists. */
++  /** Whether a mapping (generated code or custom alias) already occupies the given short code. */
 +  boolean existsByShortCode(String shortCode);
 +
 +  /**
-+   * Draws the next value of the Postgres sequence {@code url_code_seq}, the counter used when Redis
-+   * is unavailable. Values are never reused; gaps are acceptable.
++   * Draws the next value from the Postgres fallback counter {@code url_code_seq} (AC-11). Values
++   * are never reused; gaps are acceptable.
 +   */
 +  @Query(value = "SELECT nextval('url_code_seq')", nativeQuery = true)
 +  long nextSequenceValue();
 +}
 diff --git a/src/main/resources/db/migration/V1__create_urls_table.sql b/src/main/resources/db/migration/V1__create_urls_table.sql
 new file mode 100644
-index 0000000..067f744
+index 0000000..1180121
 --- /dev/null
 +++ b/src/main/resources/db/migration/V1__create_urls_table.sql
-@@ -0,0 +1,32 @@
-+-- V1: urls table (source of truth for short-code -> long-URL mappings) and the fallback counter sequence.
-+--
-+-- Forward-only Flyway migration (ADR-010). Never edit this file once it has run anywhere; every later
-+-- schema change is a new Vn__*.sql following expand/contract.
-+--
-+-- created_by is reserved for a future auth scenario and is always NULL in this release (never PII).
-+-- code_source is a plain varchar with a CHECK constraint (not a Postgres ENUM) so a third source can be
-+-- added by altering the constraint instead of migrating a type.
+@@ -0,0 +1,27 @@
++-- V1: urls table + fallback counter sequence (Design: data_model.urls, url_code_seq; ADR-002, ADR-004).
++-- Forward-only Flyway migration. Never edit once integration tests have run against it; add V2+ instead.
 +
 +CREATE TABLE urls (
 +    short_code  varchar(32)   NOT NULL,
@@ -255,11 +253,12 @@ index 0000000..067f744
 +    CONSTRAINT urls_long_url_len_chk CHECK (char_length(long_url) BETWEEN 1 AND 2048)
 +);
 +
-+-- Partial index supporting expiry lookups and sweeps; rows that never expire are not indexed.
++-- Supports expiry lookups / sweeps; rows that never expire are not indexed.
 +CREATE INDEX idx_urls_expires_at ON urls (expires_at) WHERE expires_at IS NOT NULL;
 +
-+-- Fallback short-code counter used when Redis is unavailable (ADR-002). Seeded at 62^3 = 238328 (AMB-11)
-+-- so every base62 code produced from it is at least three characters. Values are never reused; gaps are fine.
++-- Redis-outage fallback counter (AC-11). Seeded at 62^3 = 238328 (AMB-11 / ADR-004) so that even a
++-- raw sequence value encodes to a base62 code of at least three characters; the allocator additionally
++-- adds shortener.counter-seed-offset before encoding. Values are never reused; gaps are acceptable.
 +CREATE SEQUENCE url_code_seq START WITH 238328 INCREMENT BY 1 NO CYCLE CACHE 1;
 +
 +COMMENT ON COLUMN urls.created_by IS 'Reserved for a future auth scenario; left NULL in this release';
@@ -267,297 +266,258 @@ index 0000000..067f744
 +COMMENT ON SEQUENCE url_code_seq IS 'Fallback short-code counter, seeded at 62^3 so codes are >= 3 chars';
 diff --git a/src/test/java/com/example/shortener/domain/MigrationScriptTest.java b/src/test/java/com/example/shortener/domain/MigrationScriptTest.java
 new file mode 100644
-index 0000000..21a45e2
+index 0000000..fffa298
 --- /dev/null
 +++ b/src/test/java/com/example/shortener/domain/MigrationScriptTest.java
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,147 @@
 +package com.example.shortener.domain;
 +
 +import static org.assertj.core.api.Assertions.assertThat;
 +
++import jakarta.persistence.Column;
++import jakarta.persistence.Id;
++import jakarta.persistence.Table;
 +import java.io.IOException;
-+import java.nio.charset.StandardCharsets;
++import java.lang.reflect.Field;
 +import java.nio.file.Files;
 +import java.nio.file.Path;
 +import java.util.List;
-+import java.util.regex.Matcher;
 +import java.util.regex.Pattern;
 +import java.util.stream.Stream;
 +import org.junit.jupiter.api.BeforeAll;
 +import org.junit.jupiter.api.Test;
 +
 +/**
-+ * Static checks of the Flyway migration creating the {@code urls} table and the {@code
-+ * url_code_seq} fallback sequence (AC-15, AC-11). Reads the SQL file from the source tree; no
-+ * container needed.
++ * Static checks on the Flyway migration for the {@code urls} table (AC-15). Reads the SQL file from
++ * the source tree; no database container is needed.
 + */
 +class MigrationScriptTest {
 +
-+  private static final Path MIGRATIONS = Path.of("src/main/resources/db/migration");
-+  private static final Pattern VERSIONED = Pattern.compile("^V1__[A-Za-z0-9_]+\\.sql$");
++  private static final Path MIGRATION_DIR = Path.of("src/main/resources/db/migration");
++  private static final Path MIGRATION = MIGRATION_DIR.resolve("V1__create_urls_table.sql");
 +
-+  /** 62^3: the AMB-11 seed offset guaranteeing at least three base62 characters. */
-+  private static final long SEED_OFFSET = 238_328L;
++  /** Minimum sequence start honouring AMB-11 / ADR-004: 62^3 so raw values encode to >= 3 chars. */
++  private static final long MIN_SEQUENCE_START = 238_328L;
 +
 +  private static String sql;
-+  private static String normalized;
 +
 +  @BeforeAll
 +  static void readMigration() throws IOException {
-+    sql = Files.readString(MIGRATIONS.resolve("V1__create_urls_table.sql"), StandardCharsets.UTF_8);
-+    normalized = stripComments(sql).replaceAll("\\s+", " ").toLowerCase();
++    assertThat(MIGRATION).as("migration file").isRegularFile();
++    sql = Files.readString(MIGRATION);
 +  }
 +
 +  @Test
-+  void migrationFileExistsAndFollowsFlywayVersionedNaming() throws IOException {
-+    Path file = MIGRATIONS.resolve("V1__create_urls_table.sql");
-+
-+    assertThat(file).isRegularFile();
-+    assertThat(VERSIONED.matcher(file.getFileName().toString()).matches()).isTrue();
-+    assertThat(sql).isNotBlank();
++  void migrationFollowsFlywayVersionedNaming() {
++    String name = MIGRATION.getFileName().toString();
++    assertThat(name).matches("^V1__[A-Za-z0-9_]+\\.sql$");
 +  }
 +
 +  @Test
-+  void exactlyOneVersionOneMigrationExists() throws IOException {
-+    try (Stream<Path> files = Files.list(MIGRATIONS)) {
-+      List<String> v1 =
-+          files.map(p -> p.getFileName().toString()).filter(n -> n.startsWith("V1__")).toList();
-+      assertThat(v1).containsExactly("V1__create_urls_table.sql");
++  void migrationIsTheOnlyV1AndDirectoryHoldsOnlyVersionedSql() throws IOException {
++    try (Stream<Path> files = Files.list(MIGRATION_DIR)) {
++      List<String> names = files.map(p -> p.getFileName().toString()).toList();
++      assertThat(names).allMatch(n -> n.matches("^V\\d+(?:[._]\\d+)*__[A-Za-z0-9_]+\\.sql$"));
++      assertThat(names.stream().filter(n -> n.startsWith("V1__")).count()).isEqualTo(1);
 +    }
 +  }
 +
 +  @Test
-+  void migrationIsAlsoOnTheClasspathWhereFlywayLooks() {
-+    assertThat(getClass().getResource("/db/migration/V1__create_urls_table.sql")).isNotNull();
-+  }
-+
-+  @Test
-+  void createsTheUrlsTableWithEveryRequiredColumn() {
-+    assertThat(normalized).contains("create table urls (");
-+    assertThat(normalized).contains("short_code varchar(32) not null");
-+    assertThat(normalized).contains("long_url varchar(2048) not null");
-+    assertThat(normalized).contains("created_at timestamptz not null");
-+    assertThat(normalized).contains("expires_at timestamptz null");
-+    assertThat(normalized).contains("created_by varchar(255) null");
-+    assertThat(normalized).contains("code_source varchar(16) not null");
++  void createsUrlsTableWithEveryRequiredColumn() {
++    assertThat(sql).containsPattern(Pattern.compile("(?i)CREATE\\s+TABLE\\s+urls\\s*\\("));
++    assertThat(sql).containsPattern(column("short_code", "varchar\\(32\\)", true));
++    assertThat(sql).containsPattern(column("long_url", "varchar\\(2048\\)", true));
++    assertThat(sql).containsPattern(column("created_at", "timestamptz", true));
++    assertThat(sql).containsPattern(column("expires_at", "timestamptz", false));
++    assertThat(sql).containsPattern(column("created_by", "varchar(?:\\(\\d+\\))?", false));
++    assertThat(sql).containsPattern(column("code_source", "varchar(?:\\(\\d+\\))?", true));
 +  }
 +
 +  @Test
 +  void shortCodeIsThePrimaryKey() {
-+    assertThat(normalized).contains("primary key (short_code)");
++    assertThat(sql)
++        .containsPattern(Pattern.compile("(?i)PRIMARY\\s+KEY\\s*\\(\\s*short_code\\s*\\)"));
 +  }
 +
 +  @Test
-+  void codeSourceIsConstrainedToTheEnumWireValues() {
-+    assertThat(normalized).contains("check (code_source in ('redis', 'db_sequence'))");
-+    for (CodeSource source : CodeSource.values()) {
-+      assertThat(normalized).contains("'" + source.wireValue() + "'");
-+    }
++  void nullableColumnsAreNotForcedNotNull() {
++    // Anchored to the column definition line so the partial index predicate
++    // (WHERE expires_at IS NOT NULL) is not mistaken for a NOT NULL constraint.
++    assertThat(sql)
++        .doesNotContainPattern(Pattern.compile("(?im)^\\s*expires_at\\s+\\S+\\s+NOT\\s+NULL"));
++    assertThat(sql)
++        .doesNotContainPattern(Pattern.compile("(?im)^\\s*created_by\\s+\\S+\\s+NOT\\s+NULL"));
 +  }
 +
 +  @Test
-+  void shortCodeFormatAndLongUrlLengthAreChecked() {
-+    assertThat(normalized).contains("check (short_code ~ '^[0-9a-za-z]{3,32}$')");
-+    assertThat(normalized).contains("check (char_length(long_url) between 1 and 2048)");
++  void codeSourceIsRestrictedToTheKnownWireValues() {
++    assertThat(sql)
++        .containsPattern(
++            Pattern.compile(
++                "(?i)CHECK\\s*\\(\\s*code_source\\s+IN\\s*\\(\\s*'redis'\\s*,\\s*'db_sequence'\\s*\\)\\s*\\)"));
 +  }
 +
 +  @Test
 +  void createsAnIndexSupportingExpiryLookups() {
-+    assertThat(normalized)
-+        .contains(
-+            "create index idx_urls_expires_at on urls (expires_at) where expires_at is not null");
++    assertThat(sql)
++        .containsPattern(
++            Pattern.compile(
++                "(?i)CREATE\\s+INDEX\\s+\\w+\\s+ON\\s+urls\\s*\\(\\s*expires_at\\s*\\)"));
 +  }
 +
 +  @Test
-+  void createsTheFallbackSequenceSeededPastTheOffset() {
-+    Matcher m =
-+        Pattern.compile("create sequence url_code_seq start with (\\d+) increment by 1 no cycle")
-+            .matcher(normalized);
-+
-+    assertThat(m.find()).as("url_code_seq definition").isTrue();
-+    assertThat(Long.parseLong(m.group(1))).isGreaterThanOrEqualTo(SEED_OFFSET);
++  void createsFallbackSequenceSeededPastTheAmb11Offset() {
++    var matcher =
++        Pattern.compile("(?i)CREATE\\s+SEQUENCE\\s+url_code_seq\\b[^;]*?START\\s+WITH\\s+(\\d+)")
++            .matcher(sql);
++    assertThat(matcher.find()).as("CREATE SEQUENCE url_code_seq ... START WITH n").isTrue();
++    assertThat(Long.parseLong(matcher.group(1))).isGreaterThanOrEqualTo(MIN_SEQUENCE_START);
++    assertThat(sql).containsPattern(Pattern.compile("(?i)url_code_seq\\b[^;]*NO\\s+CYCLE"));
 +  }
 +
 +  @Test
-+  void containsNoDestructiveStatements() {
-+    assertThat(normalized).doesNotContain("drop ", "truncate ", "delete from ", "alter table ");
++  void migrationContainsNoDestructiveStatements() {
++    assertThat(sql)
++        .doesNotContainPattern(Pattern.compile("(?i)\\bDROP\\s+(TABLE|SEQUENCE|INDEX)\\b"));
++    assertThat(sql).doesNotContainPattern(Pattern.compile("(?i)\\bTRUNCATE\\b"));
 +  }
 +
-+  private static String stripComments(String text) {
-+    return text.lines().map(l -> l.replaceFirst("--.*$", "")).reduce("", (a, b) -> a + "\n" + b);
++  @Test
++  void entityColumnsMatchTheMigrationOneToOne() {
++    Table table = UrlMapping.class.getAnnotation(Table.class);
++    assertThat(table).isNotNull();
++    assertThat(table.name()).isEqualTo("urls");
++
++    List<String> entityColumns =
++        Stream.of(UrlMapping.class.getDeclaredFields())
++            .filter(f -> f.isAnnotationPresent(Column.class))
++            .map(f -> f.getAnnotation(Column.class).name())
++            .toList();
++    assertThat(entityColumns)
++        .containsExactlyInAnyOrder(
++            "short_code", "long_url", "created_at", "expires_at", "created_by", "code_source");
++    for (String column : entityColumns) {
++      assertThat(sql).as("column %s present in migration", column).containsPattern(column(column));
++    }
++
++    List<String> idColumns =
++        Stream.of(UrlMapping.class.getDeclaredFields())
++            .filter(f -> f.isAnnotationPresent(Id.class))
++            .map(Field::getName)
++            .toList();
++    assertThat(idColumns).containsExactly("shortCode");
++  }
++
++  private static Pattern column(String name) {
++    return Pattern.compile("(?im)^\\s*" + name + "\\s+\\S+");
++  }
++
++  private static Pattern column(String name, String type, boolean notNull) {
++    String tail = notNull ? "\\s+NOT\\s+NULL" : "(?!\\s+NOT\\s+NULL)";
++    return Pattern.compile("(?im)^\\s*" + name + "\\s+" + type + tail);
 +  }
 +}
 diff --git a/src/test/java/com/example/shortener/domain/UrlMappingTest.java b/src/test/java/com/example/shortener/domain/UrlMappingTest.java
 new file mode 100644
-index 0000000..36e2337
+index 0000000..f52bd32
 --- /dev/null
 +++ b/src/test/java/com/example/shortener/domain/UrlMappingTest.java
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,124 @@
 +package com.example.shortener.domain;
 +
 +import static org.assertj.core.api.Assertions.assertThat;
 +import static org.assertj.core.api.Assertions.assertThatThrownBy;
 +
-+import jakarta.persistence.Column;
-+import jakarta.persistence.Convert;
-+import jakarta.persistence.Entity;
-+import jakarta.persistence.Id;
-+import jakarta.persistence.Table;
-+import java.lang.reflect.Field;
++import java.time.Duration;
 +import java.time.Instant;
-+import java.util.Arrays;
-+import java.util.Map;
 +import org.junit.jupiter.api.Test;
-+import org.springframework.data.jpa.repository.JpaRepository;
-+import org.springframework.data.jpa.repository.Query;
 +
-+/** Unit tests of the domain entity, its enum and the repository contract; no database needed. */
++/** Unit tests for the {@link UrlMapping} entity and the {@link CodeSource} enum (no database). */
 +class UrlMappingTest {
 +
-+  private static final Instant NOW = Instant.parse("2026-09-14T12:00:00Z");
++  private static final Instant CREATED = Instant.parse("2026-09-14T10:00:00Z");
++  private static final Instant EXPIRY = Instant.parse("2026-09-15T10:00:00Z");
 +
 +  private static UrlMapping mapping(Instant expiresAt) {
 +    return new UrlMapping(
-+        "abc",
-+        "https://example.com/some/path",
-+        NOW.minusSeconds(3600),
-+        expiresAt,
-+        CodeSource.REDIS);
++        "abc123", "https://example.com/some/path", CREATED, expiresAt, CodeSource.REDIS);
 +  }
-+
-+  // --- isExpired (AC-3/AC-4 helper; redirect returns 410 once expired) ---
 +
 +  @Test
 +  void neverExpiredWhenExpiresAtIsNull() {
 +    UrlMapping mapping = mapping(null);
 +
-+    assertThat(mapping.isExpired(NOW)).isFalse();
-+    assertThat(mapping.isExpired(Instant.MAX)).isFalse();
++    assertThat(mapping.getExpiresAt()).isNull();
++    assertThat(mapping.isExpired(Instant.EPOCH)).isFalse();
++    assertThat(mapping.isExpired(CREATED)).isFalse();
++    assertThat(mapping.isExpired(Instant.parse("2999-01-01T00:00:00Z"))).isFalse();
 +  }
 +
 +  @Test
 +  void notExpiredBeforeExpiresAt() {
-+    UrlMapping mapping = mapping(NOW.plusSeconds(1));
++    UrlMapping mapping = mapping(EXPIRY);
 +
-+    assertThat(mapping.isExpired(NOW)).isFalse();
++    assertThat(mapping.isExpired(CREATED)).isFalse();
++    assertThat(mapping.isExpired(EXPIRY.minusNanos(1))).isFalse();
 +  }
 +
 +  @Test
 +  void expiredExactlyAtExpiresAt() {
-+    UrlMapping mapping = mapping(NOW);
-+
-+    assertThat(mapping.isExpired(NOW)).isTrue();
++    assertThat(mapping(EXPIRY).isExpired(EXPIRY)).isTrue();
 +  }
 +
 +  @Test
 +  void expiredAfterExpiresAt() {
-+    UrlMapping mapping = mapping(NOW.minusMillis(1));
++    UrlMapping mapping = mapping(EXPIRY);
 +
-+    assertThat(mapping.isExpired(NOW)).isTrue();
++    assertThat(mapping.isExpired(EXPIRY.plusNanos(1))).isTrue();
++    assertThat(mapping.isExpired(EXPIRY.plus(Duration.ofDays(30)))).isTrue();
 +  }
 +
 +  @Test
-+  void isExpiredRejectsNullReference() {
-+    assertThatThrownBy(() -> mapping(null).isExpired(null))
++  void isExpiredRejectsNullReferenceInstant() {
++    assertThatThrownBy(() -> mapping(EXPIRY).isExpired(null))
 +        .isInstanceOf(NullPointerException.class);
 +  }
 +
-+  // --- constructor / accessors (AC-1: created_by is always null) ---
-+
 +  @Test
-+  void constructorLeavesCreatedByNullAndExposesEveryColumn() {
-+    UrlMapping mapping = mapping(NOW.plusSeconds(60));
++  void constructorMapsFieldsAndLeavesCreatedByNull() {
++    UrlMapping mapping =
++        new UrlMapping("promo2024", "https://example.com", CREATED, EXPIRY, CodeSource.DB_SEQUENCE);
 +
-+    assertThat(mapping.getShortCode()).isEqualTo("abc");
-+    assertThat(mapping.getLongUrl()).isEqualTo("https://example.com/some/path");
-+    assertThat(mapping.getCreatedAt()).isEqualTo(NOW.minusSeconds(3600));
-+    assertThat(mapping.getExpiresAt()).isEqualTo(NOW.plusSeconds(60));
++    assertThat(mapping.getShortCode()).isEqualTo("promo2024");
++    assertThat(mapping.getLongUrl()).isEqualTo("https://example.com");
++    assertThat(mapping.getCreatedAt()).isEqualTo(CREATED);
++    assertThat(mapping.getExpiresAt()).isEqualTo(EXPIRY);
++    assertThat(mapping.getCodeSource()).isEqualTo(CodeSource.DB_SEQUENCE);
 +    assertThat(mapping.getCreatedBy()).isNull();
-+    assertThat(mapping.getCodeSource()).isEqualTo(CodeSource.REDIS);
 +  }
 +
 +  @Test
-+  void requiredFieldsAreRejectedWhenNull() {
-+    assertThatThrownBy(() -> new UrlMapping(null, "https://e.com", NOW, null, CodeSource.REDIS))
++  void constructorRejectsMissingMandatoryColumns() {
++    assertThatThrownBy(() -> new UrlMapping(null, "https://e.com", CREATED, null, CodeSource.REDIS))
 +        .isInstanceOf(NullPointerException.class);
-+    assertThatThrownBy(() -> new UrlMapping("abc", null, NOW, null, CodeSource.REDIS))
++    assertThatThrownBy(() -> new UrlMapping("abc", null, CREATED, null, CodeSource.REDIS))
 +        .isInstanceOf(NullPointerException.class);
 +    assertThatThrownBy(() -> new UrlMapping("abc", "https://e.com", null, null, CodeSource.REDIS))
 +        .isInstanceOf(NullPointerException.class);
-+    assertThatThrownBy(() -> new UrlMapping("abc", "https://e.com", NOW, null, null))
++    assertThatThrownBy(() -> new UrlMapping("abc", "https://e.com", CREATED, null, null))
 +        .isInstanceOf(NullPointerException.class);
 +  }
 +
 +  @Test
-+  void identityIsTheShortCode() {
++  void equalityIsBasedOnShortCode() {
 +    UrlMapping a = mapping(null);
-+    UrlMapping b = new UrlMapping("abc", "https://other.example", NOW, NOW, CodeSource.DB_SEQUENCE);
-+    UrlMapping c =
-+        new UrlMapping("abd", "https://example.com/some/path", NOW, null, CodeSource.REDIS);
++    UrlMapping sameCode =
++        new UrlMapping("abc123", "https://other.example", CREATED, EXPIRY, CodeSource.DB_SEQUENCE);
++    UrlMapping otherCode =
++        new UrlMapping("xyz789", "https://example.com/some/path", CREATED, null, CodeSource.REDIS);
 +
-+    assertThat(a).isEqualTo(b).hasSameHashCodeAs(b).isNotEqualTo(c);
-+    assertThat(a.toString()).contains("abc").doesNotContain("example.com");
-+  }
-+
-+  // --- JPA mapping is 1:1 with V1__create_urls_table.sql (AC-15) ---
-+
-+  @Test
-+  void entityIsMappedToTheUrlsTable() {
-+    assertThat(UrlMapping.class.isAnnotationPresent(Entity.class)).isTrue();
-+    assertThat(UrlMapping.class.getAnnotation(Table.class).name()).isEqualTo("urls");
++    assertThat(a).isEqualTo(sameCode).hasSameHashCodeAs(sameCode).isNotEqualTo(otherCode);
 +  }
 +
 +  @Test
-+  void everyMigrationColumnIsMappedWithMatchingNullabilityAndLength() throws Exception {
-+    Map<String, boolean[]> expected =
-+        Map.of(
-+            "shortCode", new boolean[] {false},
-+            "longUrl", new boolean[] {false},
-+            "createdAt", new boolean[] {false},
-+            "expiresAt", new boolean[] {true},
-+            "createdBy", new boolean[] {true},
-+            "codeSource", new boolean[] {false});
-+    Map<String, String> columnNames =
-+        Map.of(
-+            "shortCode", "short_code",
-+            "longUrl", "long_url",
-+            "createdAt", "created_at",
-+            "expiresAt", "expires_at",
-+            "createdBy", "created_by",
-+            "codeSource", "code_source");
-+
-+    assertThat(Arrays.stream(UrlMapping.class.getDeclaredFields()).map(Field::getName))
-+        .containsExactlyInAnyOrderElementsOf(expected.keySet());
-+
-+    for (String fieldName : expected.keySet()) {
-+      Column column = UrlMapping.class.getDeclaredField(fieldName).getAnnotation(Column.class);
-+      assertThat(column).as(fieldName).isNotNull();
-+      assertThat(column.name()).isEqualTo(columnNames.get(fieldName));
-+      assertThat(column.nullable()).as(fieldName).isEqualTo(expected.get(fieldName)[0]);
-+    }
-+
-+    assertThat(UrlMapping.class.getDeclaredField("shortCode").isAnnotationPresent(Id.class))
-+        .isTrue();
-+    assertThat(column("shortCode").length()).isEqualTo(32);
-+    assertThat(column("longUrl").length()).isEqualTo(2048);
-+    assertThat(column("createdBy").length()).isEqualTo(255);
-+    assertThat(column("codeSource").length()).isEqualTo(16);
-+    assertThat(UrlMapping.class.getDeclaredField("createdAt").getType()).isEqualTo(Instant.class);
-+    assertThat(UrlMapping.class.getDeclaredField("expiresAt").getType()).isEqualTo(Instant.class);
-+    assertThat(UrlMapping.class.getDeclaredField("codeSource").getAnnotation(Convert.class))
-+        .isNotNull()
-+        .extracting(Convert::converter)
-+        .isEqualTo(CodeSource.WireConverter.class);
-+  }
-+
-+  private static Column column(String field) throws NoSuchFieldException {
-+    return UrlMapping.class.getDeclaredField(field).getAnnotation(Column.class);
-+  }
-+
-+  // --- CodeSource wire values match the urls_code_source_chk constraint (AC-11) ---
-+
-+  @Test
-+  void codeSourceWireValuesMatchTheCheckConstraint() {
++  void codeSourceWireValuesMatchTheMigrationCheckConstraint() {
 +    assertThat(CodeSource.REDIS.wireValue()).isEqualTo("redis");
 +    assertThat(CodeSource.DB_SEQUENCE.wireValue()).isEqualTo("db_sequence");
 +    assertThat(CodeSource.values()).containsExactly(CodeSource.REDIS, CodeSource.DB_SEQUENCE);
@@ -568,44 +528,22 @@ index 0000000..36e2337
 +    for (CodeSource source : CodeSource.values()) {
 +      assertThat(CodeSource.fromWire(source.wireValue())).isSameAs(source);
 +    }
-+    assertThatThrownBy(() -> CodeSource.fromWire("REDIS"))
++    assertThatThrownBy(() -> CodeSource.fromWire("snowflake"))
 +        .isInstanceOf(IllegalArgumentException.class)
-+        .hasMessageContaining("REDIS");
-+    assertThatThrownBy(() -> CodeSource.fromWire(null))
++        .hasMessageContaining("snowflake");
++    assertThatThrownBy(() -> CodeSource.fromWire("REDIS"))
 +        .isInstanceOf(IllegalArgumentException.class);
 +  }
 +
 +  @Test
-+  void codeSourceConverterPersistsTheWireValue() {
-+    CodeSource.WireConverter converter = new CodeSource.WireConverter();
++  void codeSourceConverterPersistsWireValue() {
++    UrlMapping.CodeSourceConverter converter = new UrlMapping.CodeSourceConverter();
 +
++    assertThat(converter.convertToDatabaseColumn(CodeSource.REDIS)).isEqualTo("redis");
 +    assertThat(converter.convertToDatabaseColumn(CodeSource.DB_SEQUENCE)).isEqualTo("db_sequence");
-+    assertThat(converter.convertToEntityAttribute("redis")).isEqualTo(CodeSource.REDIS);
 +    assertThat(converter.convertToDatabaseColumn(null)).isNull();
++    assertThat(converter.convertToEntityAttribute("db_sequence")).isEqualTo(CodeSource.DB_SEQUENCE);
++    assertThat(converter.convertToEntityAttribute("redis")).isEqualTo(CodeSource.REDIS);
 +    assertThat(converter.convertToEntityAttribute(null)).isNull();
-+    assertThat(
-+            CodeSource.WireConverter.class
-+                .getAnnotation(jakarta.persistence.Converter.class)
-+                .autoApply())
-+        .isTrue();
-+  }
-+
-+  // --- repository contract (AC-11: nextval('url_code_seq') fallback) ---
-+
-+  @Test
-+  void repositoryExposesLookupsAndTheSequenceFallback() throws Exception {
-+    assertThat(JpaRepository.class).isAssignableFrom(UrlMappingRepository.class);
-+    assertThat(
-+            UrlMappingRepository.class.getMethod("findByShortCode", String.class).getReturnType())
-+        .isEqualTo(java.util.Optional.class);
-+    assertThat(
-+            UrlMappingRepository.class.getMethod("existsByShortCode", String.class).getReturnType())
-+        .isEqualTo(boolean.class);
-+
-+    Query query =
-+        UrlMappingRepository.class.getMethod("nextSequenceValue").getAnnotation(Query.class);
-+    assertThat(query).isNotNull();
-+    assertThat(query.nativeQuery()).isTrue();
-+    assertThat(query.value()).isEqualToIgnoringCase("SELECT nextval('url_code_seq')");
 +  }
 +}

@@ -4,6 +4,7 @@ Record them from a live run with --record; then the whole demo runs without an A
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +25,10 @@ async def apply_recorded(ctx: RunContext, task: TaskSpec, patch: Path) -> Done |
     """git apply + one commit per task, exactly like a live executor would leave the sandbox."""
     git = GitSandbox(ctx.sandbox)
     base = await git.head()
+    # git runs inside the sandbox: a cache path relative to the orchestrator root must be made absolute
+    absolute = await asyncio.to_thread(os.path.abspath, patch)
     proc = await asyncio.create_subprocess_exec(
-        "git", "apply", "--whitespace=nowarn", str(patch), cwd=str(ctx.sandbox)
+        "git", "apply", "--whitespace=nowarn", absolute, cwd=str(ctx.sandbox)
     )
     await proc.communicate()
     if proc.returncode != 0:
