@@ -41,7 +41,7 @@ from .executors.recording import RecordingExecutor
 from .executors.replay import ReplayExecutor
 from .llm.client import AnthropicClient, LLMClient, RecordingClient, ReplayClient
 from .llm.fake import PLANTED, FakeClient
-from .models import Kind, RepoMap, RunState, RunStatus, ValidationResult, load_policy
+from .models import Kind, NodeStatus, RepoMap, RunState, RunStatus, ValidationResult, load_policy
 from .sandbox.git import GitSandbox
 from .sandbox.repo_map import SKIP_DIRS, build_repo_map
 from .store.file_store import FileStore
@@ -313,8 +313,43 @@ class OrchestratorService:
         ctx.feedback.update(saved.get("feedback") or {})
         ctx.answers.update(saved.get("answers") or {})
         ctx.approvals |= set(saved.get("approvals") or ())
+        # a node still RUNNING on disk was mid-attempt when its process died: nothing of that attempt is
+        # trusted, so it is queued again (its handler resumes from committed work, e.g. changeset.commits)
+        for nid, status in list(state.nodes.items()):
+            if status == NodeStatus.RUNNING:
+                state.mark(nid, NodeStatus.PENDING)
+                ctx.emit(
+                    Kind.NODE_INVALIDATED,
+                    node_id=nid,
+                    actor="orchestrator",
+                    payload={"because": ["process.restart"], "origin": "resume"},
+                )
         live = LiveRun(ctx, state, record=bool(saved.get("record", False)))
         self.runs[run_id] = live
+        return live
+
+    async def resume(self, run_id: str, who: str = "human") -> LiveRun:
+        """Continue a run whose API process stopped while it was RUNNING (no pause, no halt to approve).
+
+        Paused (``AWAITING_*``) and ``HALTED`` runs keep their human checkpoints: use ``approve``/``answer``
+        for those; ``resume`` on them raises ``RuntimeError`` (API: 409). Emits ``RUN_RESUMED`` with
+        ``after="process.restart"`` and re-enters the runner, which re-runs the nodes ``load`` re-queued.
+        """
+        live = await self._get(run_id)
+        if live.state.status != RunStatus.RUNNING:
+            raise RuntimeError(
+                f"{run_id} is {live.state.status}: resume only continues a run whose process stopped while "
+                "RUNNING; approve or answer a paused/halted run instead"
+            )
+        live.ctx.emit(
+            Kind.RUN_RESUMED,
+            actor=who,
+            payload={"after": "process.restart", "lineage": live.ctx.lineage_snapshot()},
+        )
+        live.state = await self._runner(self._mode(live.ctx.replay), live.record, live.ctx.scenario).run(
+            live.ctx, live.state
+        )
+        await self._persist_artifacts(live)
         return live
 
     def _context_from_trace(self, run_id: str, state: RunState) -> dict[str, Any]:

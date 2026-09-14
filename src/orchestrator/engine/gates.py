@@ -54,9 +54,11 @@ async def diff_scope(ctx: RunContext, git: GitSandbox) -> list[Finding]:
     """``scope`` gate: the whole run diff must respect change control and the plan's ``allowed_files``.
 
     Reads every file changed since the run base tag (committed or not), minus ``PROVISIONED_PATHS``, and
-    judges it with ``PolicyEngine.check_scope`` against the union of all tasks' ``allowed_files`` and the
-    approvals in context (node ids, task/scope tokens and mapped action names all live in ``ctx.approvals``;
-    an ``approved_actions`` artifact is honoured too if present). Per-task size limits are skipped here:
+    judges it with ``PolicyEngine.check_scope`` against the union of all tasks' ``allowed_files`` plus every
+    file a human granted through ``task.scope_change`` (``scope:<task>:<path>`` tokens: the executor widened
+    the task with them, so the run-level gate must accept them too) and the approvals in context (node ids,
+    task/scope tokens and mapped action names all live in ``ctx.approvals``; an ``approved_actions``
+    artifact is honoured too if present). Per-task size limits are skipped here:
     they were enforced task by task at the write boundary, and a whole run is legitimately larger.
     """
     pe = PolicyEngine(ctx.policy, ctx.target_stack)
@@ -68,6 +70,7 @@ async def diff_scope(ctx: RunContext, git: GitSandbox) -> list[Finding]:
     if plan is not None:
         for t in plan.tasks:
             task_allowed.extend(t.allowed_files)
+    task_allowed += [a.split(":", 2)[2] for a in ctx.approvals if a.startswith("scope:")]  # human grants
     approved = set(ctx.approvals) | set(ctx.get("approved_actions", set()))  # executor adds mapped actions
     # per-task size limits were enforced at the write boundary; here only paths and the tests rule matter
     return pe.check_scope(changed, task_allowed, approved, lines, limits=False).findings

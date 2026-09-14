@@ -22,6 +22,8 @@ from orchestrator.models.state import NodeStatus, RunStatus
 from orchestrator.models.trace import Kind
 from orchestrator.service import OrchestratorService
 
+REPO = Path(__file__).resolve().parent.parent
+
 
 async def test_run_resumes_in_a_fresh_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -122,3 +124,65 @@ def impl_ok():  # type: ignore[no-untyped-def]
     from orchestrator.engine.outcomes import Success
 
     return Success({"changeset": "cs"})
+
+
+async def test_crashed_process_requeues_running_nodes_and_resume_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A node left RUNNING on disk (process died mid-batch) is re-queued on load; `resume` re-enters."""
+    import json
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    first = OrchestratorService(settings(tmp_path, target_stack="python"))
+    live = await first.start("greenfield")
+    run_id = live.state.run_id
+    with pytest.raises(RuntimeError):  # paused runs keep their checkpoint: resume is not an approval
+        await first.resume(run_id)
+    state_file = tmp_path / "runs" / run_id / "state.json"
+    st = json.loads(state_file.read_text())
+    st["status"], st["nodes"]["approval_design"] = "RUNNING", "RUNNING"  # as left by a crash mid-batch
+    state_file.write_text(json.dumps(st))
+
+    second = OrchestratorService(settings(tmp_path, target_stack="python"))
+    back = await second.live(run_id)
+    assert back is not None and back.state.nodes["approval_design"] == NodeStatus.PENDING
+    inv = [e for e in second.trace.events(run_id) if e.kind == Kind.NODE_INVALIDATED]
+    assert inv and inv[-1].payload["because"] == ["process.restart"]
+    back = await second.resume(run_id, "pdp")
+    assert back.state.status == RunStatus.AWAITING_APPROVAL  # the node ran again and paused as designed
+    resumed = [e for e in second.trace.events(run_id) if e.kind == Kind.RUN_RESUMED]
+    assert resumed[-1].payload["after"] == "process.restart" and resumed[-1].actor == "pdp"
+
+
+async def test_scope_gate_accepts_human_granted_files(tmp_path: Path) -> None:
+    """A `scope:<task>:<path>` grant widened the task at the write boundary; the run-level gate agrees."""
+    from orchestrator.engine.context import RunContext
+    from orchestrator.engine.gates import diff_scope
+    from orchestrator.llm.fake import CANNED
+    from orchestrator.models import load_policy
+    from orchestrator.sandbox.git import GitSandbox
+    from orchestrator.trace.sink import InMemorySink
+
+    policy = load_policy(str(REPO / "policy.yaml"))
+    sandbox = tmp_path / "sandbox"
+    git = GitSandbox(sandbox)
+    await git.ensure_repo()
+    await git.start_run_branch("run/r1")
+    await git.set_run_base()
+    plan = Plan.model_validate(CANNED["Plan"])
+    task = plan.tasks[0].model_copy(update={"allowed_files": ["src/shortener/**"]})
+    plan = plan.model_copy(update={"tasks": [task]})
+    ctx = RunContext(
+        run_id="r1", scenario="t", policy=policy, sandbox=sandbox, trace=InMemorySink(), target_stack="python"
+    )
+    ctx.artifacts["plan"] = __import__("orchestrator.engine.context", fromlist=["Artifact"]).Artifact(
+        "plan", 1, plan, "planning"
+    )
+    (sandbox / "src" / "shortener").mkdir(parents=True)
+    (sandbox / "src" / "shortener" / "x.py").write_text("X = 1\n")
+    (sandbox / "tests" / "unit").mkdir(parents=True)
+    (sandbox / "tests" / "unit" / "test_x.py").write_text("def test_x():\n    assert True\n")
+    findings = await diff_scope(ctx, git)
+    assert [f.file for f in findings if f.rule == "task.allowed_files"] == ["tests/unit/test_x.py"]
+    ctx.approvals.add(f"scope:{task.id}:tests/unit/test_x.py")  # the human granted exactly that file
+    assert await diff_scope(ctx, git) == []

@@ -103,6 +103,22 @@ async def approve(run_id: str, node_id: str, body: Decision) -> dict[str, Any]:
     return {"status": live.state.status, "nodes": live.state.nodes, "pending_approval": _pending_brief(live)}
 
 
+@router.post("/runs/{run_id}/resume")
+async def resume(run_id: str, body: Decision) -> dict[str, Any]:
+    """Continue a run whose API process stopped while it was RUNNING (T12).
+
+    409 when the run is paused or halted (those advance only through approve/answer), 404 when unknown.
+    Emits ``RUN_RESUMED`` (``after="process.restart"``) and runs until the next pause or the end.
+    """
+    if await svc.live(run_id) is None:
+        raise HTTPException(404, "unknown run")
+    try:
+        live = await svc.resume(run_id, body.who)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+    return {"status": live.state.status, "nodes": live.state.nodes, "pending_approval": _pending_brief(live)}
+
+
 @router.post("/runs/{run_id}/rejections/{node_id}")
 async def reject(run_id: str, node_id: str, body: Decision) -> dict[str, Any]:
     """Reject a pending checkpoint: the run safe-stops with ``halt_reason='human.reject'``.

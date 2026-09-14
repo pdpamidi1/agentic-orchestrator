@@ -86,6 +86,12 @@ def approve(run_id: str, node_id: str, who: str = "human") -> None:
 
 
 @app.command()
+def resume(run_id: str, who: str = "human") -> None:
+    """Continue a run whose API process died mid-run (``POST .../resume``); paused runs use approve/answer."""
+    _post(f"/runs/{run_id}/resume", {"who": who})
+
+
+@app.command()
 def reject(run_id: str, node_id: str, reason: str = "", who: str = "human") -> None:
     """Reject a pending checkpoint; the run halts with ``human.reject`` (``POST .../rejections/{node}``)."""
     _post(f"/runs/{run_id}/rejections/{node_id}", {"who": who, "reason": reason})
