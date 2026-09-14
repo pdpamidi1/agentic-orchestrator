@@ -27,6 +27,8 @@ sdlc metrics <run_id>
 sdlc graph | pbcopy                         # mermaid of the DAG
 ```
 Live: `cp .env.example .env`, set `ANTHROPIC_API_KEY`, then `sdlc run --scenario greenfield --record`.
+Offline golden run: start the API with `SDLC_LLM=fake SDLC_TARGET_STACK=python`, run with `--record` and approve
+twice; the run is now in `runs/cache/` and `sdlc run --scenario greenfield --replay` completes it with no key.
 
 ## Layout
 ```

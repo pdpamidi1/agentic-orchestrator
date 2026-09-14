@@ -17,7 +17,7 @@ Status legend: [ ] todo · [~] in progress · [x] done
       assert the run shows `POLICY_DECISION=VIOLATION`, a revert, and attempt 2 passing. This is the demo's best minute.
 - [~] **T6 Live agents** (prep committed; recording blocked: no ANTHROPIC_API_KEY on this machine): run `sdlc run --scenario greenfield --record` with a real key; fix prompts until every schema
       validates within `max_repairs`. Commit `runs/cache/llm/*.json`.
-- [ ] **T7 Claude Code executor**: run `implementation` live via `executors/claude_code_cli.py`; record patches to
+- [~] **T7 Claude Code executor** (prep committed: recording executor, replay-safe cache keys, fake-binary executor tests, offline golden replay; the live Claude Code run needs T6's key): run `implementation` live via `executors/claude_code_cli.py`; record patches to
       `runs/cache/changesets/greenfield/`. Verify `--replay` reproduces the run without a key.
 
 ## Day 2 — scenarios, metrics, docs

@@ -43,6 +43,10 @@ class GitSandbox:
         if rc != 0:
             await self._git("checkout", "-q", branch)
 
+    async def head(self) -> str:
+        _, out = await self._git("rev-parse", "HEAD")
+        return out.strip()
+
     async def base_ref(self) -> str:
         rc, out = await self._git("merge-base", "HEAD", "main")
         return out.strip() if rc == 0 else "HEAD~0"

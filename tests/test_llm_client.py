@@ -17,7 +17,7 @@ from orchestrator.agents.catalog import AGENTS
 from orchestrator.engine.context import RunContext
 from orchestrator.llm.client import AnthropicClient, RecordingClient, ReplayClient
 from orchestrator.llm.fake import CANNED, FakeClient
-from orchestrator.models import Spec
+from orchestrator.models import Plan, Spec
 from orchestrator.service import OrchestratorService
 
 STANDARD_KEYS = {"feedback", "answers", "run_id", "target_stack"}
@@ -124,13 +124,16 @@ async def test_recording_then_replay_round_trips(tmp_path: Path) -> None:
     assert len(files) == 1 and json.loads(files[0].read_text())["schema"] == "Spec"
     replayed, _ = await ReplayClient(cache).structured("sys", "prompt", Spec)
     assert replayed == spec
-    with pytest.raises(FileNotFoundError, match="no cached response"):
-        await ReplayClient(cache).structured("sys", "a different prompt", Spec)
+    # residual prompt drift falls back to the only recorded Spec; a schema never recorded is a miss
+    drifted, _ = await ReplayClient(cache).structured("sys", "a different prompt", Spec)
+    assert drifted == spec
+    with pytest.raises(FileNotFoundError, match="no cached response for Plan"):
+        await ReplayClient(cache).structured("sys", "prompt", Plan)
 
 
 async def test_record_refuses_without_live_agents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     svc = OrchestratorService(settings(tmp_path, llm="auto"))
-    with pytest.raises(RuntimeError, match="--record needs live agents"):
+    with pytest.raises(RuntimeError, match="nothing to record in replay mode"):
         await svc.start("greenfield", record=True)
     assert not (tmp_path / "runs" / "cache").exists()

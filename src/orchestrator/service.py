@@ -14,6 +14,7 @@ from .engine.runner import Runner
 from .executors.base import CodeExecutor
 from .executors.claude_code_cli import ClaudeCodeCliExecutor
 from .executors.fake import FakeExecutor
+from .executors.recording import RecordingExecutor
 from .executors.replay import ReplayExecutor
 from .llm.client import AnthropicClient, LLMClient, RecordingClient, ReplayClient
 from .llm.fake import FakeClient
@@ -40,6 +41,7 @@ class GitRollback:
 class LiveRun:
     ctx: RunContext
     state: RunState
+    record: bool = False  # keep recording after approvals/answers resume the run
 
 
 class OrchestratorService:
@@ -80,11 +82,12 @@ class OrchestratorService:
             if not api_key:
                 raise RuntimeError("SDLC_LLM=anthropic requires ANTHROPIC_API_KEY (or use SDLC_LLM=fake)")
             llm = AnthropicClient(self.s.model, api_key)
-            if record:
-                llm = RecordingClient(llm, self.s.cache_dir / "llm")
             executor = ClaudeCodeCliExecutor()
         else:
             raise ValueError(f"unknown llm mode {mode!r}")
+        if record:  # record once (live or fake), replay forever
+            llm = RecordingClient(llm, self.s.cache_dir / "llm")
+            executor = RecordingExecutor(executor, self.s.cache_dir / "changesets")
         return Runner(self.graph, build_handlers(llm, executor), self.store, GitRollback())
 
     async def start(
@@ -98,9 +101,9 @@ class OrchestratorService:
     ) -> LiveRun:
         run_id = f"{scenario}-{uuid.uuid4().hex[:8]}"
         mode = self._mode(replay)
-        if record and mode != "anthropic":
+        if record and mode == "replay":
             raise RuntimeError(
-                f"--record needs live agents (ANTHROPIC_API_KEY); resolved llm mode is {mode!r}"
+                "--record has nothing to record in replay mode: set ANTHROPIC_API_KEY or SDLC_LLM=fake"
             )
         text = requirement_text or (self.s.specs_dir / f"{scenario}.md").read_text(encoding="utf-8")
         sandbox = self.s.runs_dir / run_id / "sandbox"
@@ -118,7 +121,7 @@ class OrchestratorService:
         for k, v in (extra or {}).items():
             ctx.put(k, v, "intake")
         state = RunState(run_id=run_id, scenario=scenario, nodes=self.graph.initial_statuses())
-        live = LiveRun(ctx, state)
+        live = LiveRun(ctx, state, record=record)
         self.runs[run_id] = live
         live.state = await self._runner(mode, record).run(ctx, state)
         await self._persist_artifacts(live)
@@ -129,7 +132,7 @@ class OrchestratorService:
         node = self.graph.nodes.get(node_id)
         action = node.high_impact if node is not None and node.high_impact else "task.high_impact"
         await self.store.record_approval(run_id, node_id, action, "APPROVED", who)
-        live.state = await self._runner(self._mode(live.ctx.replay), False).approve(
+        live.state = await self._runner(self._mode(live.ctx.replay), live.record).approve(
             live.ctx, live.state, node_id, who
         )
         await self._persist_artifacts(live)
@@ -138,7 +141,7 @@ class OrchestratorService:
     async def reject(self, run_id: str, node_id: str, reason: str, who: str = "human") -> LiveRun:
         live = self.runs[run_id]
         await self.store.record_approval(run_id, node_id, "-", "REJECTED", who)
-        live.state = await self._runner(self._mode(live.ctx.replay), False).reject(
+        live.state = await self._runner(self._mode(live.ctx.replay), live.record).reject(
             live.ctx, live.state, node_id, who, reason
         )
         return live
@@ -146,7 +149,7 @@ class OrchestratorService:
     async def answer(self, run_id: str, answers: dict[str, str], who: str = "human") -> LiveRun:
         live = self.runs[run_id]
         node_id = next(n for n, st in live.state.nodes.items() if st.value == "AWAITING_INPUT")
-        live.state = await self._runner(self._mode(live.ctx.replay), False).answer(
+        live.state = await self._runner(self._mode(live.ctx.replay), live.record).answer(
             live.ctx, live.state, node_id, answers, who
         )
         await self._persist_artifacts(live)

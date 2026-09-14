@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypeVar
@@ -35,22 +36,49 @@ class LLMClient(Protocol):
     ) -> tuple[T, Usage]: ...
 
 
+# Prompts embed volatile tokens that differ between a record run and its replay: run ids
+# (<scenario>-<8 hex>), commit shas, gate timings ("4 passed in 0.67s", took_seconds). None of them carry
+# meaning for the cache, so they are normalised out; template text and artifact content still
+# distinguish keys.
+RUN_ID_RE = re.compile(r"\b[a-z_]+-[0-9a-f]{8}\b")
+HEX_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _normalise(prompt: str) -> str:
+    return NUMBER_RE.sub("<n>", HEX_RE.sub("<hex>", RUN_ID_RE.sub("<run_id>", prompt)))
+
+
 def _key(system: str, prompt: str, schema: type[BaseModel]) -> str:
-    return hashlib.sha256(f"{schema.__name__}\n{system}\n{prompt}".encode()).hexdigest()[:24]
+    return hashlib.sha256(f"{schema.__name__}\n{system}\n{_normalise(prompt)}".encode()).hexdigest()[:24]
 
 
 class ReplayClient:
     def __init__(self, cache_dir: Path) -> None:
         self.cache_dir = cache_dir
 
-    async def structured(
+    def _lookup(self, key: str, schema_name: str) -> Path:
+        p = self.cache_dir / f"{key}.json"
+        if p.exists():
+            return p
+        # residual prompt drift (e.g. tool output wording): fall back to the recorded response for this
+        # schema when there is exactly one, so a golden replay is not derailed by cosmetic differences
+        same = [
+            f
+            for f in sorted(self.cache_dir.glob("*.json"))
+            if json.loads(f.read_text(encoding="utf-8")).get("schema") == schema_name
+        ]
+        if len(same) == 1:
+            return same[0]
+        raise FileNotFoundError(
+            f"no cached response for {schema_name}; run live once with --record ({p.name}, "
+            f"{len(same)} candidates by schema)"
+        )
+
+    async def structured[T: BaseModel](
         self, system: str, prompt: str, schema: type[T], *, max_repairs: int = 2
     ) -> tuple[T, Usage]:
-        p = self.cache_dir / f"{_key(system, prompt, schema)}.json"
-        if not p.exists():
-            raise FileNotFoundError(
-                f"no cached response for {schema.__name__}; run live once with --record ({p.name})"
-            )
+        p = self._lookup(_key(system, prompt, schema), schema.__name__)
         data = json.loads(p.read_text(encoding="utf-8"))
         return schema.model_validate(data["output"]), Usage(**data.get("usage", {}))
 
