@@ -41,6 +41,7 @@ from typing import Protocol
 
 from ..models.state import RUNNABLE, NodeStatus, RunState, RunStatus
 from ..models.trace import Kind
+from .brief import build_brief
 from .conditions import evaluate
 from .context import RunContext
 from .graph import Graph, NodeDef
@@ -347,8 +348,9 @@ class Runner:
                 )
                 ctx.approvals.add(node.id)
             else:
-                summary = {k: str(ctx.get(k))[:500] for k in node.summary_from if ctx.get(k) is not None}
-                return NeedsApproval(action, summary)
+                brief = build_brief(node, ctx, action)  # the human decides on the real proposal + cost
+                ctx.put("approval_brief", brief, node.id)
+                return NeedsApproval(action, brief)
             if node.kind == "approval":
                 return Success()
         # input nodes: pause until answered

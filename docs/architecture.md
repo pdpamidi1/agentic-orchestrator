@@ -19,7 +19,8 @@
 | State | `RunState` persisted on every transition | `models/state.py`, `store/` |
 | Trace | Append-only events (jsonl, memory; Postgres/Kafka in TASKS) | `trace/` |
 | Metrics | Derived from events only | `trace/metrics.py`, `sql/views.sql` |
-| API/CLI | `/runs`, `/approvals`, `/rejections`, `/answers`, `/metrics`, `/trace`, `/artifacts`, `/workflow/mermaid` | `api/`, `cli.py` |
+| API/CLI | `/runs`, `/approvals`, `/rejections`, `/answers`, `/metrics`, `/trace`, `/artifacts`, `/workflow/mermaid`; `GET /runs/{id}/approvals/{node}` and `sdlc brief` return the pending approval brief, and every run/approve/answer reply carries it | `api/`, `cli.py` |
+| Approval brief | Built at every approval pause (`engine/brief.py`) and stored as the `approval_brief` artifact + `APPROVAL_REQUESTED` payload: design (endpoints, tables, packages, layering, decisions), plan (tasks, HIGH tasks, protected paths, anything outside policy), security findings, risks, cost so far from the trace, and for brownfield the contract/structure diff against `repo_map` (endpoints added/restated/removed, tables and packages added). The human decides on the proposal, never on a truncated dump | `engine/brief.py` |
 
 ## Orchestration model
 ```

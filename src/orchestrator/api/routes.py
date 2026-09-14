@@ -78,6 +78,7 @@ async def start_run(body: StartRun, bg: BackgroundTasks) -> dict[str, Any]:
         "status": live.state.status,
         "nodes": live.state.nodes,
         "pending_questions": live.state.pending_questions,
+        "pending_approval": _pending_brief(live),
     }
 
 
@@ -99,7 +100,7 @@ async def approve(run_id: str, node_id: str, body: Decision) -> dict[str, Any]:
     ``KeyError`` in the service (500). Returns the new run status and node statuses.
     """
     live = await svc.approve(run_id, node_id, body.who)
-    return {"status": live.state.status, "nodes": live.state.nodes}
+    return {"status": live.state.status, "nodes": live.state.nodes, "pending_approval": _pending_brief(live)}
 
 
 @router.post("/runs/{run_id}/rejections/{node_id}")
@@ -126,7 +127,26 @@ async def answer(run_id: str, body: Answers) -> dict[str, Any]:
         "status": live.state.status,
         "spec_version": live.ctx.version("spec"),
         "plan_version": live.state.plan_version,
+        "pending_approval": _pending_brief(live),
     }
+
+
+def _pending_brief(live: Any) -> dict[str, Any] | None:
+    """The approval brief of the node currently waiting, if the run is paused on an approval."""
+    if live.state.status != "AWAITING_APPROVAL":
+        return None
+    brief = live.ctx.get("approval_brief")
+    return brief if isinstance(brief, dict) else None
+
+
+@router.get("/runs/{run_id}/approvals/{node_id}")
+async def approval_brief(run_id: str, node_id: str) -> dict[str, Any]:
+    """The detailed brief (design, plan, cost, contract/structure changes) for a pending approval."""
+    live = svc.runs.get(run_id)
+    brief = live.ctx.get("approval_brief") if live else None
+    if not isinstance(brief, dict) or brief.get("node") != node_id:
+        raise HTTPException(404, f"no pending approval brief for {node_id}")
+    return brief
 
 
 class Deliver(BaseModel):

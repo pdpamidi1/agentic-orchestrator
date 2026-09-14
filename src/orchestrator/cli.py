@@ -33,7 +33,11 @@ def _post(path: str, body: dict) -> None:  # type: ignore[type-arg]
     """
     r = httpx.post(f"{BASE}{path}", json=body, timeout=3600)
     r.raise_for_status()
-    typer.echo(json.dumps(r.json(), indent=2))
+    data = r.json()
+    brief = data.pop("pending_approval", None) if isinstance(data, dict) else None
+    typer.echo(json.dumps(data, indent=2))
+    if brief:  # the run is waiting for a human: show the full proposal, not just the status
+        typer.echo("\n" + brief["markdown"])
 
 
 @app.command()
@@ -55,6 +59,13 @@ def run(
 def status(run_id: str) -> None:
     """Print the live ``RunState`` (``GET /runs/{run_id}``); prints the 404 body for an unknown run."""
     typer.echo(json.dumps(httpx.get(f"{BASE}/runs/{run_id}").json(), indent=2))
+
+
+@app.command()
+def brief(run_id: str, node_id: str = "approval_design") -> None:
+    """Print the detailed brief for a pending approval (``GET .../approvals/{node}``)."""
+    r = httpx.get(f"{BASE}/runs/{run_id}/approvals/{node_id}")
+    typer.echo(r.json()["markdown"] if r.status_code == 200 else json.dumps(r.json(), indent=2))
 
 
 @app.command()
