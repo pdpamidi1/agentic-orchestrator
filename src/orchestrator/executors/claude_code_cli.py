@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -178,14 +179,16 @@ class ClaudeCodeCliExecutor:
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # own process group: a timeout kills the agent AND its builds
             )
             try:
                 out, err = await asyncio.wait_for(
                     proc.communicate(), timeout=ctx.policy.budgets.node_timeout_seconds
                 )
             except (TimeoutError, asyncio.CancelledError):
-                proc.kill()  # no orphaned agent keeps editing the sandbox after we stop waiting
-                await proc.wait()
+                # no orphaned agent keeps editing the sandbox after we stop waiting, and no orphaned
+                # `mvn verify` / `java -jar` keeps a port or the target/ dir busy for the next attempt
+                await _kill_tree(proc)
                 raise
         except TimeoutError:
             return Errored("claude code timeout", transient=True)
@@ -270,6 +273,28 @@ class ClaudeCodeCliExecutor:
             cost_usd=cost,
             notes=reported.get("notes", ""),
         )
+
+
+async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
+    """Terminate the agent's whole process group (SIGTERM, 5 s grace, then SIGKILL) and reap it.
+
+    The CLI is started with ``start_new_session=True`` so its pid is the group id; every build tool or
+    application it launched belongs to that group. Falls back to killing only the CLI when the group is
+    already gone.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+            break
+        except TimeoutError:
+            continue
+    if proc.returncode is None:
+        proc.kill()
+        await proc.wait()
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:

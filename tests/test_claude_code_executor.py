@@ -28,8 +28,11 @@ pathlib.Path("../claude_args.txt").write_text("\\n".join(sys.argv[1:]))
 mode = pathlib.Path("../fake_claude_mode")
 mode = mode.read_text().strip() if mode.exists() else "done"
 if mode == "hang":
-    import time
+    import subprocess, time
 
+    # a long build the agent started (mvn verify, java -jar): must die with the agent on timeout
+    child = subprocess.Popen(["sleep", "60"])
+    pathlib.Path("../child_pid").write_text(str(child.pid))
     time.sleep(30)
     sys.exit(0)
 if mode == "crash":
@@ -154,3 +157,15 @@ async def test_timeout_kills_the_headless_process(tmp_path: Path) -> None:
     out, _ = await proc.communicate()
     left = out.decode().strip()
     assert left == "", f"orphaned headless claude still running: {left}"
+    # the whole process group went with it: the agent's build child is gone too (no orphan holds a port
+    # or the target/ directory for the next attempt)
+    child = int((tmp_path / "child_pid").read_text())
+    await asyncio.sleep(0.2)
+    proc = await asyncio.create_subprocess_exec(
+        "ps", "-o", "stat=", "-p", str(child), stdout=asyncio.subprocess.PIPE
+    )
+    out, _ = await proc.communicate()
+    state = out.decode().strip()
+    assert state == "" or state.startswith("Z"), (
+        f"agent's build child {child} survived the timeout: {state!r}"
+    )
