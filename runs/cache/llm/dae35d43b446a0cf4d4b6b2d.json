@@ -1,0 +1,213 @@
+{
+  "schema": "RiskRegister",
+  "output": {
+    "risks": [
+      {
+        "id": "R-01",
+        "description": "Hot-path latency regression on GET /{short_code}: the additional transactional outbox INSERT (plus index maintenance on idx_click_outbox_claim, longer transaction hold, and Hikari connection contention with the poller, consumer and retention job) pushes p95 above the +5% budget (AC-13, US-2). Carries impact risk R-1.",
+        "likelihood": "high",
+        "severity": "high",
+        "mitigation": "Single narrow INSERT with pre-computed values (hash and referrer host computed in-memory, no DNS/no reverse lookup, no extra round trips); reuse the already-open redirect transaction; forbid any Kafka/network call on the request thread by the layering rule that analytics.recording must not depend on analytics.kafka/outbox; run poller/retention on the dedicated bounded analytics TaskScheduler and size/segregate the connection pool so background jobs cannot starve request threads; keep analytics recording behind a runtime feature flag so it can be disabled without redeploy.",
+        "detection": "CI load-test gate comparing candidate p95 of GET /{short_code} against the recorded pre-change baseline and failing the build above +5% (AC-13); production per-endpoint latency histograms, DB statement timers on the outbox INSERT, Hikari pool wait-time/pending-connection metrics with alerts on p95 drift."
+      },
+      {
+        "id": "R-02",
+        "description": "Transaction-semantics conflict: AC-1 requires the outbox row in the same transaction as redirect handling, while AC-3/US-2 require the redirect to be unaffected by analytics failures. If the INSERT fails inside a Spring/JPA transaction, catching and logging the exception does not undo the rollback-only marking or the poisoned persistence context, so the redirect can still return 500 instead of 302.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Perform the outbox write via a plain JDBC/JdbcTemplate statement in the current transaction (no JPA flush of a broken persistence context), validate and clamp all values before the statement so constraint violations are impossible by construction, and explicitly define the required behaviour when the outbox write fails (redirect succeeds and the click is lost, vs redirect fails) - this is an open specification gap between AC-1 and AC-3 that must be answered before implementation rather than assumed.",
+        "detection": "Integration test that forces the outbox INSERT to fail (constraint violation, table missing, statement timeout) and asserts the response is still the unchanged 302 with Location header and no rollback-only exception surfaces; production counter of outbox-write failures alongside redirect 5xx rate."
+      },
+      {
+        "id": "R-03",
+        "description": "Bounded retries cause permanent analytics data loss during a broker outage longer than the retry window: with 5 attempts / cap 10s / full jitter, a claimed row exhausts attempts within roughly a minute and is moved to terminal FAILED, contradicting AC-3's promise that events 'remain pending in the outbox for later publication' during an outage.",
+        "likelihood": "high",
+        "severity": "high",
+        "mitigation": "Classify failures: broker-unreachable / no-leader / timeout errors must reschedule the row as PENDING with backoff (attempt counter not consumed or a separate unbounded-but-backed-off path capped by retention), while non-retryable errors (serialisation, record-too-large, authorization) go terminal FAILED; make attempt bounds configurable per AMB-12 and document the chosen semantics; require an operational runbook for re-driving FAILED rows. The exact boundary between AC-3 (retain pending) and AC-5 (bounded, terminal after exhaustion) is an ambiguity that needs an explicit answer.",
+        "detection": "Chaos/integration test that stops the broker for longer than the retry window and asserts events are still published after recovery; alerts on any non-zero click_outbox rows in FAILED state, on outbox backlog age (oldest PENDING occurred_at) and on the outbox-failed counter."
+      },
+      {
+        "id": "R-04",
+        "description": "Unbounded outbox growth and hot-path degradation during a prolonged broker or consumer outage: PENDING rows are deliberately excluded from the 90-day purge, so table and claim-index bloat grows without limit, slowing the redirect INSERT and the claim query in the shared database.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Expose a backlog-size gauge and a documented shed threshold: beyond it, either disable click recording via the feature flag (redirect keeps working, analytics gaps are accepted and logged) or drain to a bounded overflow/terminal state with an explicit operator decision; keep the claim query index-only over (status,next_attempt_at,id); document the maximum expected backlog per the peak redirect rate and the disk budget for 90 days of rows.",
+        "detection": "Backlog count and oldest-PENDING-age gauges with warning/critical alerts; database table/index size and autovacuum/bloat metrics; load test at peak rate with the broker stopped to measure INSERT and claim latency as the backlog grows."
+      },
+      {
+        "id": "R-05",
+        "description": "Raw client IP leakage into the outbox table, Kafka payload/headers, click_stats, application or access logs, MDC, or exception stack traces, breaching AC-10 and US-4. Carries impact risk R-5.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Hash at the earliest boundary inside analytics.recording.IpHasher; no IP-typed or IP-named field on ClickOutboxEntry, ClickEventMessage or any DTO; enforce the layering rule that InetAddress/remote-address values are referenced only in IpHasher and the request-reading controller; truncate last_error and forbid payload echoing in it; scrub IP/Referer from log patterns and from the global exception handler; never log the salt.",
+        "detection": "Unit/integration tests regex-asserting persisted rows, produced Kafka records (value plus headers) and captured log output contain no IPv4/IPv6 literal; an ArchUnit/static rule banning IP types outside IpHasher; observability log-scanning rule alerting on IP-shaped strings emitted by this service."
+      },
+      {
+        "id": "R-06",
+        "description": "Re-identification risk from a single static, never-rotated salt: SHA-256 over a 32-bit IPv4 space is exhaustively enumerable if the salt is ever disclosed (log, heap dump, config repo, backup), turning hashed_ip into recoverable personal data despite the pseudonymisation claim.",
+        "likelihood": "low",
+        "severity": "high",
+        "mitigation": "Store the salt only in the existing secret mechanism with restricted access and no default/committed literal; fail fast at startup when it is absent or weak rather than hashing with an empty salt; exclude hashed_ip from any API response and from analytics exports; record the accepted residual risk with the data protection officer, noting that salt rotation and re-hashing are declared non-goals so no compensating control exists in this release.",
+        "detection": "Startup validation test asserting the application refuses to boot with a missing/blank salt; secret-scanning gate over the repository and rendered config; periodic review that no endpoint or log exposes hashed_ip."
+      },
+      {
+        "id": "R-07",
+        "description": "Duplicate or double-counted clicks: at-least-once Kafka delivery plus a crash between a successful publish and marking the outbox row PUBLISHED re-publishes the same event; a check-then-write consumer or a failed dedupe insert would then inflate click_stats (AC-6).",
+        "likelihood": "high",
+        "severity": "medium",
+        "mitigation": "Insert-first dedupe: write idempotency_key into processed_click_event inside the same transaction as the aggregate upserts and treat a primary-key conflict as a no-op return (ADR-4); carry the key end-to-end in the message header; keep the aggregate upsert and the dedupe insert in one transaction so partial application is impossible; monotonic GREATEST for last_clicked_at so out-of-order redelivery cannot move it backwards.",
+        "detection": "Test replaying an identical event (and a concurrent duplicate from two consumer threads) and asserting total_clicks, last_clicked_at and day buckets are unchanged (AC-6); duplicate-skipped counter and a reconciliation job comparing PUBLISHED outbox rows against processed_click_event rows."
+      },
+      {
+        "id": "R-08",
+        "description": "Late duplicate after retention: processed_click_event rows are purged at 90 days, so a redelivery or manual re-drive of an event older than the cutoff re-increments click_stats, which is never corrected because aggregates are retained forever.",
+        "likelihood": "low",
+        "severity": "low",
+        "mitigation": "Keep the dedupe ledger retention greater than or equal to the maximum broker retention plus any re-drive window, and document that manual re-drives of events older than the cutoff are forbidden without an aggregate reconciliation step.",
+        "detection": "Test asserting an event whose dedupe row was purged is rejected or reconciled rather than silently re-aggregated; alert on aggregate increments whose occurred_at is older than the retention cutoff."
+      },
+      {
+        "id": "R-09",
+        "description": "Irrecoverable aggregates: the design keeps no durable raw click event table (outbox rows are purged and only the aggregate survives), so any aggregation bug, dropped FAILED event or bad deployment produces click_stats values that can never be recomputed or corrected. The impact analysis also references a click_events table that does not exist in the data model, indicating an unresolved scope gap for AC-12's 'raw click event rows'.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Resolve explicitly whether raw click rows are retained as a separate table (as the impact analysis assumes) or whether click_outbox is the raw store (as the data model implies), and record the answer before implementation; rely on Kafka topic retention as the only replay source and document the replay procedure including its dedupe-ledger interaction; keep the aggregation upserts trivially auditable (one increment per dedupe row).",
+        "detection": "Design review checklist item reconciling AC-12 wording with the migration set; consistency check comparing sum(click_stats_daily.click_count) with click_stats.total_clicks and with processed_click_event counts per short_code, alerting on divergence."
+      },
+      {
+        "id": "R-10",
+        "description": "SQL portability/dialect failure: the design uses PostgreSQL-specific constructs (FOR UPDATE SKIP LOCKED with LIMIT, ON CONFLICT, GREATEST over timestamptz, regex CHECK with '~', GENERATED BY DEFAULT AS IDENTITY, COMMENT ON COLUMN). If tests or local runs use H2/another dialect, claim and upsert paths behave differently or fail only in production; the migration body also omits the hashed_ip regex CHECK listed in the table constraints.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Run all persistence and integration tests against the production engine via Testcontainers, not an in-memory substitute; keep the claim/upsert statements as native queries in the repository layer with dialect assumptions documented; reconcile the constraint list with the migration DDL so the applied schema matches the design exactly; forward-only immutable Flyway scripts renumbered above the highest existing version.",
+        "detection": "Testcontainers-backed integration tests exercising claim, upsert and purge statements; Flyway validate/checksum and migration dry-run gates in CI; schema-diff assertion comparing the applied schema against the documented constraints."
+      },
+      {
+        "id": "R-11",
+        "description": "Consumer stalls or rebalance loop: the shared blocking RetryExecutor runs on the KafkaListener thread, so retry sleeps plus per-attempt timeouts over a batch can exceed max.poll.interval.ms, causing partition revocation, repeated redelivery and no forward progress; a poison message could also block its partition indefinitely.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Bound total in-listener retry time to a documented fraction of max.poll.interval.ms (attempts x per-attempt timeout + max backoff), tune max.poll.records, and for non-retryable/poison payloads commit past the record after logging and metering a terminal failure (tolerant reader: unknown fields ignored, missing optional fields defaulted) instead of retrying forever; no dead-letter topic is available because topic provisioning is out of scope, so the terminal-drop behaviour must be explicitly approved.",
+        "detection": "Consumer lag, rebalance-count, processing-time and consumer-failed counters with alerts; integration test injecting a malformed and a permanently failing record and asserting the partition continues to advance."
+      },
+      {
+        "id": "R-12",
+        "description": "Multi-instance scheduled job contention: every replica runs the @Scheduled poller and the retention job with no leader election, causing claim conflicts, lock waits or deadlocks on click_outbox and concurrent large DELETEs in the database shared with the redirect hot path. Carries impact risk R-7 and R-9.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Bounded batches claimed with ORDER BY id FOR UPDATE SKIP LOCKED and short claim transactions; single-threaded poller per instance with configurable interval/batch (defaults 500ms/100); retention purge in bounded batches on the analytics scheduler with an off-peak window, idempotent and safely re-runnable, scoped strictly to click_outbox (non-PENDING) and processed_click_event so aggregates are never touched.",
+        "detection": "Multi-instance integration test asserting no event is published twice and no instance starves; DB lock-wait/deadlock metrics, claim-conflict and batch-duration counters, purge duration/rows-deleted metrics with alerts on job overrun."
+      },
+      {
+        "id": "R-13",
+        "description": "Backward-compatibility break on existing contracts: wiring the recorder into the read path or plugging the new stats controller into shared security/DTO/error configuration changes status codes, the Location header, the problem+json error shape or auth behaviour for GET /{short_code}, POST /api/v1/urls or GET /api/v1/urls/{short_code} (AC-14, US-6). The committed OpenAPI also documents 302 and a placeholder bearerAuth scheme that may not match the running application (ADR-16).",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Change-by-addition only: new code in com.example.shortener.analytics.* invoked from one seam in the read handler, no edits to existing DTOs, handlers or the security configuration; reconcile the documented redirect status and auth scheme byte-for-byte with the running application before the contract gate; errors emitted only by the existing global exception handler.",
+        "detection": "Existing contract/integration suite (com.example.shortener.it) executed unmodified as a release gate; OpenAPI diff between the committed spec and the springdoc dump plus a baseline-vs-candidate response-schema diff; smoke test asserting the exact redirect status and Location header."
+      },
+      {
+        "id": "R-14",
+        "description": "Unanswered ambiguities materialised as defaults diverge from stakeholder intent: retry bounds (AMB-12), stats store (AMB-13), zero-click response (AMB-14), sparse vs dense clicks_by_day (AMB-15), purge trigger (AMB-16), idempotency key scope (AMB-17) and poller cadence (AMB-18). A different answer invalidates the data model and API contract after implementation.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Treat the recorded defaults as provisional and obtain explicit confirmation before the contract and schema are frozen; keep every default behind configuration (retry bounds, cadence, batch sizes, retention days) so only AMB-14/AMB-15 (response shape) and AMB-13/AMB-17 (schema) require code or migration changes; state in the design that any deviation requires a design revision.",
+        "detection": "Governance checklist requiring each ambiguity to be answered or explicitly waived before the contract gate; contract tests pinned to the chosen zero-click and sparse-list semantics so a late change fails the build loudly."
+      },
+      {
+        "id": "R-15",
+        "description": "Misleading eventual-consistency reporting: as_of falls back to now() when no click_stats row exists, so a short code whose clicks are still pending in the outbox looks like a freshly updated zero-click aggregate; clients may also treat stats as real-time (AC-15, US-3).",
+        "likelihood": "medium",
+        "severity": "low",
+        "mitigation": "Document eventual consistency in the OpenAPI description and define the no-aggregate as_of semantics explicitly (current instant, total_clicks=0, last_clicked_at=null, empty clicks_by_day); serve stats only from aggregates, never from the outbox, so the read path stays off the analytics write path.",
+        "detection": "Contract tests for the unknown-code (404), existing-but-zero-clicks (200/0/null/empty) and published-but-unconsumed cases asserting as_of semantics; monitoring of end-to-end lag between outbox occurred_at and click_stats.updated_at."
+      },
+      {
+        "id": "R-16",
+        "description": "Stats endpoint performance and hot-code skew: the 30-day window query over click_stats_daily, or a very popular short_code whose day-bucket row is updated on every click, creates row contention with the consumer and slow reads under load.",
+        "likelihood": "low",
+        "severity": "medium",
+        "mitigation": "Bound the query to 30 days using idx_click_stats_daily_window (short_code, day DESC) and select only the needed columns; keep the per-day upsert as a single atomic ON CONFLICT increment (no read-modify-write, per ADR-6); batch consumer processing per key where possible to reduce update frequency on hot rows.",
+        "detection": "Query-plan and latency test on the stats endpoint against a large click_stats_daily dataset; endpoint latency histogram plus DB row-lock wait metrics for click_stats/click_stats_daily."
+      },
+      {
+        "id": "R-17",
+        "description": "New dependency risk from spring-kafka/kafka-clients (and Testcontainers): version conflicts with the existing managed BOM, slower startup, transitive CVEs, or a client/broker incompatibility that only manifests at runtime against the infrastructure-owned cluster. Carries impact risk R-3.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Pin versions through the existing dependency-management BOM, keep test-only libraries in test scope, run a dependency-convergence check, and verify client/broker compatibility and the url.clicked topic existence with the infrastructure owners before release.",
+        "detection": "Build-time dependency convergence and SCA/CVE scan gates; startup health check on producer/consumer factory creation and topic metadata; Testcontainers Kafka integration test in CI."
+      },
+      {
+        "id": "R-18",
+        "description": "Operational dependency on infrastructure: the url.clicked topic is provisioned outside this release (non-goal). If it is missing, misconfigured (wrong partition count, auto-create disabled, insufficient retention) or lacks producer/consumer ACLs, publishing fails everywhere at once and per-short_code ordering guarantees may not hold after a partition-count change.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Make the topic a documented, verified deploy precondition with required partitions, retention (>= re-drive window) and ACLs; fail the deployment smoke test rather than the redirect path when metadata is unavailable; keep messages keyed by short_code and freeze the partition count to preserve ordering; record schema_version and event-version headers so payload evolution stays tolerant.",
+        "detection": "Post-deploy smoke check querying topic metadata and performing a canary publish/consume; producer error-by-type counters (authorization, unknown-topic) alerting distinctly from transient timeouts; alert on partition-count change."
+      },
+      {
+        "id": "R-19",
+        "description": "Migration and rollback hazards: adding four tables plus indexes to the live shortener schema can take locks or fail mid-way, and the documented rollback (DROP TABLE of the analytics tables) destroys in-flight PENDING outbox rows and all aggregates. Carries impact risk R-2.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Pure expand step with zero ALTERs on existing tables so the previous application binary and the new schema coexist; create indexes concurrently where the engine allows; rehearse migration and rollback on a production-sized snapshot; make binary rollback (redeploy previous artifact, leave the tables in place) the standard path and treat the DROP TABLE script as an exceptional, approved cleanup only after confirming no PENDING rows and accepting aggregate loss.",
+        "detection": "Migration dry-run, Flyway validate and duration/lock-wait metrics during deploy; post-deploy smoke test asserting redirect and POST /api/v1/urls behave unchanged and the new tables exist with expected constraints; pre-rollback check on PENDING outbox row count."
+      },
+      {
+        "id": "R-20",
+        "description": "Clock and time-zone correctness: occurred_at is taken from application clocks across replicas, so skew can place a click in the wrong UTC day bucket or (with GREATEST) pin last_clicked_at to a future instant; using the JVM default zone anywhere for day bucketing breaks AC-7/AC-11 expectations.",
+        "likelihood": "low",
+        "severity": "medium",
+        "mitigation": "Derive all day buckets with an explicit UTC conversion in SQL (occurred_at AT TIME ZONE 'UTC') and never from the JVM default zone; use timestamptz columns end-to-end; inject a Clock for testability; keep NTP synchronisation as a platform requirement; consider clamping obviously future occurred_at values and metering such events.",
+        "detection": "Tests running with a non-UTC JVM default zone asserting identical bucketing; boundary tests at 23:59:59Z/00:00:00Z; alert on last_clicked_at values in the future or on aggregate updates for future day buckets."
+      },
+      {
+        "id": "R-21",
+        "description": "The +5% p95 latency gate itself is fragile: no recorded pre-change baseline, noisy CI runners, or an unrepresentative load profile makes the gate either falsely red (blocking release) or falsely green (shipping a regression). AC-13 presumes a baseline that the brownfield workspace may not have.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Capture and version the baseline from the unmodified build on the same runner class and dataset before the change lands; run repeated iterations with warm-up and use a stable percentile estimator; define the measurement protocol (duration, concurrency, dataset size, analytics enabled) as part of the gate configuration; treat baseline absence as a blocking precondition, not an assumption.",
+        "detection": "Gate report publishing baseline vs candidate p95 with run-to-run variance; trend dashboard of the gate metric across builds to expose noise; production p95 comparison against the pre-release window after deploy."
+      }
+    ],
+    "trade_offs": [
+      "Transactional outbox over direct publish from the request thread: buys redirect availability and latency independence from Kafka (AC-3, US-2) at the cost of one extra write on the hot path, a new table on the shared database, an additional moving part (poller), and end-to-end delivery latency of at least one poll interval.",
+      "Bounded retries with terminal FAILED state over infinite retry: buys bounded resource use and no unbounded retry loops (AC-5) at the cost of possible permanent analytics loss during outages longer than the retry window, requiring an explicit operator re-drive procedure.",
+      "Eventual consistency with an as_of timestamp over strongly consistent reads: keeps the read path cheap and the write path off the query path at the cost of stale totals immediately after a click and of client confusion that must be handled by documentation, not by code.",
+      "click_stats/click_stats_daily in the shortener's own database (AMB-13 default) over a dedicated analytics store: avoids new protected infrastructure and cross-store consistency at the cost of coupling analytics write/read load, storage growth and purge activity to the database serving redirects.",
+      "Normalised click_stats_daily table over a JSON clicks_by_day column: enables atomic per-day increments and indexed 30-day window queries at the cost of an extra table, an extra FK/upsert per event and a second write per click.",
+      "Sparse ascending clicks_by_day and 200/0/null/empty for zero-click codes (AMB-14/AMB-15 defaults) over dense zero-filled days: smaller payload and no server-side calendar synthesis, but every client must zero-fill locally and cannot distinguish 'no data yet' from 'no clicks' without reading total_clicks.",
+      "Random per-redirect UUID idempotency key (ADR-3) over a deterministic content hash: never collapses two genuine clicks sharing timestamp/IP hash/referrer, but cannot suppress duplicates created before the key is assigned and requires a durable dedupe ledger in the consumer.",
+      "In-process poller with FOR UPDATE SKIP LOCKED over leader election or a separate worker service: no new coordination infrastructure or single point of failure, at the cost of every replica competing on the same table and sharing the application's thread and connection budget with request handling.",
+      "In-process scheduled purge (AMB-16 default) over partition drop: no protected DDL or infrastructure ownership now, at the cost of repeated bounded DELETEs, bloat pressure on the shared database, and deferral of the cheaper partition-drop design to a later contract release.",
+      "Single static, never-rotated salt (non-goal to rotate) over rotating salts or a keyed HMAC in an HSM: simple and keeps hashes comparable over time, but a salt disclosure makes the small IP space enumerable and there is no remediation path for historical hashes.",
+      "Retaining aggregates forever while purging raw rows at 90 days: satisfies the retention policy and keeps long-term trends, but removes any ability to recompute aggregates, so an aggregation defect is permanent.",
+      "Additive-only API under the existing /api/v1 prefix and auth scheme (ADR-14/ADR-16) over a cleaner /api/v2 shape: guarantees existing consumers keep working and the contract suite passes unmodified, at the cost of carrying pre-existing contract quirks forward unchanged.",
+      "Blocking retry inside the Kafka listener over an async/dead-letter pipeline: avoids infrastructure-owned topic provisioning, at the cost of consumption throughput during retries and rebalance risk if total retry time approaches max.poll.interval.ms."
+    ],
+    "failure_scenarios": [
+      "Kafka unreachable or slower than the per-attempt timeout: GET /{short_code} continues to return its unchanged status and Location header with no Kafka call on the request thread; outbox rows accumulate as PENDING with exponential backoff plus full jitter; stats responses go stale and as_of stops advancing; expected degraded mode is 'redirects fully healthy, analytics delayed', with alerts on backlog age. Safe-stop threshold: when the backlog exceeds the documented limit an operator disables click recording via the feature flag (redirect unaffected, clicks knowingly dropped) rather than letting the table grow without bound.",
+      "Broker outage outlasting the retry budget: affected rows reach terminal FAILED with a truncated last_error and a metric; the system must not retry them forever. Expected behaviour is an alert on non-zero FAILED rows plus a documented operator re-drive (reset to PENDING) after recovery; until the AC-3/AC-5 boundary is clarified (R-03), these events are analytics loss, not silent success.",
+      "Database unavailable or statement timeout during a redirect: the existing redirect behaviour governs the response (unchanged error contract); no partially written outbox row may exist because the row is committed in the redirect transaction. On recovery the poller resumes from PENDING rows; no compensating action is required.",
+      "Outbox INSERT fails while the redirect resolution succeeded: the required behaviour is that the redirect response stays unchanged (302 + Location) and the click is counted as lost via an outbox-write-failure metric; the implementation must not leave the transaction rollback-only. If atomicity (AC-1) is deemed to outrank redirect availability (AC-3), the alternative behaviour must be explicitly approved - this is currently an unresolved conflict, not an implementation choice.",
+      "Application crash between a successful Kafka publish and marking the row PUBLISHED: after restart the poller re-claims the row and republishes; the consumer's insert-first processed_click_event guard makes the second delivery a no-op, so click_stats, last_clicked_at and clicks_by_day still reflect the click exactly once (AC-6).",
+      "Duplicate or out-of-order delivery: duplicates are dropped by the dedupe ledger and counted as duplicate-skipped; out-of-order events cannot move last_clicked_at backwards because it is updated with GREATEST, and day buckets are keyed by the event's own UTC day.",
+      "Poison or unparsable url.clicked payload: the tolerant reader ignores unknown fields and defaults missing optional ones; a genuinely undeserialisable or permanently failing record is logged and metered as a terminal consumer failure and the offset advances so the partition is never blocked. No dead-letter topic exists in this release, so the terminal drop must be alerted on and accepted.",
+      "Consumer retry time approaching max.poll.interval.ms: the listener must bound total retry time below the poll interval; if a rebalance loop is detected the expected safe-stop is to pause/stop the listener container (consumer lag grows, redirects and the stats endpoint keep serving stale aggregates) rather than churn partitions indefinitely.",
+      "Two or more replicas polling concurrently: FOR UPDATE SKIP LOCKED with bounded batches guarantees each row is claimed by exactly one instance; contention shows up as claim-conflict and lock-wait metrics only. If lock waits threaten the redirect path, reduce batch size or increase the poll interval via configuration (no redeploy).",
+      "Retention purge overruns or contends with live traffic: purge runs in bounded batches and must be safely interruptible; on overrun it stops at the batch boundary (safe-stop) leaving older rows for the next run, and it never deletes click_stats, click_stats_daily or PENDING outbox rows. Alerting on non-decreasing oldest-raw-row age detects a stuck purge.",
+      "Stats requested for a short code with pending or unconsumed clicks: response is 200 with the aggregate as it currently stands and an as_of reflecting the last aggregate update (AC-15); it must never read the outbox or block on the consumer.",
+      "Stats requested for an unknown short code: 404 problem+json from the global exception handler (AC-9); no aggregate row is created as a side effect.",
+      "Migration failure mid-deploy: Flyway aborts, the release is stopped before the new binary serves traffic, and the previous artifact keeps running against the partially applied schema because all changes are additive (no ALTERs on existing tables). Remediation is a forward fix-up migration, never editing an applied script.",
+      "Bad analytics release detected after deploy (latency regression, privacy defect, aggregation bug): primary rollback is redeploying the previous application artifact - the new tables simply stop receiving writes and existing contracts are unaffected; fastest mitigation without redeploy is the recording feature flag. Dropping the analytics tables is an exceptional, approved action only after confirming no PENDING rows and accepting permanent loss of click_stats, since aggregates cannot be recomputed.",
+      "CI load-test gate reports p95 above baseline +5%: the build fails and the release is blocked (AC-13). If no valid recorded baseline exists, the gate must fail as inconclusive rather than pass by default.",
+      "Salt missing, blank or unreadable at startup: the application fails fast and refuses to start the analytics module (safe-stop) instead of hashing with an empty salt; if the module can be started without recording, the documented behaviour is recording disabled with a critical alert, never plaintext or unsalted IP storage."
+    ]
+  },
+  "usage": {
+    "tokens_in": 28776,
+    "tokens_out": 12936,
+    "cost_usd": 0.46728
+  }
+}

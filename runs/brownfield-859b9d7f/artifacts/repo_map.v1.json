@@ -1,0 +1,64 @@
+{
+  "stack": "java",
+  "root_packages": [
+    "com",
+    "sdlc"
+  ],
+  "packages": [
+    "com.example.shortener",
+    "com.example.shortener.api.dto",
+    "com.example.shortener.api.error",
+    "com.example.shortener.codegen",
+    "com.example.shortener.config",
+    "com.example.shortener.domain",
+    "com.example.shortener.it",
+    "com.example.shortener.read",
+    "com.example.shortener.write",
+    "sdlc"
+  ],
+  "imports": {
+    "com.example.shortener": [
+      "com.example.shortener.config"
+    ],
+    "com.example.shortener.api.error": [
+      "com.example.shortener.api.dto"
+    ],
+    "com.example.shortener.codegen": [
+      "com.example.shortener.config",
+      "com.example.shortener.domain"
+    ],
+    "com.example.shortener.it": [
+      "com.example.shortener",
+      "com.example.shortener.domain",
+      "com.example.shortener.read"
+    ],
+    "com.example.shortener.read": [
+      "com.example.shortener.api.error",
+      "com.example.shortener.config",
+      "com.example.shortener.domain"
+    ],
+    "com.example.shortener.write": [
+      "com.example.shortener.api.dto",
+      "com.example.shortener.api.error",
+      "com.example.shortener.codegen",
+      "com.example.shortener.config",
+      "com.example.shortener.domain"
+    ]
+  },
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/api/v1/urls",
+      "module": "com.example.shortener.write"
+    },
+    {
+      "method": "GET",
+      "path": "/{short_code}",
+      "module": "com.example.shortener.read"
+    }
+  ],
+  "tables": [
+    "urls"
+  ],
+  "files": 75
+}

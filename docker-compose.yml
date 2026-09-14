@@ -28,6 +28,7 @@ services:
     depends_on:
       shortener-postgres: { condition: service_healthy }
       shortener-redis: { condition: service_healthy }
+      shortener-kafka: { condition: service_healthy }   # click analytics: outbox relay + url.clicked consumer
     ports: ["8081:8080"]
     environment:                                # the variables the delivered app documents (application.yml)
       SHORTENER_DB_URL: jdbc:postgresql://shortener-postgres:5432/shortener
@@ -37,12 +38,15 @@ services:
       SHORTENER_REDIS_PORT: "6379"
       SHORTENER_BASE_URL: http://localhost:8081  # short_url host returned by POST /api/v1/urls
       # SPRING_PROFILES_ACTIVE: read | write      # default = both surfaces
-      SPRING_KAFKA_BOOTSTRAP_SERVERS: shortener-kafka:9092   # used only when the project has the Kafka starter
-  # Kafka for the brownfield click-analytics scenario (url.clicked topic); greenfield needs none (ADR-012).
-  # Start it on demand: docker compose --profile shortener --profile shortener-kafka up -d
+      # click analytics (docs/analytics.md in the project): broker of the url.clicked topic and the
+      # salt of the client-IP hash (>= 16 chars; a local-only value here, a real secret in production)
+      SHORTENER_KAFKA_BOOTSTRAP_SERVERS: shortener-kafka:9092
+      SHORTENER_ANALYTICS_IP_SALT: local-compose-salt-not-a-secret
+  # Kafka for click analytics (url.clicked topic). Part of the "shortener" profile since the brownfield
+  # delivery: the app's outbox relay and consumer need a broker (the greenfield app ran without one).
   shortener-kafka:
     image: apache/kafka:3.8.0
-    profiles: ["shortener-kafka"]
+    profiles: ["shortener", "shortener-kafka"]
     ports: ["9094:9094"]                        # host clients use localhost:9094; containers shortener-kafka:9092
     environment:
       KAFKA_NODE_ID: 1

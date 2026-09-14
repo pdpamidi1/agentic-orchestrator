@@ -1,0 +1,29 @@
+{
+  "task_id": "unit_tests",
+  "attempt": 1,
+  "gates": [
+    {
+      "gate_id": "scope",
+      "required": true,
+      "status": "FAILED",
+      "took_seconds": 0.483,
+      "findings": [
+        {
+          "file": ".github/workflows/ci.yml",
+          "line": null,
+          "rule": "change_control.protected_path",
+          "message": "requires human approval: release.config",
+          "suggested_fix": null
+        },
+        {
+          "file": "Dockerfile",
+          "line": null,
+          "rule": "change_control.protected_path",
+          "message": "requires human approval: infrastructure.change",
+          "suggested_fix": null
+        }
+      ],
+      "stdout_tail": ""
+    }
+  ]
+}

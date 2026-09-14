@@ -1,0 +1,1784 @@
+diff --git a/src/main/java/com/example/shortener/analytics/kafka/ClickEventMessage.java b/src/main/java/com/example/shortener/analytics/kafka/ClickEventMessage.java
+new file mode 100644
+index 0000000..f27765e
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/kafka/ClickEventMessage.java
+@@ -0,0 +1,94 @@
++/*
++ * ClickEventMessage.java — the url.clicked message published for one click
++ *
++ * Layer: analytics.kafka. Value object built by the outbox relay from a click_outbox row and handed
++ * to ClickEventProducer. Carries exactly the contract fields of the url.clicked topic: key =
++ * short_code, value = {short_code, occurred_at, hashed_ip, referrer_host}, header idempotency-key
++ * (AC-3, AC-10). Never holds a raw client address: hashed_ip is the salted SHA-256 digest.
++ */
++package com.example.shortener.analytics.kafka;
++
++import java.time.Instant;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Objects;
++
++/**
++ * One {@code url.clicked} message.
++ *
++ * <p><b>Invariants.</b> {@code idempotencyKey}, {@code shortCode}, {@code occurredAt} and {@code
++ * hashedIp} are non-null; {@code referrerHost} may be {@code null} (absent or unparsable Referer).
++ * The record is immutable and thread-safe.
++ *
++ * @param idempotencyKey producer-side dedupe key; sent as the {@code idempotency-key} header, not
++ *     in the value
++ * @param shortCode the redirected short code; also the message key
++ * @param occurredAt when the redirect happened (UTC)
++ * @param hashedIp salted SHA-256 hex digest of the client address
++ * @param referrerHost host of the Referer header, or {@code null}
++ */
++public record ClickEventMessage(
++    String idempotencyKey,
++    String shortCode,
++    Instant occurredAt,
++    String hashedIp,
++    String referrerHost) {
++
++  /** Value field: the redirected short code. */
++  public static final String FIELD_SHORT_CODE = "short_code";
++
++  /** Value field: ISO-8601 UTC instant of the click. */
++  public static final String FIELD_OCCURRED_AT = "occurred_at";
++
++  /** Value field: salted SHA-256 hex digest of the client address. */
++  public static final String FIELD_HASHED_IP = "hashed_ip";
++
++  /** Value field: Referer host or {@code null}. */
++  public static final String FIELD_REFERRER_HOST = "referrer_host";
++
++  /**
++   * Validates the mandatory fields.
++   *
++   * @throws NullPointerException when a mandatory component is {@code null}
++   */
++  public ClickEventMessage {
++    Objects.requireNonNull(idempotencyKey, "idempotencyKey");
++    Objects.requireNonNull(shortCode, "shortCode");
++    Objects.requireNonNull(occurredAt, "occurredAt");
++    Objects.requireNonNull(hashedIp, "hashedIp");
++  }
++
++  /** The Kafka message key: the short code. */
++  public String key() {
++    return shortCode;
++  }
++
++  /**
++   * The message value as an ordered map of contract fields, ready for JSON serialisation. {@code
++   * occurred_at} is rendered as an ISO-8601 string; {@code referrer_host} is present with a {@code
++   * null} value when unknown.
++   *
++   * @return an unmodifiable map in contract order
++   */
++  public Map<String, Object> payload() {
++    Map<String, Object> fields = new LinkedHashMap<>();
++    fields.put(FIELD_SHORT_CODE, shortCode);
++    fields.put(FIELD_OCCURRED_AT, occurredAt.toString());
++    fields.put(FIELD_HASHED_IP, hashedIp);
++    fields.put(FIELD_REFERRER_HOST, referrerHost);
++    return Collections.unmodifiableMap(fields);
++  }
++
++  /** Diagnostic rendering without the digest or the referrer. */
++  @Override
++  public String toString() {
++    return "ClickEventMessage{idempotencyKey='"
++        + idempotencyKey
++        + "', shortCode='"
++        + shortCode
++        + "', occurredAt="
++        + occurredAt
++        + '}';
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/kafka/ClickEventProducer.java b/src/main/java/com/example/shortener/analytics/kafka/ClickEventProducer.java
+new file mode 100644
+index 0000000..71af9e6
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/kafka/ClickEventProducer.java
+@@ -0,0 +1,99 @@
++/*
++ * ClickEventProducer.java — publishes url.clicked messages through Spring Kafka
++ *
++ * Layer: analytics.kafka, the only production package (besides consumer and config) allowed to
++ * import org.apache.kafka / org.springframework.kafka (ArchitectureTest rule). Wraps the
++ * auto-configured KafkaTemplate: topic url.clicked, key = short_code, value = JSON
++ * {short_code, occurred_at, hashed_ip, referrer_host}, header idempotency-key (AC-3, AC-4, AC-10).
++ * Timeouts and retries are the caller's concern (analytics.support.RetryExecutor).
++ */
++package com.example.shortener.analytics.kafka;
++
++import java.nio.charset.StandardCharsets;
++import java.util.Objects;
++import java.util.concurrent.CompletableFuture;
++import org.apache.kafka.clients.producer.ProducerRecord;
++import org.springframework.kafka.core.KafkaTemplate;
++import org.springframework.stereotype.Component;
++import tools.jackson.databind.ObjectMapper;
++
++/**
++ * Publishes one {@link ClickEventMessage} to the {@code url.clicked} topic.
++ *
++ * <p><b>Responsibility.</b> Build the {@link ProducerRecord} exactly as the contract prescribes and
++ * hand it to the {@link KafkaTemplate}; nothing else. The returned future completes when the broker
++ * acknowledges the record and fails when the send fails; a serialisation failure yields an
++ * already-failed future rather than an exception, so callers treat every failure uniformly.
++ *
++ * <p><b>Thread-safety and lifecycle.</b> Immutable singleton bean; {@link KafkaTemplate} and {@link
++ * ObjectMapper} are thread-safe.
++ */
++@Component
++public class ClickEventProducer {
++
++  /** Topic every click event is published to. */
++  public static final String TOPIC = "url.clicked";
++
++  /** Header carrying the producer-side idempotency key. */
++  public static final String HEADER_IDEMPOTENCY_KEY = "idempotency-key";
++
++  /** Spring Kafka template (auto-configured from {@code spring.kafka.*}). */
++  private final KafkaTemplate<String, String> kafkaTemplate;
++
++  /** Serialises the value payload. */
++  private final ObjectMapper objectMapper;
++
++  /**
++   * Creates the producer.
++   *
++   * @param kafkaTemplate the template to send with
++   * @param objectMapper the JSON mapper for the value
++   * @throws NullPointerException when an argument is {@code null}
++   */
++  public ClickEventProducer(
++      KafkaTemplate<String, String> kafkaTemplate, ObjectMapper objectMapper) {
++    this.kafkaTemplate = Objects.requireNonNull(kafkaTemplate, "kafkaTemplate");
++    this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper");
++  }
++
++  /**
++   * Builds the record for a message: topic {@value #TOPIC}, key = short code, JSON value from
++   * {@link ClickEventMessage#payload()}, header {@value #HEADER_IDEMPOTENCY_KEY} in UTF-8.
++   *
++   * @param message the message
++   * @return the record to send
++   * @throws NullPointerException when {@code message} is {@code null}
++   * @throws RuntimeException when the payload cannot be serialised
++   */
++  public ProducerRecord<String, String> toRecord(ClickEventMessage message) {
++    Objects.requireNonNull(message, "message");
++    String value = objectMapper.writeValueAsString(message.payload());
++    ProducerRecord<String, String> record = new ProducerRecord<>(TOPIC, message.key(), value);
++    record
++        .headers()
++        .add(HEADER_IDEMPOTENCY_KEY, message.idempotencyKey().getBytes(StandardCharsets.UTF_8));
++    return record;
++  }
++
++  /**
++   * Sends one message.
++   *
++   * @param message the message
++   * @return a future that completes when the broker acknowledged the record, or fails
++   * @throws NullPointerException when {@code message} is {@code null}
++   */
++  public CompletableFuture<Void> send(ClickEventMessage message) {
++    Objects.requireNonNull(message, "message");
++    ProducerRecord<String, String> record;
++    try {
++      record = toRecord(message);
++    } catch (RuntimeException e) {
++      return CompletableFuture.failedFuture(e);
++    }
++    try {
++      return kafkaTemplate.send(record).thenApply(result -> null);
++    } catch (RuntimeException e) {
++      return CompletableFuture.failedFuture(e);
++    }
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/outbox/OutboxMetrics.java b/src/main/java/com/example/shortener/analytics/outbox/OutboxMetrics.java
+new file mode 100644
+index 0000000..6ef04a2
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/outbox/OutboxMetrics.java
+@@ -0,0 +1,47 @@
++/*
++ * OutboxMetrics.java — counters of the outbox relay
++ *
++ * Layer: analytics.outbox. Micrometer core is not on the classpath (only micrometer-observation
++ * comes with Spring Kafka), so the relay counts through this small bean; a MeterRegistry can be
++ * bound to its getters when the actuator is added. Incremented by OutboxPublishService when a row
++ * is parked as FAILED after the retry budget is exhausted (AC-5).
++ */
++package com.example.shortener.analytics.outbox;
++
++import java.util.concurrent.atomic.AtomicLong;
++import org.springframework.stereotype.Component;
++
++/**
++ * Process-wide counters of the outbox relay.
++ *
++ * <p><b>Thread-safety.</b> Singleton bean backed by atomics; safe for concurrent use.
++ */
++@Component
++public class OutboxMetrics {
++
++  /** Rows parked as {@code FAILED} after exhausting the retry budget. */
++  private final AtomicLong publishFailed = new AtomicLong();
++
++  /** Rows acknowledged by Kafka and marked {@code PUBLISHED}. */
++  private final AtomicLong published = new AtomicLong();
++
++  /** Counts one row parked as {@code FAILED}. */
++  public void incrementPublishFailed() {
++    publishFailed.incrementAndGet();
++  }
++
++  /** Counts one row marked {@code PUBLISHED}. */
++  public void incrementPublished() {
++    published.incrementAndGet();
++  }
++
++  /** Rows parked as {@code FAILED} since start-up. */
++  public long publishFailedCount() {
++    return publishFailed.get();
++  }
++
++  /** Rows marked {@code PUBLISHED} since start-up. */
++  public long publishedCount() {
++    return published.get();
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/outbox/OutboxPoller.java b/src/main/java/com/example/shortener/analytics/outbox/OutboxPoller.java
+new file mode 100644
+index 0000000..389c019
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/outbox/OutboxPoller.java
+@@ -0,0 +1,67 @@
++/*
++ * OutboxPoller.java — @Scheduled trigger of the outbox relay
++ *
++ * Layer: analytics.outbox. Fires every analytics.outbox.poll-interval-ms on the dedicated
++ * analyticsTaskScheduler (OutboxSchedulingConfig) and asks OutboxPublishService for one pass.
++ * Never runs on a request thread, so a slow or unavailable broker cannot delay a redirect (AC-3).
++ * Any exception of a pass is logged and swallowed so the schedule keeps running.
++ */
++package com.example.shortener.analytics.outbox;
++
++import com.example.shortener.analytics.outbox.OutboxPublishService.PublishSummary;
++import java.util.Objects;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Component;
++
++/**
++ * In-process poller of the click outbox.
++ *
++ * <p><b>Responsibility.</b> Call {@link OutboxPublishService#publishDueBatch()} once per tick and
++ * contain its failures. Ticks use a fixed delay measured from the end of the previous pass, so two
++ * passes of one instance never overlap; across instances the {@code SKIP LOCKED} claim guarantees
++ * disjoint batches.
++ *
++ * <p><b>Thread-safety and lifecycle.</b> Immutable singleton bean; {@link #poll()} is invoked by
++ * the single scheduler thread only.
++ */
++@Component
++public class OutboxPoller {
++
++  private static final Logger log = LoggerFactory.getLogger(OutboxPoller.class);
++
++  /** Property that sets the delay between two passes. */
++  public static final String POLL_INTERVAL_PROPERTY = "analytics.outbox.poll-interval-ms";
++
++  private final OutboxPublishService publishService;
++
++  /**
++   * Creates the poller.
++   *
++   * @param publishService the relay unit of work
++   * @throws NullPointerException when {@code publishService} is {@code null}
++   */
++  public OutboxPoller(OutboxPublishService publishService) {
++    this.publishService = Objects.requireNonNull(publishService, "publishService");
++  }
++
++  /**
++   * One relay tick: publishes a single batch of due rows. Runs on {@link
++   * OutboxSchedulingConfig#SCHEDULER_BEAN}, never on a request thread.
++   *
++   * @return what the pass did, or {@link PublishSummary#EMPTY} when the pass failed
++   */
++  @Scheduled(
++      fixedDelayString = "${" + POLL_INTERVAL_PROPERTY + ":500}",
++      initialDelayString = "${" + POLL_INTERVAL_PROPERTY + ":500}",
++      scheduler = OutboxSchedulingConfig.SCHEDULER_BEAN)
++  public PublishSummary poll() {
++    try {
++      return publishService.publishDueBatch();
++    } catch (RuntimeException e) {
++      log.error("Outbox pass failed; rows stay PENDING for the next tick: {}", e.toString());
++      return PublishSummary.EMPTY;
++    }
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/outbox/OutboxPublishService.java b/src/main/java/com/example/shortener/analytics/outbox/OutboxPublishService.java
+new file mode 100644
+index 0000000..5921e85
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/outbox/OutboxPublishService.java
+@@ -0,0 +1,202 @@
++/*
++ * OutboxPublishService.java — relays one claimed batch of click_outbox rows to Kafka
++ *
++ * Layer: analytics.outbox (depends on analytics.domain, .repository, .kafka, .support, .config).
++ * One transactional pass: claim <= analytics.outbox.batch-size PENDING rows with
++ * SELECT ... FOR UPDATE SKIP LOCKED, publish each through ClickEventProducer under the
++ * RetryExecutor policy, mark PUBLISHED (published_at) on acknowledgement or FAILED (terminal,
++ * logged without the digest, counted) on exhaustion (AC-3, AC-4, AC-5, AC-10). The row locks are
++ * held for the whole pass so a concurrent relay instance skips these rows and never publishes them
++ * twice.
++ */
++package com.example.shortener.analytics.outbox;
++
++import com.example.shortener.analytics.config.AnalyticsProperties;
++import com.example.shortener.analytics.domain.ClickOutboxEntry;
++import com.example.shortener.analytics.kafka.ClickEventMessage;
++import com.example.shortener.analytics.kafka.ClickEventProducer;
++import com.example.shortener.analytics.repository.ClickOutboxRepository;
++import com.example.shortener.analytics.support.RetryExecutor;
++import com.example.shortener.analytics.support.RetryExecutor.RetryExhaustedException;
++import java.time.Clock;
++import java.util.List;
++import java.util.Objects;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++/**
++ * Publishes one batch of due {@code click_outbox} rows.
++ *
++ * <p><b>Responsibility.</b> {@link #publishDueBatch} is the unit of work of the relay: claim, then
++ * for every row build the {@link ClickEventMessage}, run {@link ClickEventProducer#send} through
++ * the {@link RetryExecutor}, and record the outcome on the entity. Each intermediate failure is
++ * recorded with {@link ClickOutboxEntry#scheduleRetry} (attempt counter, next_attempt_at) so the
++ * persisted {@code attempts} equals the number of sends actually made.
++ *
++ * <p><b>Transaction.</b> The whole pass runs in one read-write transaction: the claim locks the
++ * rows, every state change is flushed at commit. A failure that is not a publish failure (database
++ * error, interrupt) propagates and rolls the pass back, leaving the rows {@code PENDING} for the
++ * next tick; nothing is lost and nothing is parked by mistake.
++ *
++ * <p><b>Privacy.</b> Log lines carry the short code, the idempotency key and the attempt count,
++ * never the hashed address nor the referrer (AC-10).
++ *
++ * <p><b>Thread-safety and lifecycle.</b> Immutable singleton bean; must only be called from the
++ * analytics scheduler thread (see {@link OutboxPoller}), never from a request thread.
++ */
++@Service
++public class OutboxPublishService {
++
++  private static final Logger log = LoggerFactory.getLogger(OutboxPublishService.class);
++
++  /**
++   * Outcome of one pass.
++   *
++   * @param claimed rows claimed by the pass
++   * @param published rows acknowledged by Kafka and marked {@code PUBLISHED}
++   * @param failed rows parked as {@code FAILED}
++   */
++  public record PublishSummary(int claimed, int published, int failed) {
++
++    /** A pass that found nothing to do. */
++    public static final PublishSummary EMPTY = new PublishSummary(0, 0, 0);
++  }
++
++  private final ClickOutboxRepository repository;
++  private final ClickEventProducer producer;
++  private final RetryExecutor retryExecutor;
++  private final OutboxMetrics metrics;
++  private final int batchSize;
++  private final Clock clock;
++
++  /**
++   * Creates the service with the system UTC clock (the constructor Spring uses).
++   *
++   * @param repository the {@code click_outbox} repository
++   * @param producer the Kafka producer
++   * @param retryExecutor the retry policy executor
++   * @param metrics relay counters
++   * @param properties analytics settings (batch size)
++   * @throws NullPointerException when any argument is {@code null}
++   */
++  @Autowired
++  public OutboxPublishService(
++      ClickOutboxRepository repository,
++      ClickEventProducer producer,
++      RetryExecutor retryExecutor,
++      OutboxMetrics metrics,
++      AnalyticsProperties properties) {
++    this(repository, producer, retryExecutor, metrics, properties, Clock.systemUTC());
++  }
++
++  /**
++   * Creates the service with an explicit clock.
++   *
++   * @param repository the {@code click_outbox} repository
++   * @param producer the Kafka producer
++   * @param retryExecutor the retry policy executor
++   * @param metrics relay counters
++   * @param properties analytics settings (batch size)
++   * @param clock source of {@code published_at} and {@code next_attempt_at}
++   * @throws NullPointerException when any argument is {@code null}
++   */
++  public OutboxPublishService(
++      ClickOutboxRepository repository,
++      ClickEventProducer producer,
++      RetryExecutor retryExecutor,
++      OutboxMetrics metrics,
++      AnalyticsProperties properties,
++      Clock clock) {
++    this.repository = Objects.requireNonNull(repository, "repository");
++    this.producer = Objects.requireNonNull(producer, "producer");
++    this.retryExecutor = Objects.requireNonNull(retryExecutor, "retryExecutor");
++    this.metrics = Objects.requireNonNull(metrics, "metrics");
++    this.batchSize = Objects.requireNonNull(properties, "properties").outbox().batchSize();
++    this.clock = Objects.requireNonNull(clock, "clock");
++  }
++
++  /** Maximum rows claimed per pass ({@code analytics.outbox.batch-size}). */
++  public int batchSize() {
++    return batchSize;
++  }
++
++  /**
++   * Claims and publishes one batch of due rows.
++   *
++   * @return what happened to the claimed rows
++   * @throws RuntimeException any non-publish failure, after the transaction was rolled back
++   */
++  @Transactional
++  public PublishSummary publishDueBatch() {
++    List<ClickOutboxEntry> batch = repository.claimBatch(clock.instant(), batchSize);
++    if (batch.isEmpty()) {
++      return PublishSummary.EMPTY;
++    }
++    int published = 0;
++    int failed = 0;
++    for (ClickOutboxEntry entry : batch) {
++      if (publish(entry)) {
++        published++;
++      } else {
++        failed++;
++      }
++      repository.save(entry);
++    }
++    log.debug("Outbox pass: claimed={} published={} failed={}", batch.size(), published, failed);
++    return new PublishSummary(batch.size(), published, failed);
++  }
++
++  /** Publishes one row; returns {@code true} when it ended {@code PUBLISHED}. */
++  private boolean publish(ClickOutboxEntry entry) {
++    ClickEventMessage message = toMessage(entry);
++    try {
++      retryExecutor.execute(
++          () -> producer.send(message),
++          (attempt, backoff, cause) -> {
++            entry.scheduleRetry(clock.instant().plus(backoff));
++            log.warn(
++                "Publish attempt {} failed for short code '{}' key {}: {}; retrying in {} ms",
++                attempt,
++                entry.getShortCode(),
++                entry.getIdempotencyKey(),
++                describe(cause),
++                backoff.toMillis());
++          });
++      entry.markPublished(clock.instant());
++      metrics.incrementPublished();
++      return true;
++    } catch (RetryExhaustedException e) {
++      entry.markFailed();
++      metrics.incrementPublishFailed();
++      log.error(
++          "Giving up on short code '{}' key {} after {} attempt(s); row marked FAILED: {}",
++          entry.getShortCode(),
++          entry.getIdempotencyKey(),
++          e.getAttempts(),
++          describe(e.getCause()));
++      return false;
++    }
++  }
++
++  /** Maps a row onto the contract message. */
++  static ClickEventMessage toMessage(ClickOutboxEntry entry) {
++    return new ClickEventMessage(
++        entry.getIdempotencyKey(),
++        entry.getShortCode(),
++        entry.getOccurredAt(),
++        entry.getHashedIp(),
++        entry.getReferrerHost());
++  }
++
++  /** Exception class and message only; a cause never carries the address. */
++  private static String describe(Throwable cause) {
++    if (cause == null) {
++      return "unknown cause";
++    }
++    return cause.getClass().getSimpleName()
++        + (cause.getMessage() == null ? "" : ": " + cause.getMessage());
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/outbox/OutboxSchedulingConfig.java b/src/main/java/com/example/shortener/analytics/outbox/OutboxSchedulingConfig.java
+new file mode 100644
+index 0000000..581ed2c
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/outbox/OutboxSchedulingConfig.java
+@@ -0,0 +1,49 @@
++/*
++ * OutboxSchedulingConfig.java — dedicated scheduler for the analytics background jobs
++ *
++ * Layer: analytics.outbox. Switches on @Scheduled processing and defines the single-threaded
++ * "analyticsTaskScheduler" that OutboxPoller (and the retention job) run on, so that relay work
++ * never executes on a Tomcat request thread and cannot delay a redirect (AC-3; ArchitectureTest
++ * rule on @Scheduled methods).
++ */
++package com.example.shortener.analytics.outbox;
++
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.scheduling.annotation.EnableScheduling;
++import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
++
++/**
++ * Registers the dedicated analytics {@link ThreadPoolTaskScheduler}.
++ *
++ * <p>One thread is enough: the relay processes one batch per tick with a fixed delay between ticks,
++ * so ticks never overlap and the single instance never claims the same row twice within a process.
++ * On shutdown the scheduler waits briefly for the running tick so a half-processed batch commits or
++ * rolls back cleanly.
++ */
++@Configuration(proxyBeanMethods = false)
++@EnableScheduling
++public class OutboxSchedulingConfig {
++
++  /** Bean name of the analytics scheduler, referenced from {@code @Scheduled(scheduler = ...)}. */
++  public static final String SCHEDULER_BEAN = "analyticsTaskScheduler";
++
++  /** Thread name prefix of the scheduler thread. */
++  public static final String THREAD_PREFIX = "analytics-scheduler-";
++
++  /**
++   * The scheduler every analytics {@code @Scheduled} method must name.
++   *
++   * @return a single-threaded scheduler with named threads
++   */
++  @Bean(name = SCHEDULER_BEAN)
++  public ThreadPoolTaskScheduler analyticsTaskScheduler() {
++    ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
++    scheduler.setPoolSize(1);
++    scheduler.setThreadNamePrefix(THREAD_PREFIX);
++    scheduler.setWaitForTasksToCompleteOnShutdown(true);
++    scheduler.setAwaitTerminationSeconds(30);
++    scheduler.setRemoveOnCancelPolicy(true);
++    return scheduler;
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/support/RetryExecutor.java b/src/main/java/com/example/shortener/analytics/support/RetryExecutor.java
+new file mode 100644
+index 0000000..954657c
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/support/RetryExecutor.java
+@@ -0,0 +1,253 @@
++/*
++ * RetryExecutor.java — bounded retries with exponential backoff, jitter and a per-attempt timeout
++ *
++ * Layer: analytics.support (depends on analytics.config only; imports no Kafka type). Used by the
++ * outbox relay (analytics.outbox.OutboxPublishService) to drive one publish through the AMB-17
++ * policy: analytics.retry.max-attempts attempts, backoff min(cap, base * 2^n) with none / equal /
++ * full jitter, and analytics.kafka.timeout-ms as the upper bound of a single attempt (AC-4, AC-5).
++ */
++package com.example.shortener.analytics.support;
++
++import com.example.shortener.analytics.config.AnalyticsProperties;
++import java.time.Duration;
++import java.util.Objects;
++import java.util.SplittableRandom;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import java.util.function.Supplier;
++import java.util.random.RandomGenerator;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Component;
++
++/**
++ * Runs an asynchronous operation with bounded attempts, exponential backoff plus jitter and a
++ * per-attempt timeout (AMB-17).
++ *
++ * <p><b>Responsibility.</b> {@link #execute} starts the supplied operation up to {@code
++ * maxAttempts} times. An attempt fails when its future completes exceptionally, when the supplier
++ * throws, or when the future has not completed within {@code attemptTimeout} (the future is then
++ * cancelled). Between two attempts the executor notifies the listener, then sleeps for {@link
++ * #backoffAfter}. When the last attempt fails a {@link RetryExhaustedException} carrying the
++ * attempt count and the last cause is thrown; the caller decides what "exhausted" means (the relay
++ * parks the row as {@code FAILED}).
++ *
++ * <p><b>Backoff.</b> After the {@code n}-th failed attempt ({@code n >= 1}) the deterministic delay
++ * is {@code d = min(maxBackoff, baseBackoff * 2^(n-1))}. {@code NONE} sleeps {@code d}, {@code
++ * EQUAL} sleeps {@code d/2 + random[0, d/2]}, {@code FULL} sleeps {@code random[0, d]}. The random
++ * source is injectable so tests can pin the sequence with a seed.
++ *
++ * <p><b>Interruption.</b> An interrupt while waiting or sleeping restores the interrupt flag and
++ * aborts with an {@link IllegalStateException}; it is <em>not</em> reported as exhaustion, so a
++ * shutdown never parks rows.
++ *
++ * <p><b>Thread-safety and lifecycle.</b> Immutable singleton bean apart from the random generator,
++ * which is only touched by the calling thread of {@link #execute}; the relay runs on a single
++ * scheduler thread. The Spring constructor uses the system sleeper and an unseeded generator.
++ */
++@Component
++public class RetryExecutor {
++
++  /** Sleeps between attempts; {@link Thread#sleep(long)} live, a recorder in tests. */
++  @FunctionalInterface
++  public interface Sleeper {
++    /**
++     * Blocks for the given duration.
++     *
++     * @param duration how long to sleep; never negative
++     * @throws InterruptedException when the thread is interrupted while sleeping
++     */
++    void sleep(Duration duration) throws InterruptedException;
++  }
++
++  /** Observes failed attempts that will be retried (not the final one). */
++  @FunctionalInterface
++  public interface RetryListener {
++    /**
++     * Called after a failed attempt when another attempt follows, before the backoff sleep.
++     *
++     * @param failedAttempt 1-based index of the attempt that just failed
++     * @param backoff the delay that will be slept before the next attempt
++     * @param cause why the attempt failed (execution failure, supplier exception or timeout)
++     */
++    void onRetry(int failedAttempt, Duration backoff, Throwable cause);
++  }
++
++  /** Thrown by {@link #execute} when every attempt failed. */
++  public static class RetryExhaustedException extends RuntimeException {
++
++    private static final long serialVersionUID = 1L;
++
++    /** Number of attempts that were made. */
++    private final int attempts;
++
++    /**
++     * Creates the exception.
++     *
++     * @param attempts number of attempts made
++     * @param lastCause failure of the last attempt
++     */
++    public RetryExhaustedException(int attempts, Throwable lastCause) {
++      super("publish failed after " + attempts + " attempt(s)", lastCause);
++      this.attempts = attempts;
++    }
++
++    /** Number of attempts that were made before giving up. */
++    public int getAttempts() {
++      return attempts;
++    }
++  }
++
++  /** Attempt budget and backoff policy. */
++  private final AnalyticsProperties.Retry policy;
++
++  /** Upper bound for one attempt. */
++  private final Duration attemptTimeout;
++
++  /** Source of jitter. */
++  private final RandomGenerator random;
++
++  /** Sleeps between attempts. */
++  private final Sleeper sleeper;
++
++  /**
++   * Creates the executor Spring uses: policy and timeout from the bound properties, an unseeded
++   * random generator and a real sleeper.
++   *
++   * @param properties the analytics settings
++   * @throws NullPointerException when {@code properties} is {@code null}
++   */
++  @Autowired
++  public RetryExecutor(AnalyticsProperties properties) {
++    this(
++        Objects.requireNonNull(properties, "properties").retry(),
++        properties.kafka().timeout(),
++        new SplittableRandom(),
++        duration -> Thread.sleep(duration.toMillis()));
++  }
++
++  /**
++   * Creates the executor with every collaborator explicit (tests).
++   *
++   * @param policy attempt budget and backoff policy
++   * @param attemptTimeout upper bound for one attempt; must be positive
++   * @param random source of jitter; a seeded generator gives a reproducible sequence
++   * @param sleeper sleeps between attempts
++   * @throws NullPointerException when any argument is {@code null}
++   * @throws IllegalArgumentException when {@code attemptTimeout} is zero or negative
++   */
++  public RetryExecutor(
++      AnalyticsProperties.Retry policy,
++      Duration attemptTimeout,
++      RandomGenerator random,
++      Sleeper sleeper) {
++    this.policy = Objects.requireNonNull(policy, "policy");
++    this.attemptTimeout = Objects.requireNonNull(attemptTimeout, "attemptTimeout");
++    if (attemptTimeout.isZero() || attemptTimeout.isNegative()) {
++      throw new IllegalArgumentException("attemptTimeout must be positive");
++    }
++    this.random = Objects.requireNonNull(random, "random");
++    this.sleeper = Objects.requireNonNull(sleeper, "sleeper");
++  }
++
++  /** Maximum number of attempts, including the first. */
++  public int maxAttempts() {
++    return policy.maxAttempts();
++  }
++
++  /** Upper bound of a single attempt. */
++  public Duration attemptTimeout() {
++    return attemptTimeout;
++  }
++
++  /**
++   * Runs {@code attempt} until it succeeds or the attempt budget is exhausted.
++   *
++   * @param attempt starts one asynchronous attempt; called once per attempt
++   * @param listener notified before each backoff sleep
++   * @param <T> result type
++   * @return the value of the first successful attempt (may be {@code null})
++   * @throws RetryExhaustedException when all {@code maxAttempts} attempts failed
++   * @throws IllegalStateException when the calling thread was interrupted (flag restored)
++   * @throws NullPointerException when an argument is {@code null}
++   */
++  public <T> T execute(Supplier<CompletableFuture<T>> attempt, RetryListener listener) {
++    Objects.requireNonNull(attempt, "attempt");
++    Objects.requireNonNull(listener, "listener");
++    int max = policy.maxAttempts();
++    Throwable last = null;
++    for (int n = 1; n <= max; n++) {
++      CompletableFuture<T> future = null;
++      try {
++        future = Objects.requireNonNull(attempt.get(), "attempt returned null future");
++        return future.get(attemptTimeout.toMillis(), TimeUnit.MILLISECONDS);
++      } catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++        cancel(future);
++        throw new IllegalStateException("interrupted during attempt " + n, e);
++      } catch (TimeoutException e) {
++        cancel(future);
++        last = new TimeoutException("attempt " + n + " exceeded " + attemptTimeout);
++      } catch (ExecutionException e) {
++        last = e.getCause() != null ? e.getCause() : e;
++      } catch (RuntimeException e) {
++        last = e;
++      }
++      if (n < max) {
++        Duration backoff = backoffAfter(n);
++        listener.onRetry(n, backoff, last);
++        try {
++          sleeper.sleep(backoff);
++        } catch (InterruptedException e) {
++          Thread.currentThread().interrupt();
++          throw new IllegalStateException("interrupted during backoff after attempt " + n, e);
++        }
++      }
++    }
++    throw new RetryExhaustedException(max, last);
++  }
++
++  /**
++   * Delay to sleep after the {@code failedAttempt}-th failure, jitter applied.
++   *
++   * @param failedAttempt 1-based index of the failed attempt
++   * @return a duration in {@code [0, maxBackoff]}
++   * @throws IllegalArgumentException when {@code failedAttempt < 1}
++   */
++  public Duration backoffAfter(int failedAttempt) {
++    long ceiling = deterministicBackoffMs(failedAttempt);
++    long sleep =
++        switch (policy.jitter()) {
++          case NONE -> ceiling;
++          case EQUAL -> ceiling / 2 + randomInclusive(ceiling - ceiling / 2);
++          case FULL -> randomInclusive(ceiling);
++        };
++    return Duration.ofMillis(sleep);
++  }
++
++  /** {@code min(cap, base * 2^(n-1))} without overflow. */
++  private long deterministicBackoffMs(int failedAttempt) {
++    if (failedAttempt < 1) {
++      throw new IllegalArgumentException("failedAttempt must be >= 1");
++    }
++    long base = policy.baseBackoffMs();
++    long cap = policy.maxBackoffMs();
++    int exponent = failedAttempt - 1;
++    if (exponent >= 62 || base > (cap >> Math.min(exponent, 62))) {
++      return cap;
++    }
++    return Math.min(cap, base << exponent);
++  }
++
++  /** Uniform value in {@code [0, bound]}. */
++  private long randomInclusive(long bound) {
++    return bound <= 0 ? 0 : random.nextLong(bound + 1);
++  }
++
++  private static void cancel(CompletableFuture<?> future) {
++    if (future != null) {
++      future.cancel(true);
++    }
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/kafka/ClickEventMessageTest.java b/src/test/java/com/example/shortener/analytics/kafka/ClickEventMessageTest.java
+new file mode 100644
+index 0000000..536ef7b
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/kafka/ClickEventMessageTest.java
+@@ -0,0 +1,76 @@
++/*
++ * ClickEventMessageTest.java — contract shape of the url.clicked value object
++ *
++ * Layer: test (unit). Pins the key (short_code), the value fields in contract order
++ * {short_code, occurred_at, hashed_ip, referrer_host}, that the idempotency key is not part of
++ * the value, null handling and that toString never leaks the digest (AC-3, AC-10).
++ */
++package com.example.shortener.analytics.kafka;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import java.time.Instant;
++import java.util.Map;
++import org.junit.jupiter.api.Test;
++
++/** Unit tests of {@link ClickEventMessage}. */
++class ClickEventMessageTest {
++
++  private static final String KEY = "0b0f6f8e-6c4e-4b7b-9a3b-1a2b3c4d5e6f";
++  private static final String HASH = "a".repeat(64);
++  private static final Instant AT = Instant.parse("2026-09-14T10:15:30Z");
++
++  /** The key is the short code and the payload lists the four contract fields in order. */
++  @Test
++  void payloadCarriesContractFieldsInOrder() {
++    ClickEventMessage message = new ClickEventMessage(KEY, "promo2024", AT, HASH, "news.example");
++
++    assertThat(message.key()).isEqualTo("promo2024");
++    Map<String, Object> payload = message.payload();
++    assertThat(payload.keySet())
++        .containsExactly("short_code", "occurred_at", "hashed_ip", "referrer_host");
++    assertThat(payload)
++        .containsEntry("short_code", "promo2024")
++        .containsEntry("occurred_at", "2026-09-14T10:15:30Z")
++        .containsEntry("hashed_ip", HASH)
++        .containsEntry("referrer_host", "news.example");
++    assertThat(payload).doesNotContainValue(KEY);
++    assertThatThrownBy(() -> payload.put("x", "y"))
++        .isInstanceOf(UnsupportedOperationException.class);
++  }
++
++  /** A missing referrer is an explicit null field, not an absent key. */
++  @Test
++  void nullReferrerHostIsKeptAsNullField() {
++    ClickEventMessage message = new ClickEventMessage(KEY, "promo2024", AT, HASH, null);
++
++    assertThat(message.payload()).containsKey("referrer_host");
++    assertThat(message.payload().get("referrer_host")).isNull();
++  }
++
++  /** Mandatory fields are validated at construction. */
++  @Test
++  void mandatoryFieldsAreRequired() {
++    assertThatThrownBy(() -> new ClickEventMessage(null, "c", AT, HASH, null))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickEventMessage(KEY, null, AT, HASH, null))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickEventMessage(KEY, "c", null, HASH, null))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickEventMessage(KEY, "c", AT, null, null))
++        .isInstanceOf(NullPointerException.class);
++  }
++
++  /** Diagnostics never include the digest or the referrer. */
++  @Test
++  void toStringOmitsDigestAndReferrer() {
++    ClickEventMessage message = new ClickEventMessage(KEY, "promo2024", AT, HASH, "news.example");
++
++    assertThat(message.toString())
++        .contains(KEY)
++        .contains("promo2024")
++        .doesNotContain(HASH)
++        .doesNotContain("news.example");
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/kafka/ClickEventProducerTest.java b/src/test/java/com/example/shortener/analytics/kafka/ClickEventProducerTest.java
+new file mode 100644
+index 0000000..17671c9
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/kafka/ClickEventProducerTest.java
+@@ -0,0 +1,126 @@
++/*
++ * ClickEventProducerTest.java — topic, key, header and JSON value of a published click
++ *
++ * Layer: test (unit). With a Mockito KafkaTemplate captures the ProducerRecord and asserts topic
++ * url.clicked, key = short_code, header idempotency-key = the key bytes and a JSON value holding
++ * exactly {short_code, occurred_at, hashed_ip, referrer_host}; failures surface as failed futures
++ * (AC-3, AC-4, AC-10). No broker, no Spring context.
++ */
++package com.example.shortener.analytics.kafka;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import java.nio.charset.StandardCharsets;
++import java.time.Instant;
++import java.util.Map;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ExecutionException;
++import org.apache.kafka.clients.producer.ProducerRecord;
++import org.apache.kafka.common.header.Header;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.springframework.kafka.KafkaException;
++import org.springframework.kafka.core.KafkaTemplate;
++import org.springframework.kafka.support.SendResult;
++import tools.jackson.databind.json.JsonMapper;
++
++/** Unit tests of {@link ClickEventProducer}. */
++class ClickEventProducerTest {
++
++  private static final String KEY = "0b0f6f8e-6c4e-4b7b-9a3b-1a2b3c4d5e6f";
++  private static final String HASH = "b".repeat(64);
++  private static final Instant AT = Instant.parse("2026-09-14T10:15:30Z");
++
++  @SuppressWarnings("unchecked")
++  private final KafkaTemplate<String, String> template = mock(KafkaTemplate.class);
++
++  private final JsonMapper mapper = new JsonMapper();
++  private final ClickEventProducer producer = new ClickEventProducer(template, mapper);
++
++  /** The record goes to url.clicked, keyed by short code, with the idempotency-key header. */
++  @Test
++  @SuppressWarnings("unchecked")
++  void sendsToUrlClickedKeyedByShortCodeWithIdempotencyHeader() throws Exception {
++    when(template.send(any(ProducerRecord.class)))
++        .thenReturn(CompletableFuture.completedFuture(mock(SendResult.class)));
++    ClickEventMessage message = new ClickEventMessage(KEY, "promo2024", AT, HASH, "news.example");
++
++    CompletableFuture<Void> future = producer.send(message);
++
++    assertThat(future.get()).isNull();
++    ArgumentCaptor<ProducerRecord<String, String>> captor =
++        ArgumentCaptor.forClass(ProducerRecord.class);
++    verify(template).send(captor.capture());
++    ProducerRecord<String, String> record = captor.getValue();
++    assertThat(record.topic()).isEqualTo("url.clicked");
++    assertThat(record.key()).isEqualTo("promo2024");
++    Header header = record.headers().lastHeader("idempotency-key");
++    assertThat(header).isNotNull();
++    assertThat(new String(header.value(), StandardCharsets.UTF_8)).isEqualTo(KEY);
++    assertThat(record.headers().toArray()).hasSize(1);
++
++    Map<String, Object> value = mapper.readValue(record.value(), Map.class);
++    assertThat(value)
++        .hasSize(4)
++        .containsEntry("short_code", "promo2024")
++        .containsEntry("occurred_at", "2026-09-14T10:15:30Z")
++        .containsEntry("hashed_ip", HASH)
++        .containsEntry("referrer_host", "news.example");
++    assertThat(record.value()).doesNotContain(KEY);
++  }
++
++  /** A missing referrer is serialised as JSON null. */
++  @Test
++  @SuppressWarnings("unchecked")
++  void nullReferrerHostIsSerialisedAsNull() {
++    ProducerRecord<String, String> record =
++        producer.toRecord(new ClickEventMessage(KEY, "promo2024", AT, HASH, null));
++
++    Map<String, Object> value = mapper.readValue(record.value(), Map.class);
++    assertThat(value).containsKey("referrer_host");
++    assertThat(value.get("referrer_host")).isNull();
++  }
++
++  /** A failed send surfaces as a failed future, never as a thrown exception. */
++  @Test
++  @SuppressWarnings("unchecked")
++  void brokerFailureCompletesFutureExceptionally() {
++    when(template.send(any(ProducerRecord.class)))
++        .thenReturn(CompletableFuture.failedFuture(new KafkaException("broker down")));
++
++    CompletableFuture<Void> future =
++        producer.send(new ClickEventMessage(KEY, "promo2024", AT, HASH, null));
++
++    assertThat(future).isCompletedExceptionally();
++    assertThatThrownBy(future::get)
++        .isInstanceOf(ExecutionException.class)
++        .hasCauseInstanceOf(KafkaException.class);
++  }
++
++  /** A template that throws synchronously is also reported as a failed future. */
++  @Test
++  @SuppressWarnings("unchecked")
++  void synchronousTemplateFailureCompletesFutureExceptionally() {
++    when(template.send(any(ProducerRecord.class))).thenThrow(new IllegalStateException("closed"));
++
++    CompletableFuture<Void> future =
++        producer.send(new ClickEventMessage(KEY, "promo2024", AT, HASH, null));
++
++    assertThat(future).isCompletedExceptionally();
++  }
++
++  /** Collaborators and the message are mandatory. */
++  @Test
++  void nullArgumentsAreRejected() {
++    assertThatThrownBy(() -> new ClickEventProducer(null, mapper))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickEventProducer(template, null))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> producer.send(null)).isInstanceOf(NullPointerException.class);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/outbox/OutboxPollerTest.java b/src/test/java/com/example/shortener/analytics/outbox/OutboxPollerTest.java
+new file mode 100644
+index 0000000..faba60a
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/outbox/OutboxPollerTest.java
+@@ -0,0 +1,97 @@
++/*
++ * OutboxPollerTest.java — the poller delegates, contains failures and runs off request threads
++ *
++ * Layer: test (unit). Pins that poll() calls OutboxPublishService once and returns its summary,
++ * swallows a failing pass, is @Scheduled with a fixed delay bound to
++ * analytics.outbox.poll-interval-ms on the dedicated analyticsTaskScheduler, and that
++ * OutboxSchedulingConfig enables scheduling and builds a single-threaded scheduler whose threads
++ * carry the analytics prefix (AC-3). No Spring context.
++ */
++package com.example.shortener.analytics.outbox;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import com.example.shortener.analytics.outbox.OutboxPublishService.PublishSummary;
++import java.lang.reflect.Method;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.TimeUnit;
++import org.junit.jupiter.api.Test;
++import org.springframework.context.annotation.Bean;
++import org.springframework.scheduling.annotation.EnableScheduling;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
++
++/** Unit tests of {@link OutboxPoller} and {@link OutboxSchedulingConfig}. */
++class OutboxPollerTest {
++
++  private final OutboxPublishService service = mock(OutboxPublishService.class);
++  private final OutboxPoller poller = new OutboxPoller(service);
++
++  /** One tick is one pass. */
++  @Test
++  void pollRunsOnePassAndReturnsItsSummary() {
++    when(service.publishDueBatch()).thenReturn(new PublishSummary(3, 2, 1));
++
++    assertThat(poller.poll()).isEqualTo(new PublishSummary(3, 2, 1));
++    verify(service).publishDueBatch();
++  }
++
++  /** A failing pass is logged and swallowed so the schedule survives. */
++  @Test
++  void failingPassIsContained() {
++    when(service.publishDueBatch()).thenThrow(new IllegalStateException("database unavailable"));
++
++    assertThat(poller.poll()).isEqualTo(PublishSummary.EMPTY);
++  }
++
++  /** poll() is scheduled with a fixed delay from the property on the analytics scheduler. */
++  @Test
++  void pollIsScheduledOnTheAnalyticsScheduler() throws NoSuchMethodException {
++    Method poll = OutboxPoller.class.getMethod("poll");
++    Scheduled scheduled = poll.getAnnotation(Scheduled.class);
++
++    assertThat(scheduled).isNotNull();
++    assertThat(scheduled.scheduler()).isEqualTo(OutboxSchedulingConfig.SCHEDULER_BEAN);
++    assertThat(scheduled.fixedDelayString()).contains("analytics.outbox.poll-interval-ms");
++    assertThat(scheduled.fixedRate()).isEqualTo(-1L);
++    assertThat(scheduled.cron()).isEmpty();
++  }
++
++  /** The configuration enables scheduling and exposes the bean under the referenced name. */
++  @Test
++  void configurationEnablesSchedulingAndNamesTheBean() throws NoSuchMethodException {
++    assertThat(OutboxSchedulingConfig.class.getAnnotation(EnableScheduling.class)).isNotNull();
++    Bean bean =
++        OutboxSchedulingConfig.class.getMethod("analyticsTaskScheduler").getAnnotation(Bean.class);
++    assertThat(bean).isNotNull();
++    assertThat(bean.name()).containsExactly("analyticsTaskScheduler");
++  }
++
++  /** Work submitted to the scheduler runs on a dedicated, named, single thread. */
++  @Test
++  void schedulerRunsWorkOnDedicatedAnalyticsThread() throws Exception {
++    ThreadPoolTaskScheduler scheduler = new OutboxSchedulingConfig().analyticsTaskScheduler();
++    scheduler.initialize();
++    try {
++      CompletableFuture<String> threadName = new CompletableFuture<>();
++      scheduler.execute(() -> threadName.complete(Thread.currentThread().getName()));
++
++      assertThat(threadName.get(5, TimeUnit.SECONDS))
++          .startsWith(OutboxSchedulingConfig.THREAD_PREFIX);
++      assertThat(threadName.get()).isNotEqualTo(Thread.currentThread().getName());
++      assertThat(scheduler.getPoolSize()).isEqualTo(1);
++    } finally {
++      scheduler.shutdown();
++    }
++  }
++
++  /** The service is mandatory. */
++  @Test
++  void nullServiceIsRejected() {
++    assertThatThrownBy(() -> new OutboxPoller(null)).isInstanceOf(NullPointerException.class);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/outbox/OutboxPublishServiceTest.java b/src/test/java/com/example/shortener/analytics/outbox/OutboxPublishServiceTest.java
+new file mode 100644
+index 0000000..466e830
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/outbox/OutboxPublishServiceTest.java
+@@ -0,0 +1,317 @@
++/*
++ * OutboxPublishServiceTest.java — claim bounds, state transitions, exhaustion and no duplicates
++ *
++ * Layer: test (unit). A Mockito ClickOutboxRepository whose claimBatch answers from an in-memory
++ * table (PENDING, due, limited), a Mockito ClickEventProducer and a real RetryExecutor with a
++ * recording sleeper. Pins: the claim asks for exactly analytics.outbox.batch-size rows; success
++ * marks PUBLISHED with published_at = clock; a transient failure schedules a retry and succeeds;
++ * exhaustion marks FAILED, counts the metric and logs without the digest; a second pass republishes
++ * nothing; non-publish failures propagate; publishDueBatch is @Transactional (AC-3, AC-4, AC-5,
++ * AC-10). No Spring context, no broker.
++ */
++package com.example.shortener.analytics.outbox;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyInt;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.core.read.ListAppender;
++import com.example.shortener.analytics.config.AnalyticsProperties;
++import com.example.shortener.analytics.config.AnalyticsProperties.Jitter;
++import com.example.shortener.analytics.domain.ClickOutboxEntry;
++import com.example.shortener.analytics.domain.OutboxStatus;
++import com.example.shortener.analytics.kafka.ClickEventMessage;
++import com.example.shortener.analytics.kafka.ClickEventProducer;
++import com.example.shortener.analytics.outbox.OutboxPublishService.PublishSummary;
++import com.example.shortener.analytics.repository.ClickOutboxRepository;
++import com.example.shortener.analytics.support.RetryExecutor;
++import java.time.Clock;
++import java.time.Duration;
++import java.time.Instant;
++import java.time.ZoneOffset;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.SplittableRandom;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.slf4j.LoggerFactory;
++import org.springframework.dao.DataAccessResourceFailureException;
++import org.springframework.transaction.annotation.Transactional;
++
++/** Unit tests of {@link OutboxPublishService}. */
++class OutboxPublishServiceTest {
++
++  private static final Instant NOW = Instant.parse("2026-09-14T10:15:30Z");
++  private static final int BATCH = 3;
++  private static final int MAX_ATTEMPTS = 3;
++  private static final String HASH = "c".repeat(64);
++
++  private final ClickOutboxRepository repository = mock(ClickOutboxRepository.class);
++  private final ClickEventProducer producer = mock(ClickEventProducer.class);
++  private final OutboxMetrics metrics = new OutboxMetrics();
++  private final List<Duration> sleeps = new ArrayList<>();
++  private final RetryExecutor retryExecutor =
++      new RetryExecutor(
++          new AnalyticsProperties.Retry(MAX_ATTEMPTS, 100, 10_000, Jitter.NONE),
++          Duration.ofMillis(50),
++          new SplittableRandom(42L),
++          sleeps::add);
++  private final AnalyticsProperties properties =
++      new AnalyticsProperties(
++          "unit-test-salt-0123456789",
++          new AnalyticsProperties.Outbox(500, BATCH),
++          new AnalyticsProperties.Retry(MAX_ATTEMPTS, 100, 10_000, Jitter.NONE),
++          new AnalyticsProperties.Kafka(50),
++          new AnalyticsProperties.Retention(90));
++  private final OutboxPublishService service =
++      new OutboxPublishService(
++          repository,
++          producer,
++          retryExecutor,
++          metrics,
++          properties,
++          Clock.fixed(NOW, ZoneOffset.UTC));
++
++  /** The in-memory click_outbox table behind the mocked repository. */
++  private final List<ClickOutboxEntry> table = new ArrayList<>();
++
++  private final ListAppender<ILoggingEvent> logs = new ListAppender<>();
++  private final Logger serviceLogger = (Logger) LoggerFactory.getLogger(OutboxPublishService.class);
++
++  @BeforeEach
++  void stubRepositoryAndLogs() {
++    when(repository.claimBatch(any(Instant.class), anyInt()))
++        .thenAnswer(
++            inv -> {
++              Instant now = inv.getArgument(0);
++              int limit = inv.getArgument(1);
++              return table.stream()
++                  .filter(e -> e.getStatus() == OutboxStatus.PENDING)
++                  .filter(e -> !e.getNextAttemptAt().isAfter(now))
++                  .limit(limit)
++                  .toList();
++            });
++    when(repository.save(any(ClickOutboxEntry.class))).thenAnswer(inv -> inv.getArgument(0));
++    logs.start();
++    serviceLogger.addAppender(logs);
++  }
++
++  @AfterEach
++  void detachLogs() {
++    serviceLogger.detachAppender(logs);
++  }
++
++  private ClickOutboxEntry row(String key, String code, String referrer) {
++    ClickOutboxEntry entry =
++        new ClickOutboxEntry(key, code, NOW.minusSeconds(5), HASH, referrer, NOW.minusSeconds(5));
++    table.add(entry);
++    return entry;
++  }
++
++  private void producerSucceeds() {
++    when(producer.send(any(ClickEventMessage.class)))
++        .thenReturn(CompletableFuture.completedFuture(null));
++  }
++
++  private void producerFails() {
++    when(producer.send(any(ClickEventMessage.class)))
++        .thenReturn(CompletableFuture.failedFuture(new IllegalStateException("broker down")));
++  }
++
++  /** The claim asks for exactly batch-size rows and only those are published. */
++  @Test
++  void claimsAtMostBatchSizeRows() {
++    producerSucceeds();
++    for (int i = 0; i < BATCH + 2; i++) {
++      row("key-" + i, "code" + i, null);
++    }
++
++    PublishSummary summary = service.publishDueBatch();
++
++    verify(repository).claimBatch(NOW, BATCH);
++    assertThat(service.batchSize()).isEqualTo(BATCH);
++    assertThat(summary).isEqualTo(new PublishSummary(BATCH, BATCH, 0));
++    verify(producer, times(BATCH)).send(any(ClickEventMessage.class));
++    assertThat(table.stream().filter(e -> e.getStatus() == OutboxStatus.PUBLISHED)).hasSize(BATCH);
++    assertThat(table.stream().filter(e -> e.getStatus() == OutboxStatus.PENDING)).hasSize(2);
++  }
++
++  /** A successful publish marks PUBLISHED with published_at and the contract message content. */
++  @Test
++  void successfulPublishMarksRowPublished() {
++    producerSucceeds();
++    ClickOutboxEntry entry = row("key-1", "promo2024", "news.example");
++
++    PublishSummary summary = service.publishDueBatch();
++
++    assertThat(summary).isEqualTo(new PublishSummary(1, 1, 0));
++    assertThat(entry.getStatus()).isEqualTo(OutboxStatus.PUBLISHED);
++    assertThat(entry.getPublishedAt()).isEqualTo(NOW);
++    assertThat(entry.getAttempts()).isEqualTo(1);
++    assertThat(metrics.publishedCount()).isEqualTo(1);
++    assertThat(metrics.publishFailedCount()).isZero();
++    verify(repository).save(entry);
++
++    ArgumentCaptor<ClickEventMessage> captor = ArgumentCaptor.forClass(ClickEventMessage.class);
++    verify(producer).send(captor.capture());
++    ClickEventMessage message = captor.getValue();
++    assertThat(message.idempotencyKey()).isEqualTo("key-1");
++    assertThat(message.key()).isEqualTo("promo2024");
++    assertThat(message.occurredAt()).isEqualTo(entry.getOccurredAt());
++    assertThat(message.hashedIp()).isEqualTo(HASH);
++    assertThat(message.referrerHost()).isEqualTo("news.example");
++    assertThat(sleeps).isEmpty();
++  }
++
++  /** A transient failure is retried after the backoff and the row ends PUBLISHED. */
++  @Test
++  void transientFailureIsRetriedThenPublished() {
++    AtomicInteger calls = new AtomicInteger();
++    when(producer.send(any(ClickEventMessage.class)))
++        .thenAnswer(
++            inv ->
++                calls.incrementAndGet() == 1
++                    ? CompletableFuture.failedFuture(new IllegalStateException("hiccup"))
++                    : CompletableFuture.completedFuture(null));
++    ClickOutboxEntry entry = row("key-1", "promo2024", null);
++
++    PublishSummary summary = service.publishDueBatch();
++
++    assertThat(summary).isEqualTo(new PublishSummary(1, 1, 0));
++    assertThat(entry.getStatus()).isEqualTo(OutboxStatus.PUBLISHED);
++    assertThat(entry.getAttempts()).isEqualTo(2);
++    assertThat(entry.getNextAttemptAt()).isEqualTo(NOW.plusMillis(100));
++    assertThat(sleeps).containsExactly(Duration.ofMillis(100));
++    assertThat(metrics.publishFailedCount()).isZero();
++  }
++
++  /** Exhausting the budget parks the row as FAILED, counts it and logs without the digest. */
++  @Test
++  void exhaustedRetriesMarkRowFailedAndCountMetric() {
++    producerFails();
++    ClickOutboxEntry entry = row("key-1", "promo2024", "news.example");
++
++    PublishSummary summary = service.publishDueBatch();
++
++    assertThat(summary).isEqualTo(new PublishSummary(1, 0, 1));
++    assertThat(entry.getStatus()).isEqualTo(OutboxStatus.FAILED);
++    assertThat(entry.getPublishedAt()).isNull();
++    assertThat(entry.getAttempts()).isEqualTo(MAX_ATTEMPTS);
++    verify(producer, times(MAX_ATTEMPTS)).send(any(ClickEventMessage.class));
++    assertThat(sleeps).containsExactly(Duration.ofMillis(100), Duration.ofMillis(200));
++    assertThat(metrics.publishFailedCount()).isEqualTo(1);
++    assertThat(metrics.publishedCount()).isZero();
++    verify(repository).save(entry);
++
++    List<String> lines = logs.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
++    assertThat(lines).anySatisfy(l -> assertThat(l).contains("FAILED").contains("key-1"));
++    assertThat(lines).allSatisfy(l -> assertThat(l).doesNotContain(HASH));
++    assertThat(lines).allSatisfy(l -> assertThat(l).doesNotContain("news.example"));
++  }
++
++  /** A FAILED row is never picked up again; a second pass republishes nothing. */
++  @Test
++  void failedRowIsNeverRetriedOnLaterPasses() {
++    producerFails();
++    row("key-1", "promo2024", null);
++    service.publishDueBatch();
++
++    PublishSummary second = service.publishDueBatch();
++
++    assertThat(second).isEqualTo(PublishSummary.EMPTY);
++    verify(producer, times(MAX_ATTEMPTS)).send(any(ClickEventMessage.class));
++    assertThat(metrics.publishFailedCount()).isEqualTo(1);
++  }
++
++  /** Published rows are not claimed again: a second pass sends nothing. */
++  @Test
++  void secondPassDoesNotPublishDuplicates() {
++    producerSucceeds();
++    row("key-1", "promo2024", null);
++    row("key-2", "promo2024", null);
++
++    PublishSummary first = service.publishDueBatch();
++    PublishSummary second = service.publishDueBatch();
++
++    assertThat(first).isEqualTo(new PublishSummary(2, 2, 0));
++    assertThat(second).isEqualTo(PublishSummary.EMPTY);
++    verify(producer, times(2)).send(any(ClickEventMessage.class));
++    verify(repository, times(2)).claimBatch(NOW, BATCH);
++  }
++
++  /** A mixed batch: one row succeeds, one is parked; each is saved with its own outcome. */
++  @Test
++  void mixedBatchRecordsEachOutcome() {
++    ClickOutboxEntry good = row("good", "promo2024", null);
++    ClickOutboxEntry bad = row("bad", "promo2024", null);
++    when(producer.send(any(ClickEventMessage.class)))
++        .thenAnswer(
++            inv ->
++                ((ClickEventMessage) inv.getArgument(0)).idempotencyKey().equals("good")
++                    ? CompletableFuture.completedFuture(null)
++                    : CompletableFuture.failedFuture(new IllegalStateException("no")));
++
++    PublishSummary summary = service.publishDueBatch();
++
++    assertThat(summary).isEqualTo(new PublishSummary(2, 1, 1));
++    assertThat(good.getStatus()).isEqualTo(OutboxStatus.PUBLISHED);
++    assertThat(bad.getStatus()).isEqualTo(OutboxStatus.FAILED);
++    verify(repository).save(good);
++    verify(repository).save(bad);
++  }
++
++  /** A database failure propagates so the transaction rolls back and rows stay PENDING. */
++  @Test
++  void repositoryFailurePropagates() {
++    when(repository.claimBatch(any(Instant.class), anyInt()))
++        .thenThrow(new DataAccessResourceFailureException("database unavailable"));
++
++    assertThatThrownBy(service::publishDueBatch)
++        .isInstanceOf(DataAccessResourceFailureException.class);
++  }
++
++  /** Claim, publish and state changes share one read-write transaction. */
++  @Test
++  void publishDueBatchIsTransactional() throws NoSuchMethodException {
++    Transactional annotation =
++        OutboxPublishService.class.getMethod("publishDueBatch").getAnnotation(Transactional.class);
++    assertThat(annotation).isNotNull();
++    assertThat(annotation.readOnly()).isFalse();
++  }
++
++  /** Every collaborator is mandatory. */
++  @Test
++  void nullCollaboratorsAreRejected() {
++    assertThatThrownBy(
++            () -> new OutboxPublishService(null, producer, retryExecutor, metrics, properties))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(
++            () -> new OutboxPublishService(repository, null, retryExecutor, metrics, properties))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(
++            () -> new OutboxPublishService(repository, producer, null, metrics, properties))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(
++            () -> new OutboxPublishService(repository, producer, retryExecutor, null, properties))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(
++            () -> new OutboxPublishService(repository, producer, retryExecutor, metrics, null))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(
++            () ->
++                new OutboxPublishService(
++                    repository, producer, retryExecutor, metrics, properties, null))
++        .isInstanceOf(NullPointerException.class);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/outbox/RetryExecutorTest.java b/src/test/java/com/example/shortener/analytics/outbox/RetryExecutorTest.java
+new file mode 100644
+index 0000000..28c1929
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/outbox/RetryExecutorTest.java
+@@ -0,0 +1,285 @@
++/*
++ * RetryExecutorTest.java — bounded attempts, backoff sequence, jitter, timeout and exhaustion
++ *
++ * Layer: test (unit). Drives RetryExecutor with a recording sleeper and a seeded random generator:
++ * the NONE schedule is exactly base * 2^n capped; FULL and EQUAL stay inside their bounds and are
++ * reproducible for the same seed; a hung attempt is cut off at the per-attempt timeout and the
++ * future cancelled; success stops the loop; exhaustion throws with the attempt count and last
++ * cause; an interrupt aborts without reporting exhaustion (AC-4, AC-5). No Spring context.
++ */
++package com.example.shortener.analytics.outbox;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.example.shortener.analytics.config.AnalyticsProperties;
++import com.example.shortener.analytics.config.AnalyticsProperties.Jitter;
++import com.example.shortener.analytics.config.AnalyticsProperties.Retry;
++import com.example.shortener.analytics.support.RetryExecutor;
++import com.example.shortener.analytics.support.RetryExecutor.RetryExhaustedException;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.SplittableRandom;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.jupiter.api.Test;
++
++/** Unit tests of {@link RetryExecutor}. */
++class RetryExecutorTest {
++
++  private static final long SEED = 42L;
++  private static final Duration TIMEOUT = Duration.ofMillis(50);
++
++  private final List<Duration> sleeps = new ArrayList<>();
++  private final List<Integer> retriedAttempts = new ArrayList<>();
++  private final List<Throwable> causes = new ArrayList<>();
++
++  private RetryExecutor executor(int maxAttempts, Jitter jitter, long seed) {
++    return new RetryExecutor(
++        new Retry(maxAttempts, 100, 10_000, jitter),
++        TIMEOUT,
++        new SplittableRandom(seed),
++        sleeps::add);
++  }
++
++  private RetryExecutor.RetryListener listener() {
++    return (attempt, backoff, cause) -> {
++      retriedAttempts.add(attempt);
++      causes.add(cause);
++    };
++  }
++
++  /** Without jitter the sequence is 100, 200, 400, 800 ms and no sleep follows the last failure. */
++  @Test
++  void noneJitterProducesExactExponentialSequence() {
++    RetryExecutor executor = executor(5, Jitter.NONE, SEED);
++
++    assertThatThrownBy(
++            () ->
++                executor.execute(
++                    () -> CompletableFuture.failedFuture(new IllegalStateException("down")),
++                    listener()))
++        .isInstanceOf(RetryExhaustedException.class);
++
++    assertThat(sleeps)
++        .containsExactly(
++            Duration.ofMillis(100),
++            Duration.ofMillis(200),
++            Duration.ofMillis(400),
++            Duration.ofMillis(800));
++    assertThat(retriedAttempts).containsExactly(1, 2, 3, 4);
++    assertThat(causes).allSatisfy(c -> assertThat(c).hasMessage("down"));
++  }
++
++  /** The deterministic delay is capped at max-backoff-ms and never overflows. */
++  @Test
++  void deterministicBackoffIsCapped() {
++    RetryExecutor executor =
++        new RetryExecutor(
++            new Retry(5, 100, 350, Jitter.NONE), TIMEOUT, new SplittableRandom(SEED), sleeps::add);
++
++    assertThat(executor.backoffAfter(1)).isEqualTo(Duration.ofMillis(100));
++    assertThat(executor.backoffAfter(2)).isEqualTo(Duration.ofMillis(200));
++    assertThat(executor.backoffAfter(3)).isEqualTo(Duration.ofMillis(350));
++    assertThat(executor.backoffAfter(40)).isEqualTo(Duration.ofMillis(350));
++    assertThat(executor.backoffAfter(100)).isEqualTo(Duration.ofMillis(350));
++    assertThatThrownBy(() -> executor.backoffAfter(0)).isInstanceOf(IllegalArgumentException.class);
++  }
++
++  /** Full jitter stays within [0, cap_n] and is reproducible for the same seed. */
++  @Test
++  void fullJitterIsBoundedAndDeterministicForASeed() {
++    RetryExecutor first = executor(5, Jitter.FULL, SEED);
++    RetryExecutor second = executor(5, Jitter.FULL, SEED);
++
++    List<Duration> firstRun = new ArrayList<>();
++    List<Duration> secondRun = new ArrayList<>();
++    for (int n = 1; n <= 4; n++) {
++      firstRun.add(first.backoffAfter(n));
++      secondRun.add(second.backoffAfter(n));
++    }
++
++    assertThat(firstRun).isEqualTo(secondRun);
++    for (int n = 1; n <= 4; n++) {
++      long ceiling = 100L << (n - 1);
++      assertThat(firstRun.get(n - 1).toMillis()).isBetween(0L, ceiling);
++    }
++    // A different seed produces a different sequence (the jitter really is random).
++    List<Duration> otherSeed = new ArrayList<>();
++    RetryExecutor third = executor(5, Jitter.FULL, SEED + 1);
++    for (int n = 1; n <= 4; n++) {
++      otherSeed.add(third.backoffAfter(n));
++    }
++    assertThat(otherSeed).isNotEqualTo(firstRun);
++  }
++
++  /** Equal jitter stays within [cap_n / 2, cap_n]. */
++  @Test
++  void equalJitterKeepsHalfOfTheDelay() {
++    RetryExecutor executor = executor(5, Jitter.EQUAL, SEED);
++    for (int n = 1; n <= 6; n++) {
++      long ceiling = Math.min(10_000L, 100L << (n - 1));
++      assertThat(executor.backoffAfter(n).toMillis()).isBetween(ceiling / 2, ceiling);
++    }
++  }
++
++  /** The executor sleeps exactly the jittered value it computed, in order. */
++  @Test
++  void executeSleepsTheJitteredBackoffs() {
++    RetryExecutor expected = executor(4, Jitter.FULL, SEED);
++    List<Duration> expectedSleeps =
++        List.of(expected.backoffAfter(1), expected.backoffAfter(2), expected.backoffAfter(3));
++    RetryExecutor executor = executor(4, Jitter.FULL, SEED);
++
++    assertThatThrownBy(
++            () ->
++                executor.execute(
++                    () -> CompletableFuture.failedFuture(new RuntimeException("x")), listener()))
++        .isInstanceOf(RetryExhaustedException.class);
++
++    assertThat(sleeps).isEqualTo(expectedSleeps);
++  }
++
++  /** A success stops the loop immediately and returns the value. */
++  @Test
++  void returnsFirstSuccessfulResult() {
++    RetryExecutor executor = executor(5, Jitter.NONE, SEED);
++    AtomicInteger calls = new AtomicInteger();
++
++    String result =
++        executor.execute(
++            () ->
++                calls.incrementAndGet() < 3
++                    ? CompletableFuture.failedFuture(new RuntimeException("not yet"))
++                    : CompletableFuture.completedFuture("ok"),
++            listener());
++
++    assertThat(result).isEqualTo("ok");
++    assertThat(calls).hasValue(3);
++    assertThat(sleeps).containsExactly(Duration.ofMillis(100), Duration.ofMillis(200));
++    assertThat(retriedAttempts).containsExactly(1, 2);
++  }
++
++  /** A hung attempt is cut off at the per-attempt timeout, cancelled and counted as a failure. */
++  @Test
++  void hungAttemptTimesOutAndIsCancelled() {
++    RetryExecutor executor = executor(2, Jitter.NONE, SEED);
++    List<CompletableFuture<String>> futures = new ArrayList<>();
++
++    assertThatThrownBy(
++            () ->
++                executor.execute(
++                    () -> {
++                      CompletableFuture<String> hung = new CompletableFuture<>();
++                      futures.add(hung);
++                      return hung;
++                    },
++                    listener()))
++        .isInstanceOf(RetryExhaustedException.class)
++        .hasCauseInstanceOf(TimeoutException.class)
++        .satisfies(e -> assertThat(((RetryExhaustedException) e).getAttempts()).isEqualTo(2));
++
++    assertThat(futures).hasSize(2).allSatisfy(f -> assertThat(f.isCancelled()).isTrue());
++    assertThat(causes).hasSize(1).first().isInstanceOf(TimeoutException.class);
++    assertThat(sleeps).containsExactly(Duration.ofMillis(100));
++    assertThat(executor.attemptTimeout()).isEqualTo(TIMEOUT);
++  }
++
++  /** A supplier that throws synchronously is a failed attempt, not a crash. */
++  @Test
++  void synchronousExceptionCountsAsFailedAttempt() {
++    RetryExecutor executor = executor(3, Jitter.NONE, SEED);
++    AtomicInteger calls = new AtomicInteger();
++
++    assertThatThrownBy(
++            () ->
++                executor.execute(
++                    () -> {
++                      calls.incrementAndGet();
++                      throw new IllegalArgumentException("boom");
++                    },
++                    listener()))
++        .isInstanceOf(RetryExhaustedException.class)
++        .hasCauseInstanceOf(IllegalArgumentException.class)
++        .hasMessageContaining("3 attempt(s)");
++
++    assertThat(calls).hasValue(3);
++    assertThat(executor.maxAttempts()).isEqualTo(3);
++  }
++
++  /** One attempt only: no sleep, no listener call, exhaustion after the single failure. */
++  @Test
++  void singleAttemptPolicyNeverSleeps() {
++    RetryExecutor executor = executor(1, Jitter.FULL, SEED);
++
++    assertThatThrownBy(
++            () ->
++                executor.execute(
++                    () -> CompletableFuture.failedFuture(new RuntimeException("x")), listener()))
++        .isInstanceOf(RetryExhaustedException.class);
++
++    assertThat(sleeps).isEmpty();
++    assertThat(retriedAttempts).isEmpty();
++  }
++
++  /** An interrupt during backoff aborts with the flag restored and is not exhaustion. */
++  @Test
++  void interruptDuringBackoffAbortsWithoutExhaustion() {
++    RetryExecutor executor =
++        new RetryExecutor(
++            new Retry(5, 100, 10_000, Jitter.NONE),
++            TIMEOUT,
++            new SplittableRandom(SEED),
++            duration -> {
++              throw new InterruptedException("stop");
++            });
++
++    try {
++      assertThatThrownBy(
++              () ->
++                  executor.execute(
++                      () -> CompletableFuture.failedFuture(new RuntimeException("x")), listener()))
++          .isInstanceOf(IllegalStateException.class)
++          .isNotInstanceOf(RetryExhaustedException.class);
++      assertThat(Thread.currentThread().isInterrupted()).isTrue();
++    } finally {
++      Thread.interrupted();
++    }
++  }
++
++  /** The Spring constructor takes policy and timeout from the bound properties. */
++  @Test
++  void springConstructorReadsPolicyFromProperties() {
++    AnalyticsProperties properties =
++        new AnalyticsProperties(
++            "unit-test-salt-0123456789",
++            new AnalyticsProperties.Outbox(500, 100),
++            new Retry(7, 100, 10_000, Jitter.FULL),
++            new AnalyticsProperties.Kafka(1234),
++            new AnalyticsProperties.Retention(90));
++
++    RetryExecutor executor = new RetryExecutor(properties);
++
++    assertThat(executor.maxAttempts()).isEqualTo(7);
++    assertThat(executor.attemptTimeout()).isEqualTo(Duration.ofMillis(1234));
++  }
++
++  /** Every collaborator is mandatory and the timeout must be positive. */
++  @Test
++  void invalidArgumentsAreRejected() {
++    Retry retry = new Retry(5, 100, 10_000, Jitter.FULL);
++    SplittableRandom random = new SplittableRandom(SEED);
++    assertThatThrownBy(() -> new RetryExecutor(null, TIMEOUT, random, sleeps::add))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new RetryExecutor(retry, Duration.ZERO, random, sleeps::add))
++        .isInstanceOf(IllegalArgumentException.class);
++    assertThatThrownBy(() -> new RetryExecutor(retry, TIMEOUT, null, sleeps::add))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new RetryExecutor(retry, TIMEOUT, random, null))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new RetryExecutor((AnalyticsProperties) null))
++        .isInstanceOf(NullPointerException.class);
++  }
++}

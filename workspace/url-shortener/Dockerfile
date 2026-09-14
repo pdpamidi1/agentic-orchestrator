@@ -12,6 +12,10 @@
 # coordinates are injected at run time through environment variables (see README.md):
 #   SHORTENER_DB_URL, SHORTENER_DB_USERNAME, SHORTENER_DB_PASSWORD,
 #   SHORTENER_REDIS_HOST, SHORTENER_REDIS_PORT, SHORTENER_BASE_URL
+# Click analytics (docs/analytics.md) additionally take, at run time only:
+#   SHORTENER_KAFKA_BOOTSTRAP_SERVERS   broker of the url.clicked topic
+#   SHORTENER_ANALYTICS_IP_SALT         secret salt of the client-IP hash; supplied from the
+#                                       deployment's secret store, never baked into the image
 #
 # The deployment surface is selected with SPRING_PROFILES_ACTIVE:
 #   default -> both surfaces (POST /api/v1/urls and GET /{short_code})

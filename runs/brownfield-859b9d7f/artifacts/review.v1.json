@@ -1,0 +1,92 @@
+{
+  "criteria": [
+    {
+      "id": "AC-1",
+      "verdict": "FAIL",
+      "evidence": "ClickEventRecorder + V2__click_analytics.sql create the row with idempotency_key/short_code/occurred_at/hashed_ip/referrer_host and RedirectClickRecordingIT/RedirectClickRecordingTest cover it, but the T3 note states the insert runs in \"ClickEventRecorder's own @Transactional write transaction ... UrlReadService (not in allowed files) keeps its read-only lookup transaction\". The AC requires the row to be committed in the same transaction as redirect handling; as implemented it is a separate transaction, so atomicity with redirect handling is not demonstrated by any test."
+    },
+    {
+      "id": "AC-2",
+      "verdict": "PASS",
+      "evidence": "src/test/java/com/example/shortener/redirect/RedirectClickRecordingTest.java (unknown/expired cases) plus T3 note \"404/410 never reach the recorder\"; RedirectClickRecordingIT asserts no outbox row."
+    },
+    {
+      "id": "AC-3",
+      "verdict": "FAIL",
+      "evidence": "No-Kafka-on-request-path is evidenced by T3 note and RedirectClickRecordingTest, but the planned proof (T8 class <base>.analytics.it.KafkaUnavailableRedirectIT) is absent from files_changed/tests_added, so \"redirect unchanged with broker down and event stays PENDING\" is unverified."
+    },
+    {
+      "id": "AC-4",
+      "verdict": "PASS",
+      "evidence": "src/main/java/com/example/shortener/analytics/outbox/OutboxPoller.java + OutboxPublishService.java with ClickOutboxRepository.claimBatch (FOR UPDATE SKIP LOCKED, LIMIT); tests OutboxPollerTest, OutboxPublishServiceTest, ClickAnalyticsRepositoryIT (batch-size bound / no duplicate publish)."
+    },
+    {
+      "id": "AC-5",
+      "verdict": "PASS",
+      "evidence": "src/main/java/com/example/shortener/analytics/support/RetryExecutor.java (bounded attempts, exponential backoff, none/equal/full jitter, per-attempt timeout) with RetryExecutorTest; terminal FAILED/EXHAUSTED states counted in OutboxMetrics/ConsumerMetrics (OutboxPublishServiceTest, ClickEventConsumerTest, ConsumerMetricsTest)."
+    },
+    {
+      "id": "AC-6",
+      "verdict": "PASS",
+      "evidence": "ProcessedClickEvent + ClickStatsAggregator dedupe; src/test/java/com/example/shortener/analytics/aggregation/ClickStatsAggregatorIT.java and ClickStatsAggregatorTest.java cover duplicate delivery no-op (end-to-end duplicate proof from T8 is still missing)."
+    },
+    {
+      "id": "AC-7",
+      "verdict": "PASS",
+      "evidence": "click_stats / click_stats_daily in V2__click_analytics.sql; ClickStatsAggregator UTC day bucketing verified in ClickStatsAggregatorTest (midnight-boundary/out-of-order last_clicked_at cases per T5 note)."
+    },
+    {
+      "id": "AC-8",
+      "verdict": "FAIL",
+      "evidence": "T7 was not delivered: no commit for T7 and no src/main/java/com/example/shortener/analytics/api/** (ClickStatsController/ClickStatsResponse/ClickStatsQueryService) or tests in files_changed."
+    },
+    {
+      "id": "AC-9",
+      "verdict": "FAIL",
+      "evidence": "No stats endpoint exists (no analytics/api package, no MockMvc test for 404) in the changeset."
+    },
+    {
+      "id": "AC-10",
+      "verdict": "PASS",
+      "evidence": "src/main/java/com/example/shortener/analytics/recording/IpHasher.java (salt+SHA-256 hex) with IpHasherTest; migration stores only hashed_ip; T3/T4/T5/T6 notes confirm logging excludes raw IP. No automated log-content assertion exists, so this is code/notes evidence rather than a negative-PII test."
+    },
+    {
+      "id": "AC-11",
+      "verdict": "PASS",
+      "evidence": "src/main/java/com/example/shortener/analytics/recording/ReferrerHostExtractor.java with ReferrerHostExtractorTest (host-only, null for absent/unparsable)."
+    },
+    {
+      "id": "AC-12",
+      "verdict": "PASS",
+      "evidence": "src/main/java/com/example/shortener/analytics/retention/ClickRetentionJob.java; ClickRetentionJobTest (8/8) and ClickRetentionJobIT (3/3, Testcontainers PG) assert boundary deletes and untouched aggregates. See concern about PENDING rows."
+    },
+    {
+      "id": "AC-13",
+      "verdict": "FAIL",
+      "evidence": "Planned RedirectLatencyBudgetIT (T8) and the CI gate (.github/workflows/ci.yml) are absent; no baseline or p95 comparison artifact in the changeset."
+    },
+    {
+      "id": "AC-14",
+      "verdict": "PASS",
+      "evidence": "T3 note: full unit suite of 304 tests passes including unmodified RedirectControllerTest and ArchitectureTest, and `-Pit verify` with OpenApiContractIT passed; no existing contract files were modified (only RedirectController got an additive recorder call). The additive stats operation/OpenAPI part remains undelivered (see AC-8)."
+    },
+    {
+      "id": "AC-15",
+      "verdict": "FAIL",
+      "evidence": "as_of semantics live in ClickStatsQueryService/ClickStatsResponse (T7), which are not present in files_changed; no test covers published-but-unconsumed eventual consistency."
+    }
+  ],
+  "concerns": [
+    "Plan not completed: T7 (stats endpoint + additive openapi.yaml) and T8 (end-to-end IT, KafkaUnavailableRedirectIT, latency gate, Dockerfile/CI/README) have no commits. AC-8, AC-9, AC-13, AC-15 are unimplemented and AC-3/AC-6 lack their cross-cutting integration proof, so the release checklist (contract dump match, CI gates, docs) is unmet.",
+    "AC-1 transactional boundary deviation: the outbox insert runs in ClickEventRecorder's own @Transactional write transaction rather than the transaction handling the redirect (T3 note). This is a defensible design for a read-only redirect path but it contradicts the literal AC text and is not covered by a test asserting atomicity; it should be escalated as an ambiguity/spec amendment rather than silently accepted.",
+    "Retention scope risk (plan T6 risk_note): notes say click_outbox is purged by occurred_at older than retention.days with no mention of excluding rows still in PENDING/FAILED (unpublished) state. If a row is stuck unpublished for >90 days it would be deleted before publication, causing silent event loss. Needs an explicit status predicate and a test.",
+    "Consumer failure handling: T5 note says after retry exhaustion the record is acked and marked EXHAUSTED with no DLQ. That is bounded (satisfies AC-5) but means permanent, silent aggregate loss; ensure the metered/logged terminal state is alertable and documented, and that offsets are only committed after the dedupe+upsert transaction commits (no test named for offset/commit ordering).",
+    "Observability: T4 note states micrometer-core is absent and metrics are hand-rolled counters (OutboxMetrics/ConsumerMetrics). \"metered\" in AC-5 is therefore not exported to any monitoring backend; confirm this is acceptable or add the dependency in a build-owning task.",
+    "Secret hygiene: application.yml carries a SHORTENER_ANALYTICS_IP_SALT placeholder with a \"non-secret local fallback\" default. A default salt value silently weakens AC-10 if the env var is missing in production; prefer fail-fast validation (no default) in AnalyticsProperties.",
+    "PII test gap: there is no negative test scanning outbox rows, Kafka payloads or log output for raw IP substrings (AC-10 explicitly covers logs). Current evidence is implementation notes only.",
+    "Layering/structure workaround: AnalyticsProperties is registered via a nested @Configuration because the application class was outside allowed_files (T1 note). Functional but a pattern deviation worth normalizing later; similarly OutboxSchedulingConfig introduces @EnableScheduling from a feature package.",
+    "Hygiene: T6 note reports an unresolved spotless failure in the T5 file ClickStatsAggregatorTest.java (left untouched because of allowed_files), and the T4 note says the tree was left uncommitted although a T4 commit hash exists \u2014 reconcile these before merge.",
+    "Plan/spec deviations to confirm with the human: AMB mapping in docs/analytics.md was \"inferred\" per T1 note, and the `it` Maven profile plus springdoc dump were reportedly unchanged/not fully exercised locally in T1, which the T7/T8 contract gate depends on."
+  ],
+  "recommendation": "REVISE"
+}

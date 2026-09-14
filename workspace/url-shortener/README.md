@@ -199,6 +199,91 @@ environment (or your secret manager) and are never part of the image or the repo
 Flyway runs the migrations in `src/main/resources/db/migration` on start-up; the schema is
 `validate`d against the JPA model, never generated.
 
+## Click analytics
+
+Every successful redirect is counted, asynchronously and without ever storing a raw client
+address. The pipeline is a transactional outbox relayed to Kafka and aggregated by an in-process
+consumer; [`docs/analytics.md`](docs/analytics.md) is the detailed reference.
+
+```
+GET /{short_code} ──302──▶ client
+       │  same transaction as the lookup
+       ▼
+ click_outbox (PENDING)  ──OutboxPoller (scheduler thread, never a request thread)──▶  Kafka url.clicked
+                                                                                          │
+                                                             ClickEventConsumer ◀─────────┘
+                                                                     │  one transaction: processed_click_event dedupe + upserts
+                                                                     ▼
+                                                  click_stats, click_stats_daily  ──▶  GET /api/v1/urls/{short_code}/stats
+```
+
+1. **Record** (`analytics.recording`): the redirect inserts one `click_outbox` row in the same
+   transaction as the successful lookup. `404`/`410` responses insert nothing. The request thread
+   never talks to Kafka, so a slow or unavailable broker cannot delay or fail a redirect
+   (`KafkaUnavailableRedirectIT`, `RedirectLatencyBudgetIT`).
+2. **Relay** (`analytics.outbox`): a poller claims due `PENDING` rows with `FOR UPDATE SKIP LOCKED`
+   and publishes them to the `url.clicked` topic (key = short code, JSON value, `idempotency-key`
+   header) with bounded retries, exponential backoff and jitter. Rows become `PUBLISHED` on
+   acknowledgement or `FAILED` after the retry budget; several instances can relay concurrently.
+3. **Aggregate** (`analytics.consumer`, `analytics.aggregation`): the consumer dedupes on
+   `processed_click_event` and upserts `click_stats` / `click_stats_daily` in one transaction, so a
+   redelivered record is a no-op (exactly-once aggregation, `ClickAnalyticsEndToEndIT`).
+4. **Serve** (`analytics.api`): the stats endpoint below reads the aggregates.
+5. **Purge** (`analytics.retention`): a daily job deletes raw rows older than the retention period;
+   aggregates are kept.
+
+### `GET /api/v1/urls/{short_code}/stats` — `getUrlClickStats`
+
+Additive, under the existing `/api/v1` surface (registered on the default and `write` profiles,
+`404` on `read`-only instances like `POST /api/v1/urls`).
+
+```bash
+curl -s localhost:8080/api/v1/urls/100001/stats
+# 200 {"total_clicks":3,"last_clicked_at":"2026-09-14T10:15:30Z","as_of":"2026-09-14T10:15:31Z",
+#      "clicks_by_day":[{"date":"2026-09-13","count":1},{"date":"2026-09-14","count":2}]}
+```
+
+| Status | When | Body |
+|---|---|---|
+| `200` | known short code, clicked or not (`0` / `null` / `[]` for a never-clicked link) | `total_clicks`, `last_clicked_at`, `as_of` (freshness of the aggregate), sparse ascending `clicks_by_day` over the last 30 UTC days |
+| `404` | unknown short code | `application/problem+json` |
+
+The numbers lag behind the redirects by the relay + consumer latency; `as_of` says how fresh they
+are. The code base has no `/api/v1` authentication scheme (a stated non-goal), so the endpoint
+carries no `401` today; adding one is a separate, approved change.
+
+### Analytics configuration
+
+| Property | Environment variable | Default | Purpose |
+|---|---|---|---|
+| `analytics.salt` | `SHORTENER_ANALYTICS_IP_SALT` | non-secret local marker | Secret salt of the client-IP hash (≥ 16 characters). **Must** be set in production; supply it from the environment or a CI/deployment secret, never commit it. |
+| `spring.kafka.bootstrap-servers` | `SHORTENER_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Broker address of the `url.clicked` topic. |
+| `analytics.outbox.poll-interval-ms` | `ANALYTICS_OUTBOX_POLL_INTERVAL_MS` | `500` | Delay between two relay passes (50 ms – 60 s). |
+| `analytics.outbox.batch-size` | `ANALYTICS_OUTBOX_BATCH_SIZE` | `100` | Rows relayed per pass (1 – 10 000). |
+| `analytics.retry.max-attempts` | `ANALYTICS_RETRY_MAX_ATTEMPTS` | `5` | Publish / aggregation attempts before giving up. |
+| `analytics.retry.base-backoff-ms` / `max-backoff-ms` | `ANALYTICS_RETRY_BASE_BACKOFF_MS` / `ANALYTICS_RETRY_MAX_BACKOFF_MS` | `100` / `10000` | Exponential backoff bounds. |
+| `analytics.retry.jitter` | `ANALYTICS_RETRY_JITTER` | `full` | `full`, `equal` or `none`. |
+| `analytics.kafka.timeout-ms` | `ANALYTICS_KAFKA_TIMEOUT_MS` | `5000` | Bound of one produce request / aggregation attempt. |
+| `analytics.consumer.auto-startup` | `ANALYTICS_CONSUMER_AUTO_STARTUP` | `true` | Start the `url.clicked` listener with the application. |
+| `analytics.retention.days` | `ANALYTICS_RETENTION_DAYS` | `90` | Age after which raw click rows are purged (1 – 3650). |
+| `analytics.retention.cron` | `ANALYTICS_RETENTION_CRON` | `0 0 3 * * *` | Purge schedule (UTC). |
+
+### Privacy and retention guarantees
+
+* **The client's network identifier is never stored or logged in clear text.** Only a salted
+  SHA-256 digest (`hashed_ip`, 64 hex characters, enforced by a check constraint) reaches the
+  database and the topic; the plain value is discarded on the request thread. The salt
+  lives outside the repository (`SHORTENER_ANALYTICS_IP_SALT`); the checked-in fallback exists
+  only so local runs and tests boot, and a leaked salt is rotated by changing the variable.
+* **Referrers are reduced to the host name** (lower-cased, no path, query or credentials).
+* **No personal data columns** exist in any analytics table (`ClickAnalyticsMigrationTest` pins
+  this); log lines carry short codes, keys and counts, never digests or referrers.
+* **Raw events are kept for `analytics.retention.days` (90 days)**: `click_outbox` rows and
+  `processed_click_event` markers older than that are deleted by the retention job.
+  `click_stats` and `click_stats_daily` are aggregates and are kept for the life of the link.
+* **Counting is exactly-once** at the aggregate level (outbox idempotency key + consumer dedupe),
+  and the redirect never depends on the broker.
+
 ## Running locally
 
 Prerequisites: JDK 25, Docker (for the databases and the integration tests). Maven is
@@ -235,7 +320,7 @@ provided by the wrapper.
    | `./mvnw -q spotless:check`                     | google-java-format check (`spotless:apply` fixes)              |
    | `./mvnw -q -Dtest=ArchitectureTest test`       | layering rules (`src/test/java/sdlc/ArchitectureTest.java`)    |
    | `./mvnw -q test`                               | unit tests (`*Test`), no Docker needed                         |
-   | `./mvnw -q -Pit verify`                        | integration tests (`*IT`) against Testcontainers PostgreSQL and Redis, and the springdoc dump to `target/openapi.yaml` / `target/openapi.json` |
+   | `./mvnw -q -Pit verify`                        | integration tests (`*IT`) against Testcontainers PostgreSQL, Redis and Kafka, including the redirect latency gate (`RedirectLatencyBudgetIT`), and the springdoc dump to `target/openapi.yaml` / `target/openapi.json` |
 
    The same commands, in the same order, form the CI pipeline in
    [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
@@ -264,7 +349,8 @@ docker run --rm -p 8082:8080 -e SPRING_PROFILES_ACTIVE=write ... url-shortener
 ```
 
 `-e SHORTENER_DB_PASSWORD` without a value forwards the variable from the calling shell, so the
-credential never appears on the command line or in the image. `JAVA_OPTS` (default
+credential never appears on the command line or in the image. Pass `-e SHORTENER_ANALYTICS_IP_SALT`
+and `-e SHORTENER_KAFKA_BOOTSTRAP_SERVERS=...` the same way for the click analytics pipeline. `JAVA_OPTS` (default
 `-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError`) can be overridden the same way.
 
 ## Project layout

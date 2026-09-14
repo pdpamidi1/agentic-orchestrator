@@ -74,13 +74,15 @@ Java 25 / Spring Boot 4 / Maven, see its README for endpoints and profiles).
 `sdlc deliver <run_id>` copies a COMPLETED run into `workspace/url-shortener` (a standalone Spring Boot / Maven
 project: `./mvnw test`, `./mvnw -Pit verify`). To run it against real Postgres and Redis and look at the data:
 ```bash
-make shortener-up                 # postgres :5433, redis :6380, app :8081 (builds workspace/url-shortener/Dockerfile)
+make shortener-up                 # postgres :5433, redis :6380, kafka (:9094 from the host), app :8081
+                                  # (builds workspace/url-shortener/Dockerfile; Kafka carries url.clicked events)
 curl -s -X POST localhost:8081/api/v1/urls -H 'content-type: application/json' \
      -d '{"long_url":"https://example.com/a/very/long/path"}'
 curl -si localhost:8081/<short_code>            # 302 with Location
 make shortener-psql               # then: select short_code, long_url, code_source, expires_at from urls;
 make shortener-redis              # then: keys *   /   get <key>
-make shortener-up-all             # + Kafka (:9094 from the host) for the brownfield click-analytics build
+make shortener-up-all             # same stack (alias kept from before Kafka joined the profile)
+curl -s localhost:8081/api/v1/urls/<short_code>/stats   # click analytics: totals + per-day counts (brownfield)
 make shortener-kafka              # tail the url.clicked topic
 make shortener-down
 ```

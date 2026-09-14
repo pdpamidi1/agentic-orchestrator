@@ -67,8 +67,13 @@ jobs:
         run: ./mvnw -q -B test
 
       # Gate: integration + contract (required) - *IT classes against Testcontainers
-      # PostgreSQL/Redis, plus the springdoc dump written to target/openapi.{json,yaml}.
-      - name: Integration tests and OpenAPI dump
+      # PostgreSQL/Redis/Kafka, plus the springdoc dump written to target/openapi.{json,yaml}.
+      # Includes the click-analytics end-to-end test (ClickAnalyticsEndToEndIT), the broker-down
+      # redirect test (KafkaUnavailableRedirectIT) and the latency gate (RedirectLatencyBudgetIT:
+      # p95 of GET /{short_code} may not exceed the recorded baseline by more than 5 %).
+      # The IP salt is never needed here: the tests boot on the non-secret local fallback. A
+      # deployment job would reference it as ${{ secrets.SHORTENER_ANALYTICS_IP_SALT }}.
+      - name: Integration tests, latency gate and OpenAPI dump
         run: ./mvnw -q -B -Pit verify
 
       # Gate: contract (required) - the committed document must equal what the running

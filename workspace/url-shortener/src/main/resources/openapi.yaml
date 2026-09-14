@@ -6,6 +6,8 @@ servers:
 - url: http://localhost:8080
   description: Generated server url
 tags:
+- name: analytics
+  description: Click statistics of short links
 - name: redirect
   description: Short link resolution
 - name: urls
@@ -102,6 +104,43 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetail"
+  /api/v1/urls/{short_code}/stats:
+    get:
+      tags:
+      - analytics
+      summary: Aggregated click statistics of a short URL
+      description: "Returns total_clicks, last_clicked_at, as_of (freshness of the\
+        \ aggregate) and a sparse ascending clicks_by_day over the last 30 UTC days\
+        \ (days with at least one click only). A link that was never clicked answers\
+        \ 0 / null / []."
+      operationId: getUrlClickStats
+      parameters:
+      - name: short_code
+        in: path
+        description: Generated base62 code or custom alias
+        required: true
+        schema:
+          type: string
+        example: promo2024
+      responses:
+        "200":
+          description: Aggregated click statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClickStatsResponse"
+        "404":
+          description: Short code unknown
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+        "500":
+          description: Unhandled server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
 components:
   schemas:
     CreateUrlRequest:
@@ -153,3 +192,28 @@ components:
         properties:
           type: object
           additionalProperties: {}
+    ClickStatsDayEntry:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        count:
+          type: integer
+          format: int64
+    ClickStatsResponse:
+      type: object
+      properties:
+        total_clicks:
+          type: integer
+          format: int64
+        last_clicked_at:
+          type: string
+          format: date-time
+        as_of:
+          type: string
+          format: date-time
+        clicks_by_day:
+          type: array
+          items:
+            $ref: "#/components/schemas/ClickStatsDayEntry"

@@ -1,0 +1,120 @@
+{
+  "schema": "Impact",
+  "output": {
+    "run_id": "brownfield-859b9d7f",
+    "impacted_packages": [
+      "com.example.shortener",
+      "com.example.shortener.read",
+      "com.example.shortener.domain",
+      "com.example.shortener.config",
+      "com.example.shortener.api.dto",
+      "com.example.shortener.api.error",
+      "com.example.shortener.it",
+      "com.example.shortener.write"
+    ],
+    "new_packages": [
+      "com.example.shortener.analytics",
+      "com.example.shortener.analytics.domain",
+      "com.example.shortener.analytics.outbox",
+      "com.example.shortener.analytics.publish",
+      "com.example.shortener.analytics.consume",
+      "com.example.shortener.analytics.aggregate",
+      "com.example.shortener.analytics.api",
+      "com.example.shortener.analytics.api.dto",
+      "com.example.shortener.analytics.privacy",
+      "com.example.shortener.analytics.retention",
+      "com.example.shortener.analytics.config"
+    ],
+    "impacted_endpoints": [
+      "GET /{short_code} (com.example.shortener.read) - HOT PATH, PUBLIC CONTRACT: handler must additionally write one outbox row in the same DB transaction as successful redirect resolution; response status/Location/headers must remain byte-for-byte unchanged (AC-1, AC-3, AC-13, AC-14)",
+      "GET /api/v1/urls/{short_code}/stats (NEW, com.example.shortener.analytics.api) - additive endpoint reusing the existing /api/v1 auth scheme; 200 with total_clicks, last_clicked_at, as_of, clicks_by_day; 404 for unknown short_code (AC-8, AC-9, AC-15)",
+      "POST /api/v1/urls (com.example.shortener.write) - PUBLIC CONTRACT: no functional change expected, but shares /api/v1 security/DTO/error config that the new endpoint plugs into; existing contract tests must pass unmodified (AC-14)"
+    ],
+    "data_flows": [
+      "GET /{short_code} request (client IP, Referer header) -> read module resolves short_code against urls table; on successful resolution build ClickEvent (salted SHA-256 of IP via analytics.privacy, host-only referrer_host, occurred_at UTC, random UUID idempotency key) -> INSERT into click_outbox in the SAME transaction as redirect handling -> commit -> 302/301 returned without any Kafka call on the request thread (AC-1, AC-3, AC-10, AC-11)",
+      "Scheduled outbox poller (interval + batch size configurable, defaults 500ms/100) -> SELECT ... FOR UPDATE SKIP LOCKED claims pending click_outbox batch -> serialize event, publish to Kafka topic url.clicked with key=short_code and idempotency key in message header, bounded per-attempt timeout + exponential backoff with full jitter (default 5 attempts, base 100ms, cap 10s) -> mark row PUBLISHED (or FAILED terminal state, logged + metered) in click_outbox (AC-4, AC-5)",
+      "Kafka topic url.clicked -> analytics consumer (bounded retry/backoff, per-attempt timeout) -> dedupe on idempotency key via processed_click_event table / unique constraint -> INSERT raw row into click_events and UPSERT aggregate into click_stats (total_clicks, last_clicked_at, clicks_by_day bucketed in UTC, updated_at as as_of) (AC-6, AC-7)",
+      "GET /api/v1/urls/{short_code}/stats -> existing /api/v1 auth filter -> verify short_code exists in urls (404 otherwise) -> read click_stats + last-30-day day buckets -> StatsResponse DTO {total_clicks, last_clicked_at, as_of=aggregate updated_at, clicks_by_day[{date,count}] sparse, ordered} (AC-8, AC-9, AC-14, AC-15)",
+      "Scheduled retention job (in-process, interval + batch size configurable) -> DELETE FROM click_events WHERE occurred_at < now-90d (batched) -> click_stats and urls left untouched; metrics/log of purged row count (AC-12)"
+    ],
+    "risks": [
+      {
+        "id": "R-1",
+        "description": "HOT PATH: the extra transactional outbox INSERT on every successful redirect pushes p95 latency of GET /{short_code} beyond the 5% budget (extra row write, index maintenance, longer transaction, connection-pool contention with the poller).",
+        "likelihood": "high",
+        "severity": "high",
+        "mitigation": "Keep the outbox row minimal with a single narrow index on (status, id); reuse the already-open redirect transaction with no additional round trips beyond one INSERT; never call Kafka, hashing of unbounded input, or DNS on the request thread; size the HikariCP pool and give the poller/retention jobs a separate bounded pool or small fixed thread count; make analytics recording toggleable by a feature flag for fast rollback.",
+        "detection": "Automated CI load-test gate comparing p95 of GET /{short_code} against the recorded pre-change baseline, failing the build above +5% (AC-13); per-endpoint latency histograms and DB statement timers in production dashboards with alerting on p95 regression."
+      },
+      {
+        "id": "R-2",
+        "description": "MIGRATIONS: new tables (click_outbox, click_events, click_stats, dedupe table) plus indexes are added to the shortener's existing schema; a long-running or lock-taking migration, or a rollback that drops tables with in-flight data, causes downtime or data loss.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Additive, forward-only migrations via the existing migration tool (no ALTER on urls); create indexes concurrently where the engine supports it; separate analytics-owned tables per AMB-13 default so the shortener schema objects are untouched; rehearse migration + rollback on a production-sized snapshot; ensure the redirect path tolerates the tables being absent only behind the feature flag, not silently.",
+        "detection": "Migration dry-run and checksum validation in CI/staging; migration duration and lock-wait metrics during deploy; post-deploy smoke test asserting redirect + POST /api/v1/urls still work and the new tables exist with expected constraints."
+      },
+      {
+        "id": "R-3",
+        "description": "DEPENDENCIES: introducing a Kafka client / spring-kafka (plus retry and possibly Testcontainers) can conflict with existing managed versions, inflate startup time, or pull transitive CVEs; a broker-client version mismatch fails at runtime only.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Pin versions through the existing dependency-management BOM, run a dependency-tree/convergence check, scope test-only libraries to test scope, and confirm client/broker compatibility with the infrastructure-owned cluster before release.",
+        "detection": "Build-time dependency convergence + SCA/CVE scan gates; application startup health check for producer/consumer factory creation; integration test against a Testcontainers Kafka in CI."
+      },
+      {
+        "id": "R-4",
+        "description": "PUBLIC CONTRACT: refactoring the read module to inject outbox recording, or adding shared DTO/error/security wiring for the new /api/v1 stats endpoint, accidentally alters existing responses (status code, Location header, error body shape, or auth behaviour) for GET /{short_code} or POST /api/v1/urls.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Change-by-addition: new code lives in com.example.shortener.analytics.* and is invoked from a single seam in the read handler; no modification to existing DTOs in com.example.shortener.api.dto or handlers in write; run the existing contract test suite unmodified and add the stats endpoint as a separate, additively registered controller reusing the current security config without editing it.",
+        "detection": "Existing contract/integration test suite (com.example.shortener.it) executed unmodified as a release gate (AC-14); OpenAPI/response-schema diff check between baseline and candidate builds."
+      },
+      {
+        "id": "R-5",
+        "description": "PRIVACY: a raw client IP leaks into the outbox payload, Kafka message, click_events, aggregate rows, access/debug logs, or an exception stack trace/MDC, breaching AC-10.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Hash at the earliest boundary in analytics.privacy so no raw-IP-typed field ever reaches the event/entity types; forbid IP fields on outbox/event/DTO classes; read the static salt from the existing secret/config mechanism and never log it; scrub IP and Referer from log patterns and error handlers; store referrer host only, null on parse failure.",
+        "detection": "Unit/integration tests asserting persisted rows, produced Kafka payloads and captured log output contain no raw IP (regex assertion over IPv4/IPv6 patterns); log-scanning rule in the observability pipeline alerting on IP-shaped strings from this service."
+      },
+      {
+        "id": "R-6",
+        "description": "Duplicate or lost analytics: at-least-once delivery plus poller/consumer retries double-count clicks, or a crash between publish and marking the outbox row published re-publishes events; conversely an exhausted retry silently drops events.",
+        "likelihood": "high",
+        "severity": "medium",
+        "mitigation": "Carry a per-redirect UUID idempotency key on the outbox row and in the Kafka header; enforce exactly-once effect in the consumer via a unique constraint on the idempotency key with insert-then-ignore before aggregate upsert; mark outbox rows with a terminal FAILED state after bounded retries (configurable, default 5 attempts / base 100ms / cap 10s / full jitter) and log + meter instead of retrying forever; key messages by short_code to preserve per-code ordering.",
+        "detection": "Test replaying the same event twice and asserting unchanged click_stats (AC-6); counters for published/duplicate-skipped/failed events, outbox backlog age gauge, and alerts on non-zero FAILED rows or growing pending age."
+      },
+      {
+        "id": "R-7",
+        "description": "Concurrent poller instances across application replicas contend on click_outbox (lock waits, SKIP LOCKED misuse, or hot-row contention), degrading DB throughput shared with the redirect hot path.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Claim strictly bounded batches with SELECT ... FOR UPDATE SKIP LOCKED ordered by id, keep claim transactions short (claim -> publish outside the claiming lock where safe -> mark), make interval and batch size configurable (defaults 500ms/100), and cap poller concurrency per instance.",
+        "detection": "Multi-instance integration test asserting no event published twice and no starvation; DB lock-wait/deadlock metrics, poller batch duration and claim-conflict counters."
+      },
+      {
+        "id": "R-8",
+        "description": "Eventual-consistency and semantics surprises on the stats endpoint: clients treat stats as real-time, or the zero-click / sparse-vs-dense clicks_by_day behaviour (AMB-14, AMB-15) is implemented differently from expectations, plus unbounded scans of click_events for the 30-day window.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Serve stats only from the click_stats aggregate with an as_of timestamp, document eventual consistency, implement the recorded defaults (200 with total_clicks=0, last_clicked_at=null, empty clicks_by_day; sparse day list) and flag AMB-14/AMB-15 for confirmation before release; index day buckets by (short_code, day) and bound the query to 30 days.",
+        "detection": "Contract tests for the existing-but-zero-clicks and unknown-short-code cases; assertion that as_of equals the aggregate's last update time; query-plan/latency test on the stats endpoint with a large click_events dataset."
+      },
+      {
+        "id": "R-9",
+        "description": "Retention job (90-day purge of raw click_events) runs as a large unbatched DELETE, blocking or bloating the shared database, or incorrectly deletes click_stats aggregates.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Delete in configurable bounded batches with a sleep between batches, run off-peak on a dedicated connection, scope the statement to click_events only (never click_stats or urls), and make the job idempotent and safely re-runnable.",
+        "detection": "Test asserting rows older than 90 days are removed while click_stats is unchanged (AC-12); purge-duration, rows-deleted and oldest-raw-row-age metrics with alerts on job overrun or non-decreasing oldest-row age."
+      }
+    ]
+  },
+  "usage": {
+    "tokens_in": 6412,
+    "tokens_out": 4814,
+    "cost_usd": 0.15241
+  }
+}

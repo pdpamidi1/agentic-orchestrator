@@ -1,0 +1,354 @@
+{
+  "run_id": "brownfield-859b9d7f",
+  "version": 1,
+  "previous_version": null,
+  "spec_version": 2,
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Build, dependency and configuration foundation for click analytics",
+      "depends_on": [],
+      "parallel_group": null,
+      "impact_level": "HIGH",
+      "allowed_files": [
+        "pom.xml",
+        "src/main/resources/application*.yml",
+        "src/main/resources/application*.yaml",
+        "src/main/java/**/analytics/config/AnalyticsProperties.java",
+        "src/test/resources/application*.yml",
+        "src/test/java/**/analytics/config/AnalyticsPropertiesTest.java",
+        "docs/analytics.md"
+      ],
+      "contract_slice": [],
+      "data_model_slice": [
+        "AnalyticsProperties (salt, outbox.pollIntervalMs=500, outbox.batchSize=100, retry.maxAttempts=5, retry.baseBackoffMs=100, retry.maxBackoffMs=10000, retry.jitter=full, kafka.timeoutMs, retention.days=90)"
+      ],
+      "class_structure": [
+        "<base>.analytics.config.AnalyticsProperties"
+      ],
+      "acceptance_criteria_ids": [
+        "AC-5",
+        "AC-10"
+      ],
+      "definition_of_done": [
+        "pom.xml adds spring-kafka, springdoc-openapi-starter-webmvc-ui, a resilience/retry utility or hand-rolled backoff (no new infra), and test deps (spring-kafka-test or testcontainers kafka + db) without changing existing module coordinates",
+        "pom.xml defines an `it` Maven profile that binds failsafe integration-test/verify AND springdoc-openapi-maven-plugin so `./mvnw -q -Pit verify` writes target/openapi.yaml (or target/openapi.json)",
+        "`./mvnw -q -DskipTests compile`, `./mvnw -q -Dtest=ArchitectureTest test` and `./mvnw -q test` still pass with the provisioned Maven wrapper untouched",
+        "application*.yml gains an `analytics.*` block with documented defaults (poll interval 500ms, batch 100, 5 attempts, base 100ms, cap 10s, full jitter, request timeout, retention 90 days) and the IP salt read from the existing secret/config mechanism as a placeholder (no literal secret committed)",
+        "AnalyticsProperties is a validated @ConfigurationProperties bean; AnalyticsPropertiesTest asserts defaults and validation bounds",
+        "docs/analytics.md records the resolved defaults for AMB-12, AMB-16, AMB-17 and AMB-18"
+      ],
+      "risk_notes": "Touches the protected build file and application config; a wrong dependency version or profile binding breaks every downstream gate. The salt must never be committed as a literal value (security gate).",
+      "rollback_note": "Revert pom.xml, the application*.yml analytics block and the new config class; no runtime behaviour depends on them yet."
+    },
+    {
+      "id": "T2",
+      "title": "Schema migrations plus persistence model for click_outbox and click_stats",
+      "depends_on": [
+        "T1"
+      ],
+      "parallel_group": null,
+      "impact_level": "HIGH",
+      "allowed_files": [
+        "src/main/resources/db/migration/V*__click_analytics.sql",
+        "src/main/java/**/analytics/domain/**/*.java",
+        "src/main/java/**/analytics/repository/**/*.java",
+        "src/test/java/**/analytics/repository/**/*.java",
+        "docs/analytics.md"
+      ],
+      "contract_slice": [],
+      "data_model_slice": [
+        "click_outbox(id, idempotency_key UNIQUE, short_code, occurred_at TIMESTAMPTZ, hashed_ip, referrer_host NULL, status PENDING|PUBLISHED|FAILED, attempts, next_attempt_at, published_at, created_at)",
+        "click_stats(short_code PK, total_clicks, last_clicked_at, updated_at)",
+        "click_stats_daily(short_code, day DATE UTC, count, PK(short_code, day))",
+        "processed_click_event(idempotency_key PK, processed_at) for consumer dedupe"
+      ],
+      "class_structure": [
+        "<base>.analytics.domain.ClickOutboxEntry",
+        "<base>.analytics.domain.OutboxStatus",
+        "<base>.analytics.domain.ClickStats",
+        "<base>.analytics.domain.ClickStatsDaily",
+        "<base>.analytics.domain.ProcessedClickEvent",
+        "<base>.analytics.repository.ClickOutboxRepository",
+        "<base>.analytics.repository.ClickStatsRepository",
+        "<base>.analytics.repository.ProcessedClickEventRepository"
+      ],
+      "acceptance_criteria_ids": [
+        "AC-1",
+        "AC-6",
+        "AC-7",
+        "AC-10",
+        "AC-12"
+      ],
+      "definition_of_done": [
+        "Additive forward-only migration script(s) create click_outbox, click_stats, click_stats_daily and processed_click_event with UTC timestamp columns and indexes on (status, next_attempt_at) and (occurred_at) for retention scans; no existing table is altered destructively",
+        "No column anywhere stores a raw IP address or other forbidden PII; only hashed_ip (SHA-256 hex) exists",
+        "JPA entities and repositories are added under the analytics package only; ClickOutboxRepository exposes a batch claim query using SELECT ... FOR UPDATE SKIP LOCKED with a LIMIT bound",
+        "Repository tests (in-memory/Testcontainers as the existing suite does) prove the migration applies, unique idempotency_key is enforced, and the SKIP LOCKED claim returns at most batchSize rows",
+        "`./mvnw -q test` and the ArchitectureTest pass"
+      ],
+      "risk_notes": "Migration files live in a protected path; an incorrect or non-additive script can break startup for the existing shortener schema. Migration version numbering must not collide with existing scripts.",
+      "rollback_note": "Drop the four new tables via a follow-up migration and delete the new entity/repository classes; existing tables are untouched."
+    },
+    {
+      "id": "T3",
+      "title": "Record click events transactionally on successful redirect (hashing + referrer host)",
+      "depends_on": [
+        "T2"
+      ],
+      "parallel_group": null,
+      "impact_level": "MEDIUM",
+      "allowed_files": [
+        "src/main/java/**/analytics/recording/**/*.java",
+        "src/main/java/**/*RedirectController.java",
+        "src/main/java/**/*RedirectService.java",
+        "src/test/java/**/analytics/recording/**/*.java",
+        "src/test/java/**/redirect/**/*.java"
+      ],
+      "contract_slice": [
+        "redirectToTargetUrl"
+      ],
+      "data_model_slice": [
+        "click_outbox insert (idempotency_key = random UUID per redirect, short_code, occurred_at UTC, hashed_ip, referrer_host)"
+      ],
+      "class_structure": [
+        "<base>.analytics.recording.ClickEventRecorder",
+        "<base>.analytics.recording.IpHasher",
+        "<base>.analytics.recording.ReferrerHostExtractor"
+      ],
+      "acceptance_criteria_ids": [
+        "AC-1",
+        "AC-2",
+        "AC-3",
+        "AC-10",
+        "AC-11",
+        "AC-14"
+      ],
+      "definition_of_done": [
+        "On a successful redirect the existing handler writes exactly one click_outbox row inside the same transaction as redirect handling, with a per-redirect random UUID idempotency key",
+        "Unknown/expired short codes produce no outbox row and no event",
+        "The redirect path performs no Kafka or network call and no blocking wait; recorder failures are caught, logged without raw IP, and never change the redirect status or Location header",
+        "IpHasher computes SHA-256 over (configured static salt + client IP) and returns hex; raw IP is never stored, logged or passed on",
+        "ReferrerHostExtractor returns the host component only and null for absent/unparsable Referer",
+        "Unit tests cover success, 404/expired, recorder-throws, missing/garbage Referer and hashing determinism; existing redirect contract tests pass unmodified"
+      ],
+      "risk_notes": "Touches the hot redirect path of an existing service; any added latency or thrown exception directly regresses AC-3/AC-13 and the backward-compatibility criterion.",
+      "rollback_note": "Remove the recorder call from the redirect handler and delete the recording package; redirect behaviour returns to the pre-change baseline."
+    },
+    {
+      "id": "T4",
+      "title": "Outbox poller and Kafka publisher with bounded retries, backoff and jitter",
+      "depends_on": [
+        "T2"
+      ],
+      "parallel_group": "analytics-pipeline",
+      "impact_level": "MEDIUM",
+      "allowed_files": [
+        "src/main/java/**/analytics/outbox/**/*.java",
+        "src/main/java/**/analytics/kafka/ClickEventProducer.java",
+        "src/main/java/**/analytics/kafka/ClickEventMessage.java",
+        "src/main/java/**/analytics/support/RetryExecutor.java",
+        "src/test/java/**/analytics/outbox/**/*.java",
+        "src/test/java/**/analytics/kafka/**/*.java"
+      ],
+      "contract_slice": [],
+      "data_model_slice": [
+        "click_outbox status transitions PENDING -> PUBLISHED | FAILED",
+        "url.clicked message: key=short_code, value={short_code, occurred_at, hashed_ip, referrer_host}, header idempotency-key"
+      ],
+      "class_structure": [
+        "<base>.analytics.outbox.OutboxPoller",
+        "<base>.analytics.outbox.OutboxPublishService",
+        "<base>.analytics.kafka.ClickEventProducer",
+        "<base>.analytics.kafka.ClickEventMessage",
+        "<base>.analytics.support.RetryExecutor"
+      ],
+      "acceptance_criteria_ids": [
+        "AC-3",
+        "AC-4",
+        "AC-5",
+        "AC-10"
+      ],
+      "definition_of_done": [
+        "A @Scheduled in-process poller claims at most analytics.outbox.batchSize PENDING rows via SELECT ... FOR UPDATE SKIP LOCKED so concurrent instances never publish the same row twice",
+        "Each event is published to topic url.clicked keyed by short_code with the idempotency key in a message header; successful rows are marked PUBLISHED with published_at",
+        "RetryExecutor implements bounded attempts with exponential backoff plus full jitter and a per-attempt timeout from AnalyticsProperties; after exhaustion the row moves to FAILED, is logged (no raw IP) and a metric/counter is incremented, and it is never retried again",
+        "The poller never runs on a request thread and cannot block redirects",
+        "Unit tests cover batch claim bounds, key/header content, retry sequence with a deterministic jitter seed, timeout handling, exhaustion -> FAILED, and no-duplicate publish on a second poll"
+      ],
+      "risk_notes": "Scheduling plus row locking can deadlock or starve under load; unbounded retries or missing timeouts would violate AC-5. Topic is provisioned by infrastructure, so tests must use an embedded/Testcontainers broker.",
+      "rollback_note": "Disable the scheduler via the analytics property and delete the outbox/kafka publisher classes; rows simply stay PENDING."
+    },
+    {
+      "id": "T5",
+      "title": "Idempotent analytics consumer aggregating url.clicked into click_stats",
+      "depends_on": [
+        "T2"
+      ],
+      "parallel_group": "analytics-pipeline",
+      "impact_level": "MEDIUM",
+      "allowed_files": [
+        "src/main/java/**/analytics/consumer/**/*.java",
+        "src/main/java/**/analytics/aggregation/**/*.java",
+        "src/test/java/**/analytics/consumer/**/*.java",
+        "src/test/java/**/analytics/aggregation/**/*.java"
+      ],
+      "contract_slice": [],
+      "data_model_slice": [
+        "click_stats(total_clicks, last_clicked_at, updated_at)",
+        "click_stats_daily(short_code, day UTC, count)",
+        "processed_click_event(idempotency_key)"
+      ],
+      "class_structure": [
+        "<base>.analytics.consumer.ClickEventConsumer",
+        "<base>.analytics.aggregation.ClickStatsAggregator"
+      ],
+      "acceptance_criteria_ids": [
+        "AC-5",
+        "AC-6",
+        "AC-7",
+        "AC-10"
+      ],
+      "definition_of_done": [
+        "A Kafka listener on url.clicked deserializes the event and delegates to ClickStatsAggregator inside one transaction",
+        "Aggregation upserts click_stats (total_clicks, last_clicked_at, updated_at) and click_stats_daily using a UTC day bucket derived from occurred_at",
+        "Duplicate deliveries with the same idempotency key are detected via processed_click_event and are a no-op for totals, last_clicked_at and daily buckets",
+        "Consumer failures use the shared RetryExecutor policy (bounded attempts, backoff + jitter, timeout) and end in a logged/metered terminal state instead of infinite redelivery",
+        "No raw IP is logged or stored; only hashed_ip flows through",
+        "Tests cover single event, duplicate event, out-of-order events for last_clicked_at, UTC day bucketing across a midnight boundary, and retry exhaustion"
+      ],
+      "risk_notes": "Consumer offset handling combined with transactional upserts can double-count if dedupe is applied after the write; day bucketing in a non-UTC JVM timezone is a common defect.",
+      "rollback_note": "Remove the listener bean (or disable the analytics consumer property) and delete the consumer/aggregation classes; published events remain on the topic."
+    },
+    {
+      "id": "T6",
+      "title": "90-day retention purge for raw click events",
+      "depends_on": [
+        "T2"
+      ],
+      "parallel_group": "analytics-pipeline",
+      "impact_level": "MEDIUM",
+      "allowed_files": [
+        "src/main/java/**/analytics/retention/**/*.java",
+        "src/test/java/**/analytics/retention/**/*.java",
+        "docs/analytics.md"
+      ],
+      "contract_slice": [],
+      "data_model_slice": [
+        "click_outbox delete where occurred_at < now - retention.days",
+        "processed_click_event delete where processed_at < now - retention.days"
+      ],
+      "class_structure": [
+        "<base>.analytics.retention.ClickRetentionJob"
+      ],
+      "acceptance_criteria_ids": [
+        "AC-12"
+      ],
+      "definition_of_done": [
+        "An in-process scheduled job deletes raw click rows older than analytics.retention.days (default 90) in configurable bounded batches",
+        "click_stats and click_stats_daily aggregate rows are never touched by the job",
+        "The job logs the deleted count per run and never logs row payloads",
+        "Tests insert rows straddling the 90-day boundary and assert only the older raw rows are deleted while aggregates are unchanged, plus batch-size bounding",
+        "docs/analytics.md documents the retention job cadence and configuration"
+      ],
+      "risk_notes": "A mis-scoped DELETE could remove aggregates or unpublished PENDING outbox rows; the query must exclude rows still awaiting publication.",
+      "rollback_note": "Disable the retention schedule property and delete the retention package; already-deleted raw rows are not recoverable, which is the intended policy."
+    },
+    {
+      "id": "T7",
+      "title": "Additive GET /api/v1/urls/{short_code}/stats endpoint and OpenAPI document",
+      "depends_on": [
+        "T5"
+      ],
+      "parallel_group": null,
+      "impact_level": "MEDIUM",
+      "allowed_files": [
+        "src/main/java/**/analytics/api/**/*.java",
+        "src/main/resources/openapi.yaml",
+        "src/test/java/**/analytics/api/**/*.java",
+        "docs/analytics.md"
+      ],
+      "contract_slice": [
+        "getUrlClickStats"
+      ],
+      "data_model_slice": [
+        "ClickStatsResponse{total_clicks, last_clicked_at, as_of, clicks_by_day:[{date, count}]}"
+      ],
+      "class_structure": [
+        "<base>.analytics.api.ClickStatsController",
+        "<base>.analytics.api.ClickStatsResponse",
+        "<base>.analytics.api.ClickStatsDayEntry",
+        "<base>.analytics.api.ClickStatsQueryService"
+      ],
+      "acceptance_criteria_ids": [
+        "AC-8",
+        "AC-9",
+        "AC-14",
+        "AC-15"
+      ],
+      "definition_of_done": [
+        "GET /api/v1/urls/{short_code}/stats returns 200 with total_clicks, last_clicked_at, as_of (click_stats.updated_at, now when no aggregate exists) and clicks_by_day ordered ascending over the last 30 UTC days as a sparse list (days with >=1 click only)",
+        "An existing short code with zero clicks returns 200 with total_clicks=0, last_clicked_at=null and an empty clicks_by_day",
+        "An unknown short code returns 404 using the existing error representation",
+        "The endpoint is secured by the existing /api/v1 auth scheme with no change to that scheme, and no existing operation, field or status code is modified",
+        "src/main/resources/openapi.yaml is updated additively with operationId getUrlClickStats, its 200/401/404 responses and the new schemas, and matches the springdoc dump produced by `-Pit verify`",
+        "MockMvc/WebMvc tests cover 200 with data, 200 empty, 404, unauthenticated, and the 30-day window boundary"
+      ],
+      "risk_notes": "The contract gate compares the committed document to the running app operation-by-operation and status-by-status; any drift (including security responses) fails the build. Field naming must be snake_case exactly as specified.",
+      "rollback_note": "Remove the controller/response classes and revert the additive openapi.yaml block; all pre-existing operations are unchanged."
+    },
+    {
+      "id": "T8",
+      "title": "Integration tests, latency gate and release artifacts",
+      "depends_on": [
+        "T3",
+        "T4",
+        "T6",
+        "T7"
+      ],
+      "parallel_group": null,
+      "impact_level": "HIGH",
+      "allowed_files": [
+        "Dockerfile",
+        ".github/workflows/ci.yml",
+        "README.md",
+        "src/test/java/**/analytics/it/**/*IT.java",
+        "src/test/resources/**",
+        "docs/analytics.md"
+      ],
+      "contract_slice": [
+        "redirectToTargetUrl",
+        "getUrlClickStats"
+      ],
+      "data_model_slice": [],
+      "class_structure": [
+        "<base>.analytics.it.ClickAnalyticsEndToEndIT",
+        "<base>.analytics.it.RedirectLatencyBudgetIT",
+        "<base>.analytics.it.KafkaUnavailableRedirectIT"
+      ],
+      "acceptance_criteria_ids": [
+        "AC-1",
+        "AC-3",
+        "AC-4",
+        "AC-6",
+        "AC-8",
+        "AC-13",
+        "AC-14",
+        "AC-15"
+      ],
+      "definition_of_done": [
+        "End-to-end IT: redirect -> outbox row -> poller publish -> consumer aggregate -> stats endpoint returns the click, including a duplicate delivery proving exactly-once aggregation",
+        "KafkaUnavailableRedirectIT proves the redirect keeps its status and Location header with the broker down and the event stays PENDING in the outbox",
+        "RedirectLatencyBudgetIT measures p95 of GET /{short_code} against a recorded baseline and fails when the increase exceeds 5%",
+        "`./mvnw -q -Pit verify` runs these ITs and emits target/openapi.yaml; the dump matches the committed src/main/resources/openapi.yaml",
+        "Dockerfile builds and runs the application with the Maven wrapper, and .github/workflows/ci.yml runs compile, spotless:check (advisory), ArchitectureTest, `./mvnw -q test` and `./mvnw -q -Pit verify` including the latency gate",
+        "README.md documents the analytics pipeline, configuration properties, privacy/retention guarantees and the new stats endpoint",
+        "No secrets are committed; the IP salt is supplied via environment/CI secret reference only"
+      ],
+      "risk_notes": "Touches protected release paths (Dockerfile, workflow). Flaky container-based ITs or a noisy latency measurement could block the release gate; the latency test must use warmup and a fixed sample size.",
+      "rollback_note": "Revert Dockerfile/workflow/README changes and delete the IT classes; the release gate reverts to the previous pipeline definition."
+    }
+  ],
+  "invalidated_task_ids": [],
+  "rationale": "The DAG follows the dependency reality of an outbox pipeline in a brownfield service. T1 lands every protected build/config change first (dependencies, the `it` profile with the springdoc dump, analytics properties) because the compile, unit, integration and contract gates all depend on it, and it resolves AMB-12/16/17/18 to their documented defaults. T2 lands the additive schema plus JPA model in one protected-path task so that the writer, publisher, consumer and retention job all code against a stable, already-migrated shape. T3 then changes the hot redirect path in isolation, keeping the blast radius on the existing contract small and pairing it with tests that prove AC-2/AC-3/AC-10/AC-11. T4, T5 and T6 are independent leaves over the same schema (publisher, consumer, retention) and share the `analytics-pipeline` group: disjoint file globs, serialised execution in the shared tree. T7 is sequenced after the consumer because the stats projection and its as_of semantics depend on the aggregate tables, and it owns the additive OpenAPI change so the contract gate has a single source of truth. T8 closes the release checklist (Dockerfile, workflow, README, OpenAPI presence) and the cross-cutting integration/latency gates once all behaviour exists. Every task that touches src/** ships tests in the same commit, all globs stay inside allowed or protected paths, migrations/pom/config/Dockerfile/workflow tasks are HIGH, and the orchestrator-provisioned mvnw and ArchitectureTest are never listed in any allowed_files while each task's definition of done requires them to keep passing."
+}

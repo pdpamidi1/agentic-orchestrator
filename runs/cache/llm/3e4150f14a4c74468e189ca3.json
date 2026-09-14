@@ -1,0 +1,34 @@
+{
+  "schema": "Diagnosis",
+  "output": {
+    "root_cause": "Two independent blockers, neither fixable by another implementation pass inside current policy. (1) Change-control: the required `scope` gate rejects modifications to `.github/workflows/ci.yml` (release.config) and `Dockerfile` (infrastructure.change) as protected paths needing human approval. These files are the core of task T8, which also owns the CI latency gate demanded by AC-13, so the plan cannot complete without an approved protected change. (2) Infrastructure: the required `integration` gate died with exit 137 (SIGKILL/OOM \u2014 'Killed' after repeated Spring MockMvc context bootstraps), i.e. the container ran out of memory/was reaped, not a logical test failure; no code edit reliably fixes a runner resource limit. Secondary, and also human-scope: T7 (stats endpoint + additive openapi.yaml) and T8 were never delivered, leaving AC-8/AC-9/AC-13/AC-15 unimplemented, and AC-1 as implemented deliberately deviates from the spec text (outbox insert in ClickEventRecorder's own @Transactional write transaction rather than the redirect's transaction) \u2014 a spec ambiguity that requires a human amendment decision rather than a silent acceptance. Retrying would re-run the same protected-path rejection and the same OOM; replanning cannot remove the protected paths because AC-13 requires the CI gate.",
+    "decision": "halt",
+    "feedback": [
+      {
+        "target": "human-approver: change_control (.github/workflows/ci.yml, Dockerfile)",
+        "instruction": "Approve or explicitly waive the protected-path changes required by plan task T8: `.github/workflows/ci.yml` (adds compile, spotless:check advisory, ArchitectureTest, `./mvnw -q test`, `./mvnw -q -Pit verify` plus the redirect p95 latency gate) and `Dockerfile` (runtime image for the analytics-enabled app). If approval is denied, drop AC-13's CI-enforced latency gate from the spec so the plan can be reduced to non-protected paths; the run cannot proceed until one of these two decisions is recorded."
+      },
+      {
+        "target": "human-approver: pipeline infrastructure (integration gate runner)",
+        "instruction": "Integration gate was SIGKILLed (exit 137) after ~71s while repeatedly bootstrapping Spring MockMvc/TestDispatcherServlet contexts. Raise the runner memory limit and/or the surefire/failsafe fork heap (-Xmx) for the integration stage, and confirm Docker/Testcontainers resources are available (T1 notes `-Pit verify` was never run in-sandbox for lack of Docker). Re-run validation only after the runner limits are raised; no source change can make this deterministic."
+      },
+      {
+        "target": "human-approver: spec owner (AC-1 transactional boundary)",
+        "instruction": "Decide the AC-1 contract. Implementation (T3, ClickEventRecorder + read/RedirectController) commits the click_outbox row in the recorder's own @Transactional write transaction because UrlReadService keeps a read-only lookup transaction and was outside allowed_files. Either (a) amend AC-1 to accept a separate best-effort write transaction on the request thread (and require a test asserting redirect status/Location are unaffected when the insert fails), or (b) keep the literal 'same transaction as redirect handling' wording and authorise editing UrlReadService/the redirect transaction boundary in a follow-up task's allowed_files."
+      },
+      {
+        "target": "planner (next plan version, after approvals)",
+        "instruction": "Do not re-issue T8 as a single task while protected paths are unapproved. Split it: (i) a non-protected task delivering `<base>.analytics.it.ClickAnalyticsEndToEndIT`, `KafkaUnavailableRedirectIT` (redirect unchanged with broker down, event stays PENDING -> AC-3) and `RedirectLatencyBudgetIT` under src/test/java/**/analytics/it/** plus src/test/resources/**; (ii) a separate protected task gated on human approval for Dockerfile/.github/workflows/ci.yml/README.md. Keep T7 (analytics/api ClickStatsController, ClickStatsResponse, ClickStatsDayEntry, ClickStatsQueryService + additive src/main/resources/openapi.yaml, AC-8/AC-9/AC-15) as the first task of the next version since it is entirely in non-protected paths and currently undelivered."
+      },
+      {
+        "target": "planner: T6 retention scope and T1 salt hygiene (carry into next plan)",
+        "instruction": "Add explicit DoD items flagged by review: ClickRetentionJob must exclude click_outbox rows still in PENDING/FAILED (unpublished) status from the purge predicate with a test proving an unpublished >retention.days row survives; AnalyticsProperties must fail fast when the IP salt is absent instead of falling back to a committed default (AC-10); and add a negative PII test asserting no raw IP appears in outbox rows, Kafka payloads or log output."
+      }
+    ]
+  },
+  "usage": {
+    "tokens_in": 19475,
+    "tokens_out": 2281,
+    "cost_usd": 0.1544
+  }
+}

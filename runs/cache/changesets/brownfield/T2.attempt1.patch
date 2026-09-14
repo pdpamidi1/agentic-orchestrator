@@ -1,0 +1,1706 @@
+diff --git a/docs/analytics.md b/docs/analytics.md
+index 6dbb3e8..dbb69ec 100644
+--- a/docs/analytics.md
++++ b/docs/analytics.md
+@@ -24,6 +24,39 @@ task T1 (build, dependency and configuration foundation). The values are bound a
+ | AMB-17 | What happens when Kafka is slow or down? | A produce request times out after **5 s**. Publishing is retried **5** times with exponential backoff starting at **100 ms**, capped at **10 s**, with **full** jitter (`sleep = random(0, min(cap, base * 2^attempt))`; `equal` and `none` are also accepted). The cap must be ≥ the base. | `analytics.kafka.timeout-ms`, `analytics.retry.max-attempts`, `analytics.retry.base-backoff-ms`, `analytics.retry.max-backoff-ms`, `analytics.retry.jitter` |
+ | AMB-18 | How long are raw click events kept? | **90 days**; older rows are purged by the retention job. Bounds: 1 – 3650 days. | `analytics.retention.days` |
+ 
++## Data model (task T2, `V2__click_analytics.sql`)
++
++Additive, forward-only Flyway migration; nothing from V1 (`urls`, `url_code_seq`) is altered. All
++timestamps are `timestamptz` written in UTC; `click_stats_daily.day` is the UTC calendar day of the
++click. **No table stores a client address or any other personal data**: the only address-derived
++column is `hashed_ip`, a salted SHA-256 digest as 64 lowercase hex characters, enforced by
++`click_outbox_hashed_ip_chk`.
++
++| Table | Purpose | Key / constraints | Indexes |
++|---|---|---|---|
++| `click_outbox` | Transactional outbox of click events recorded on the redirect path and relayed to Kafka | `id` identity PK; `idempotency_key` UNIQUE; `status IN ('PENDING','PUBLISHED','FAILED')`; `attempts >= 0` | `(status, next_attempt_at)` for the relay claim, `(occurred_at)` for the retention purge |
++| `click_stats` | Lifetime clicks per short code (`total_clicks`, `last_clicked_at`, `updated_at`) | PK `short_code`; `total_clicks >= 0` | – |
++| `click_stats_daily` | Clicks per short code per UTC day (`count`) | PK `(short_code, day)`; `count >= 0` | – |
++| `processed_click_event` | Consumer-side dedupe marker (`processed_at`) | PK `idempotency_key` | – |
++
++Java mapping (`com.example.shortener.analytics`), validated against the schema at start-up by
++`spring.jpa.hibernate.ddl-auto: validate`:
++
++| Class | Notes |
++|---|---|
++| `domain.ClickOutboxEntry`, `domain.OutboxStatus` | Entity + status enum (stored by name through an `AttributeConverter`). State transitions: `markPublished`, `scheduleRetry`, `markFailed`; all increment `attempts`. |
++| `domain.ClickStats`, `domain.ClickStatsDaily` (with embedded `Key`) | Aggregate entities read by the stats endpoint. |
++| `domain.ProcessedClickEvent` | Dedupe marker entity. |
++| `repository.ClickOutboxRepository` | `claimBatch(now, limit)`: native `SELECT … WHERE status = 'PENDING' AND next_attempt_at <= :now ORDER BY next_attempt_at, id LIMIT :limit FOR UPDATE SKIP LOCKED`. Must be called inside the relay's transaction; concurrent relays never claim the same row and never block each other. `deleteOccurredBefore(cutoff)` backs the retention job. |
++| `repository.ClickStatsRepository` | Atomic `INSERT … ON CONFLICT DO UPDATE` upserts `incrementTotal` (moves `last_clicked_at` forward only) and `incrementDaily`; `findDaily(shortCode, from, to)`. |
++| `repository.ProcessedClickEventRepository` | `insertIfAbsent(key, at)` returns `1` when newly recorded and `0` on a replay (`ON CONFLICT DO NOTHING`); `deleteProcessedBefore(cutoff)`. |
++
++Tests: `ClickAnalyticsMigrationTest` (Docker-free, `./mvnw test`) pins the SQL shape, the absence
++of personal-data columns and the entity/column match; `ClickAnalyticsRepositoryIT`
++(`./mvnw -Pit verify`, Testcontainers PostgreSQL) proves the migration applies, the unique key is
++enforced, `claimBatch` returns at most `batchSize` rows and skips rows locked by a concurrent
++transaction, and the upserts/dedupe behave as described.
++
+ ## Environment variables
+ 
+ | Variable | Property | Default |
+diff --git a/src/main/java/com/example/shortener/analytics/domain/ClickOutboxEntry.java b/src/main/java/com/example/shortener/analytics/domain/ClickOutboxEntry.java
+new file mode 100644
+index 0000000..0761769
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/domain/ClickOutboxEntry.java
+@@ -0,0 +1,302 @@
++/*
++ * ClickOutboxEntry.java — JPA entity for one row of the click_outbox table
++ *
++ * Layer: analytics.domain (leaf). One click recorded on the redirect path, waiting to be relayed to
++ * Kafka by the outbox relay. Mapped 1:1 onto click_outbox from V2__click_analytics.sql and checked
++ * against it at start-up (ddl-auto: validate). Carries only a salted SHA-256 hex digest of the
++ * client address (hashed_ip), never the address itself (AC-1, AC-6, AC-7, AC-10, AC-12).
++ */
++package com.example.shortener.analytics.domain;
++
++import jakarta.persistence.AttributeConverter;
++import jakarta.persistence.Column;
++import jakarta.persistence.Convert;
++import jakarta.persistence.Converter;
++import jakarta.persistence.Entity;
++import jakarta.persistence.GeneratedValue;
++import jakarta.persistence.GenerationType;
++import jakarta.persistence.Id;
++import jakarta.persistence.Table;
++import java.time.Instant;
++import java.util.Objects;
++import java.util.regex.Pattern;
++
++/**
++ * One click event in the transactional outbox ({@code click_outbox}).
++ *
++ * <p><b>Responsibility.</b> Hold the event payload plus its relay bookkeeping ({@code status},
++ * {@code attempts}, {@code nextAttemptAt}, {@code publishedAt}) and apply the three state
++ * transitions the relay needs: {@link #markPublished}, {@link #scheduleRetry} and {@link
++ * #markFailed}.
++ *
++ * <p><b>Invariants.</b> {@code idempotencyKey}, {@code shortCode}, {@code occurredAt}, {@code
++ * hashedIp}, {@code status}, {@code nextAttemptAt} and {@code createdAt} are non-null; {@code
++ * hashedIp} is exactly 64 lowercase hex characters (a SHA-256 digest), enforced here and by {@code
++ * click_outbox_hashed_ip_chk}; {@code attempts >= 0}; {@code publishedAt} is non-null exactly when
++ * {@code status == PUBLISHED}. {@code idempotencyKey} is unique ({@code
++ * uq_click_outbox_idempotency_key}); the surrogate {@code id} is database-generated.
++ *
++ * <p><b>Identity.</b> {@link #equals(Object)} compares the business key {@code idempotencyKey},
++ * which is stable before and after the identity column is assigned; {@link #hashCode()} is constant
++ * (standard JPA entity pattern).
++ *
++ * <p><b>Thread-safety.</b> Not thread-safe; instances are confined to one transaction. Not a Spring
++ * bean.
++ */
++@Entity
++@Table(name = "click_outbox")
++public class ClickOutboxEntry {
++
++  /** Shape of a SHA-256 digest rendered as lowercase hex. */
++  private static final Pattern SHA256_HEX = Pattern.compile("^[0-9a-f]{64}$");
++
++  /** Surrogate key, assigned by the database identity column. */
++  @Id
++  @GeneratedValue(strategy = GenerationType.IDENTITY)
++  @Column(name = "id", nullable = false)
++  private Long id;
++
++  /** Producer-side idempotency key; unique per click, reused by the consumer for dedupe. */
++  @Column(name = "idempotency_key", nullable = false, unique = true, length = 128)
++  private String idempotencyKey;
++
++  /** The short code that was redirected. */
++  @Column(name = "short_code", nullable = false, length = 32)
++  private String shortCode;
++
++  /** When the redirect happened (UTC). */
++  @Column(name = "occurred_at", nullable = false)
++  private Instant occurredAt;
++
++  /** Salted SHA-256 hex digest of the client address; the only trace of the client that is kept. */
++  @Column(name = "hashed_ip", nullable = false, length = 64)
++  private String hashedIp;
++
++  /** Host part of the Referer header, or {@code null} when absent or unparsable. */
++  @Column(name = "referrer_host", length = 255)
++  private String referrerHost;
++
++  /** Relay state, stored as {@code 'PENDING'} / {@code 'PUBLISHED'} / {@code 'FAILED'}. */
++  @Convert(converter = OutboxStatusConverter.class)
++  @Column(name = "status", nullable = false, length = 16)
++  private OutboxStatus status;
++
++  /** Number of publish attempts made so far. */
++  @Column(name = "attempts", nullable = false)
++  private int attempts;
++
++  /** Earliest instant at which the relay may (re)try this row (UTC). */
++  @Column(name = "next_attempt_at", nullable = false)
++  private Instant nextAttemptAt;
++
++  /** When Kafka acknowledged the event (UTC), or {@code null} while not yet published. */
++  @Column(name = "published_at")
++  private Instant publishedAt;
++
++  /** When the row was written (UTC). */
++  @Column(name = "created_at", nullable = false)
++  private Instant createdAt;
++
++  /** Required by JPA. */
++  protected ClickOutboxEntry() {}
++
++  /**
++   * Creates a new pending entry that is immediately eligible for the relay.
++   *
++   * @param idempotencyKey unique key of this click (1 to 128 characters)
++   * @param shortCode the redirected short code
++   * @param occurredAt when the redirect happened (UTC)
++   * @param hashedIp salted SHA-256 digest of the client address as 64 lowercase hex characters
++   * @param referrerHost host of the Referer header, or {@code null}
++   * @param createdAt when the row is being written (UTC); also the first {@code nextAttemptAt}
++   * @throws NullPointerException when a mandatory argument is {@code null}
++   * @throws IllegalArgumentException when {@code hashedIp} is not a 64-character lowercase hex
++   *     string or {@code idempotencyKey} is blank or too long
++   */
++  public ClickOutboxEntry(
++      String idempotencyKey,
++      String shortCode,
++      Instant occurredAt,
++      String hashedIp,
++      String referrerHost,
++      Instant createdAt) {
++    this.idempotencyKey = Objects.requireNonNull(idempotencyKey, "idempotencyKey");
++    if (idempotencyKey.isBlank() || idempotencyKey.length() > 128) {
++      throw new IllegalArgumentException("idempotencyKey must be 1 to 128 characters");
++    }
++    this.shortCode = Objects.requireNonNull(shortCode, "shortCode");
++    this.occurredAt = Objects.requireNonNull(occurredAt, "occurredAt");
++    this.hashedIp = Objects.requireNonNull(hashedIp, "hashedIp");
++    if (!SHA256_HEX.matcher(hashedIp).matches()) {
++      throw new IllegalArgumentException("hashedIp must be a 64-character lowercase hex digest");
++    }
++    this.referrerHost = referrerHost;
++    this.status = OutboxStatus.PENDING;
++    this.attempts = 0;
++    this.createdAt = Objects.requireNonNull(createdAt, "createdAt");
++    this.nextAttemptAt = createdAt;
++    this.publishedAt = null;
++  }
++
++  /**
++   * Records a successful publish: status becomes {@link OutboxStatus#PUBLISHED}, the attempt
++   * counter is incremented and {@code publishedAt} is set.
++   *
++   * @param at acknowledgement instant (UTC)
++   * @throws IllegalStateException when the entry is not {@link OutboxStatus#PENDING}
++   */
++  public void markPublished(Instant at) {
++    requirePending();
++    this.attempts++;
++    this.status = OutboxStatus.PUBLISHED;
++    this.publishedAt = Objects.requireNonNull(at, "at");
++  }
++
++  /**
++   * Records a failed attempt with retries left: the entry stays {@link OutboxStatus#PENDING}, the
++   * attempt counter is incremented and the relay will not pick it up before {@code nextAttemptAt}.
++   *
++   * @param nextAttemptAt earliest instant of the next attempt (UTC)
++   * @throws IllegalStateException when the entry is not {@link OutboxStatus#PENDING}
++   */
++  public void scheduleRetry(Instant nextAttemptAt) {
++    requirePending();
++    this.attempts++;
++    this.nextAttemptAt = Objects.requireNonNull(nextAttemptAt, "nextAttemptAt");
++  }
++
++  /**
++   * Records a failed attempt that exhausted the retry budget: status becomes {@link
++   * OutboxStatus#FAILED} (terminal) and the attempt counter is incremented.
++   *
++   * @throws IllegalStateException when the entry is not {@link OutboxStatus#PENDING}
++   */
++  public void markFailed() {
++    requirePending();
++    this.attempts++;
++    this.status = OutboxStatus.FAILED;
++  }
++
++  private void requirePending() {
++    if (status != OutboxStatus.PENDING) {
++      throw new IllegalStateException("entry is already " + status);
++    }
++  }
++
++  /** Database-generated surrogate key, or {@code null} before the first flush. */
++  public Long getId() {
++    return id;
++  }
++
++  /** Unique key of this click. */
++  public String getIdempotencyKey() {
++    return idempotencyKey;
++  }
++
++  /** The redirected short code. */
++  public String getShortCode() {
++    return shortCode;
++  }
++
++  /** When the redirect happened (UTC). */
++  public Instant getOccurredAt() {
++    return occurredAt;
++  }
++
++  /** Salted SHA-256 hex digest of the client address. */
++  public String getHashedIp() {
++    return hashedIp;
++  }
++
++  /** Referer host, or {@code null}. */
++  public String getReferrerHost() {
++    return referrerHost;
++  }
++
++  /** Current relay state. */
++  public OutboxStatus getStatus() {
++    return status;
++  }
++
++  /** Publish attempts made so far. */
++  public int getAttempts() {
++    return attempts;
++  }
++
++  /** Earliest instant of the next relay attempt (UTC). */
++  public Instant getNextAttemptAt() {
++    return nextAttemptAt;
++  }
++
++  /** Kafka acknowledgement instant (UTC), or {@code null}. */
++  public Instant getPublishedAt() {
++    return publishedAt;
++  }
++
++  /** When the row was written (UTC). */
++  public Instant getCreatedAt() {
++    return createdAt;
++  }
++
++  /**
++   * Entity equality by business key: same instance or same non-null {@code idempotencyKey}.
++   *
++   * @param other the object to compare with
++   * @return {@code true} for the same instance or the same idempotency key
++   */
++  @Override
++  public boolean equals(Object other) {
++    if (this == other) {
++      return true;
++    }
++    if (!(other instanceof ClickOutboxEntry that)) {
++      return false;
++    }
++    return idempotencyKey != null && idempotencyKey.equals(that.idempotencyKey);
++  }
++
++  /** Constant hash code, consistent with {@link #equals(Object)} across the entity lifecycle. */
++  @Override
++  public int hashCode() {
++    return ClickOutboxEntry.class.hashCode();
++  }
++
++  /** Diagnostic rendering without the hashed address or the referrer. */
++  @Override
++  public String toString() {
++    return "ClickOutboxEntry{id="
++        + id
++        + ", idempotencyKey='"
++        + idempotencyKey
++        + "', shortCode='"
++        + shortCode
++        + "', occurredAt="
++        + occurredAt
++        + ", status="
++        + status
++        + ", attempts="
++        + attempts
++        + ", nextAttemptAt="
++        + nextAttemptAt
++        + '}';
++  }
++
++  /**
++   * Persists {@link OutboxStatus} by its constant name ({@code 'PENDING'} etc.), matching {@code
++   * click_outbox_status_chk}. Applied explicitly via {@code @Convert}; {@code null} maps to {@code
++   * null} in both directions. Stateless and thread-safe.
++   */
++  @Converter
++  public static class OutboxStatusConverter implements AttributeConverter<OutboxStatus, String> {
++
++    @Override
++    public String convertToDatabaseColumn(OutboxStatus attribute) {
++      return attribute == null ? null : attribute.name();
++    }
++
++    @Override
++    public OutboxStatus convertToEntityAttribute(String dbData) {
++      return dbData == null ? null : OutboxStatus.valueOf(dbData);
++    }
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/domain/ClickStats.java b/src/main/java/com/example/shortener/analytics/domain/ClickStats.java
+new file mode 100644
+index 0000000..9f0934f
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/domain/ClickStats.java
+@@ -0,0 +1,135 @@
++/*
++ * ClickStats.java — JPA entity for one row of the click_stats table (per-link click aggregate)
++ *
++ * Layer: analytics.domain (leaf). Maintained by the Kafka consumer, read by the stats endpoint.
++ * Mapped 1:1 onto click_stats from V2__click_analytics.sql (AC-7, AC-10).
++ */
++package com.example.shortener.analytics.domain;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.Id;
++import jakarta.persistence.Table;
++import java.time.Instant;
++import java.util.Objects;
++
++/**
++ * Total click count of one short code ({@code click_stats}).
++ *
++ * <p><b>Invariants.</b> {@code shortCode} (primary key) and {@code updatedAt} are non-null; {@code
++ * totalClicks >= 0} ({@code click_stats_total_clicks_chk}); {@code lastClickedAt} is {@code null}
++ * only for a row that has never counted a click.
++ *
++ * <p><b>Identity.</b> By {@code shortCode}; constant {@link #hashCode()}. Not thread-safe; not a
++ * Spring bean. Concurrent increments are normally done with the atomic upsert on {@code
++ * ClickStatsRepository} rather than by loading and saving this entity.
++ */
++@Entity
++@Table(name = "click_stats")
++public class ClickStats {
++
++  /** Primary key: the short code the clicks belong to. */
++  @Id
++  @Column(name = "short_code", nullable = false, length = 32)
++  private String shortCode;
++
++  /** Lifetime click count. */
++  @Column(name = "total_clicks", nullable = false)
++  private long totalClicks;
++
++  /** Instant of the most recent counted click (UTC), or {@code null} when none. */
++  @Column(name = "last_clicked_at")
++  private Instant lastClickedAt;
++
++  /** When the row was last written (UTC). */
++  @Column(name = "updated_at", nullable = false)
++  private Instant updatedAt;
++
++  /** Required by JPA. */
++  protected ClickStats() {}
++
++  /**
++   * Creates an aggregate row.
++   *
++   * @param shortCode the short code
++   * @param totalClicks lifetime click count, {@code >= 0}
++   * @param lastClickedAt most recent click (UTC) or {@code null}
++   * @param updatedAt write instant (UTC)
++   * @throws NullPointerException when {@code shortCode} or {@code updatedAt} is {@code null}
++   * @throws IllegalArgumentException when {@code totalClicks} is negative
++   */
++  public ClickStats(String shortCode, long totalClicks, Instant lastClickedAt, Instant updatedAt) {
++    this.shortCode = Objects.requireNonNull(shortCode, "shortCode");
++    if (totalClicks < 0) {
++      throw new IllegalArgumentException("totalClicks must be >= 0");
++    }
++    this.totalClicks = totalClicks;
++    this.lastClickedAt = lastClickedAt;
++    this.updatedAt = Objects.requireNonNull(updatedAt, "updatedAt");
++  }
++
++  /**
++   * Counts one click: increments the total and moves {@code lastClickedAt} forward if the click is
++   * newer than the one already recorded (events may arrive out of order).
++   *
++   * @param clickedAt when the click happened (UTC)
++   * @param now write instant (UTC)
++   */
++  public void recordClick(Instant clickedAt, Instant now) {
++    Objects.requireNonNull(clickedAt, "clickedAt");
++    this.totalClicks++;
++    if (lastClickedAt == null || clickedAt.isAfter(lastClickedAt)) {
++      this.lastClickedAt = clickedAt;
++    }
++    this.updatedAt = Objects.requireNonNull(now, "now");
++  }
++
++  /** The short code (primary key). */
++  public String getShortCode() {
++    return shortCode;
++  }
++
++  /** Lifetime click count. */
++  public long getTotalClicks() {
++    return totalClicks;
++  }
++
++  /** Most recent counted click (UTC), or {@code null}. */
++  public Instant getLastClickedAt() {
++    return lastClickedAt;
++  }
++
++  /** Last write instant (UTC). */
++  public Instant getUpdatedAt() {
++    return updatedAt;
++  }
++
++  @Override
++  public boolean equals(Object other) {
++    if (this == other) {
++      return true;
++    }
++    if (!(other instanceof ClickStats that)) {
++      return false;
++    }
++    return shortCode != null && shortCode.equals(that.shortCode);
++  }
++
++  @Override
++  public int hashCode() {
++    return ClickStats.class.hashCode();
++  }
++
++  @Override
++  public String toString() {
++    return "ClickStats{shortCode='"
++        + shortCode
++        + "', totalClicks="
++        + totalClicks
++        + ", lastClickedAt="
++        + lastClickedAt
++        + ", updatedAt="
++        + updatedAt
++        + '}';
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/domain/ClickStatsDaily.java b/src/main/java/com/example/shortener/analytics/domain/ClickStatsDaily.java
+new file mode 100644
+index 0000000..e46bcfa
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/domain/ClickStatsDaily.java
+@@ -0,0 +1,169 @@
++/*
++ * ClickStatsDaily.java — JPA entity for one row of click_stats_daily (per-link, per-UTC-day count)
++ *
++ * Layer: analytics.domain (leaf). Maintained by the Kafka consumer, read by the stats endpoint for
++ * the daily breakdown. Mapped 1:1 onto click_stats_daily from V2__click_analytics.sql; the
++ * composite primary key (short_code, day) is the embedded Key (AC-7, AC-10).
++ */
++package com.example.shortener.analytics.domain;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Embeddable;
++import jakarta.persistence.EmbeddedId;
++import jakarta.persistence.Entity;
++import jakarta.persistence.Table;
++import java.io.Serializable;
++import java.time.LocalDate;
++import java.util.Objects;
++
++/**
++ * Click count of one short code on one UTC calendar day ({@code click_stats_daily}).
++ *
++ * <p><b>Invariants.</b> {@code key} (short code and day) is non-null; {@code count >= 0} ({@code
++ * click_stats_daily_count_chk}). The day is the UTC date of the click's {@code occurred_at}; the
++ * consumer derives it with {@code occurredAt.atZone(ZoneOffset.UTC).toLocalDate()}.
++ *
++ * <p><b>Identity.</b> By {@link Key}; constant {@link #hashCode()}. Not thread-safe; not a Spring
++ * bean. Concurrent increments normally go through the atomic upsert on {@code
++ * ClickStatsRepository}.
++ */
++@Entity
++@Table(name = "click_stats_daily")
++public class ClickStatsDaily {
++
++  /** Composite primary key {@code (short_code, day)}. */
++  @EmbeddedId private Key key;
++
++  /** Clicks counted on that day. */
++  @Column(name = "count", nullable = false)
++  private long count;
++
++  /** Required by JPA. */
++  protected ClickStatsDaily() {}
++
++  /**
++   * Creates a daily row.
++   *
++   * @param key short code and UTC day
++   * @param count clicks on that day, {@code >= 0}
++   * @throws NullPointerException when {@code key} is {@code null}
++   * @throws IllegalArgumentException when {@code count} is negative
++   */
++  public ClickStatsDaily(Key key, long count) {
++    this.key = Objects.requireNonNull(key, "key");
++    if (count < 0) {
++      throw new IllegalArgumentException("count must be >= 0");
++    }
++    this.count = count;
++  }
++
++  /** Counts one more click on this day. */
++  public void increment() {
++    this.count++;
++  }
++
++  /** The composite key. */
++  public Key getKey() {
++    return key;
++  }
++
++  /** Convenience accessor for {@code key.shortCode}. */
++  public String getShortCode() {
++    return key.getShortCode();
++  }
++
++  /** Convenience accessor for {@code key.day}. */
++  public LocalDate getDay() {
++    return key.getDay();
++  }
++
++  /** Clicks counted on this day. */
++  public long getCount() {
++    return count;
++  }
++
++  @Override
++  public boolean equals(Object other) {
++    if (this == other) {
++      return true;
++    }
++    if (!(other instanceof ClickStatsDaily that)) {
++      return false;
++    }
++    return key != null && key.equals(that.key);
++  }
++
++  @Override
++  public int hashCode() {
++    return ClickStatsDaily.class.hashCode();
++  }
++
++  @Override
++  public String toString() {
++    return "ClickStatsDaily{" + key + ", count=" + count + '}';
++  }
++
++  /**
++   * Composite primary key of {@code click_stats_daily}: {@code (short_code, day)}. Immutable value
++   * type; {@link #equals(Object)} and {@link #hashCode()} use both components as JPA requires.
++   */
++  @Embeddable
++  public static class Key implements Serializable {
++
++    private static final long serialVersionUID = 1L;
++
++    /** The short code the clicks belong to. */
++    @Column(name = "short_code", nullable = false, length = 32)
++    private String shortCode;
++
++    /** UTC calendar day of the clicks. */
++    @Column(name = "day", nullable = false)
++    private LocalDate day;
++
++    /** Required by JPA. */
++    protected Key() {}
++
++    /**
++     * Creates a key.
++     *
++     * @param shortCode the short code
++     * @param day UTC calendar day
++     * @throws NullPointerException when either argument is {@code null}
++     */
++    public Key(String shortCode, LocalDate day) {
++      this.shortCode = Objects.requireNonNull(shortCode, "shortCode");
++      this.day = Objects.requireNonNull(day, "day");
++    }
++
++    /** The short code. */
++    public String getShortCode() {
++      return shortCode;
++    }
++
++    /** The UTC day. */
++    public LocalDate getDay() {
++      return day;
++    }
++
++    @Override
++    public boolean equals(Object other) {
++      if (this == other) {
++        return true;
++      }
++      if (!(other instanceof Key that)) {
++        return false;
++      }
++      return Objects.equals(shortCode, that.shortCode) && Objects.equals(day, that.day);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(shortCode, day);
++    }
++
++    @Override
++    public String toString() {
++      return "shortCode='" + shortCode + "', day=" + day;
++    }
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/domain/OutboxStatus.java b/src/main/java/com/example/shortener/analytics/domain/OutboxStatus.java
+new file mode 100644
+index 0000000..6ff5bfb
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/domain/OutboxStatus.java
+@@ -0,0 +1,25 @@
++/*
++ * OutboxStatus.java — Lifecycle state of one click_outbox row
++ *
++ * Layer: analytics.domain (leaf; depends on nothing inside the application). Persisted by its
++ * constant name through ClickOutboxEntry.OutboxStatusConverter into the varchar(16) status column,
++ * whose CHECK constraint (V2__click_analytics.sql) admits exactly these three values.
++ */
++package com.example.shortener.analytics.domain;
++
++/**
++ * State of a click event in the transactional outbox.
++ *
++ * <p>Transitions: {@link #PENDING} to {@link #PUBLISHED} on a successful Kafka acknowledgement,
++ * {@link #PENDING} to {@link #PENDING} (with a later {@code next_attempt_at}) on a failed attempt
++ * that still has retries left, {@link #PENDING} to {@link #FAILED} when the attempt budget is
++ * exhausted. {@code PUBLISHED} and {@code FAILED} are terminal.
++ */
++public enum OutboxStatus {
++  /** Recorded on the redirect path and not yet acknowledged by Kafka; eligible for the relay. */
++  PENDING,
++  /** Acknowledged by Kafka; kept until the retention job purges it. */
++  PUBLISHED,
++  /** Retry budget exhausted; kept for inspection, never picked up by the relay again. */
++  FAILED
++}
+diff --git a/src/main/java/com/example/shortener/analytics/domain/ProcessedClickEvent.java b/src/main/java/com/example/shortener/analytics/domain/ProcessedClickEvent.java
+new file mode 100644
+index 0000000..5b14dcf
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/domain/ProcessedClickEvent.java
+@@ -0,0 +1,89 @@
++/*
++ * ProcessedClickEvent.java — JPA entity for one row of processed_click_event (consumer dedupe)
++ *
++ * Layer: analytics.domain (leaf). Written by the Kafka consumer in the same transaction as the
++ * aggregate update so that a redelivered event (same idempotency key) is applied at most once.
++ * Mapped 1:1 onto processed_click_event from V2__click_analytics.sql (AC-6, AC-12).
++ */
++package com.example.shortener.analytics.domain;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.Id;
++import jakarta.persistence.Table;
++import java.time.Instant;
++import java.util.Objects;
++
++/**
++ * Marker that a click event with a given idempotency key has already been applied to the aggregates
++ * ({@code processed_click_event}).
++ *
++ * <p><b>Invariants.</b> {@code idempotencyKey} (primary key) and {@code processedAt} are non-null.
++ * Rows are write-once. Identity by {@code idempotencyKey}; constant {@link #hashCode()}. Not
++ * thread-safe; not a Spring bean.
++ */
++@Entity
++@Table(name = "processed_click_event")
++public class ProcessedClickEvent {
++
++  /**
++   * Primary key: the event's idempotency key, identical to {@code click_outbox.idempotency_key}.
++   */
++  @Id
++  @Column(name = "idempotency_key", nullable = false, length = 128)
++  private String idempotencyKey;
++
++  /** When the consumer applied the event (UTC). */
++  @Column(name = "processed_at", nullable = false)
++  private Instant processedAt;
++
++  /** Required by JPA. */
++  protected ProcessedClickEvent() {}
++
++  /**
++   * Creates a marker.
++   *
++   * @param idempotencyKey the event's idempotency key
++   * @param processedAt when the event was applied (UTC)
++   * @throws NullPointerException when either argument is {@code null}
++   */
++  public ProcessedClickEvent(String idempotencyKey, Instant processedAt) {
++    this.idempotencyKey = Objects.requireNonNull(idempotencyKey, "idempotencyKey");
++    this.processedAt = Objects.requireNonNull(processedAt, "processedAt");
++  }
++
++  /** The idempotency key (primary key). */
++  public String getIdempotencyKey() {
++    return idempotencyKey;
++  }
++
++  /** When the event was applied (UTC). */
++  public Instant getProcessedAt() {
++    return processedAt;
++  }
++
++  @Override
++  public boolean equals(Object other) {
++    if (this == other) {
++      return true;
++    }
++    if (!(other instanceof ProcessedClickEvent that)) {
++      return false;
++    }
++    return idempotencyKey != null && idempotencyKey.equals(that.idempotencyKey);
++  }
++
++  @Override
++  public int hashCode() {
++    return ProcessedClickEvent.class.hashCode();
++  }
++
++  @Override
++  public String toString() {
++    return "ProcessedClickEvent{idempotencyKey='"
++        + idempotencyKey
++        + "', processedAt="
++        + processedAt
++        + '}';
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/repository/ClickOutboxRepository.java b/src/main/java/com/example/shortener/analytics/repository/ClickOutboxRepository.java
+new file mode 100644
+index 0000000..5a17e64
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/repository/ClickOutboxRepository.java
+@@ -0,0 +1,90 @@
++/*
++ * ClickOutboxRepository.java — Spring Data JPA repository for click_outbox rows
++ *
++ * Layer: analytics.repository (depends on analytics.domain only). Used by the recording path to
++ * insert entries, by the outbox relay to claim batches with SELECT ... FOR UPDATE SKIP LOCKED and
++ * by the retention job to purge old rows (AC-1, AC-6, AC-7, AC-10, AC-12).
++ */
++package com.example.shortener.analytics.repository;
++
++import com.example.shortener.analytics.domain.ClickOutboxEntry;
++import com.example.shortener.analytics.domain.OutboxStatus;
++import java.time.Instant;
++import java.util.List;
++import java.util.Optional;
++import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Modifying;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
++
++/**
++ * Spring Data JPA repository for {@link ClickOutboxEntry}.
++ *
++ * <p><b>Responsibility.</b> CRUD on {@code click_outbox} plus the two set-oriented operations the
++ * relay and the retention job need: {@link #claimBatch} and {@link #deleteOccurredBefore}.
++ *
++ * <p><b>Thread-safety and lifecycle.</b> Singleton proxy bean created by Spring Data; safe for
++ * concurrent use. {@link #claimBatch} must be called inside a transaction that stays open while the
++ * claimed rows are processed and updated, otherwise the row locks are released immediately.
++ */
++public interface ClickOutboxRepository extends JpaRepository<ClickOutboxEntry, Long> {
++
++  /**
++   * Looks up an entry by its unique idempotency key.
++   *
++   * @param idempotencyKey the key
++   * @return the entry, or empty
++   */
++  Optional<ClickOutboxEntry> findByIdempotencyKey(String idempotencyKey);
++
++  /**
++   * Whether an entry with the given idempotency key already exists (fast pre-check; the unique
++   * constraint {@code uq_click_outbox_idempotency_key} is the actual guarantee).
++   *
++   * @param idempotencyKey the key
++   * @return {@code true} when present
++   */
++  boolean existsByIdempotencyKey(String idempotencyKey);
++
++  /**
++   * Claims up to {@code limit} pending entries whose {@code next_attempt_at} is not after {@code
++   * now}, oldest due first, locking them for the calling transaction and skipping rows already
++   * locked by another relay instance ({@code FOR UPDATE SKIP LOCKED}). Concurrent relays therefore
++   * never claim the same row twice and never block each other.
++   *
++   * <p>Native SQL because JPQL has neither {@code LIMIT} nor {@code SKIP LOCKED}. Uses {@code
++   * idx_click_outbox_status_next_attempt_at}.
++   *
++   * @param now the reference instant (UTC)
++   * @param limit maximum number of rows to claim ({@code analytics.outbox.batch-size})
++   * @return at most {@code limit} locked entries, possibly empty
++   */
++  @Query(
++      value =
++          "SELECT * FROM click_outbox"
++              + " WHERE status = 'PENDING' AND next_attempt_at <= :now"
++              + " ORDER BY next_attempt_at, id"
++              + " LIMIT :limit"
++              + " FOR UPDATE SKIP LOCKED",
++      nativeQuery = true)
++  List<ClickOutboxEntry> claimBatch(@Param("now") Instant now, @Param("limit") int limit);
++
++  /**
++   * Counts entries in a given state (operational visibility, tests).
++   *
++   * @param status the state
++   * @return number of rows
++   */
++  long countByStatus(OutboxStatus status);
++
++  /**
++   * Retention purge: deletes entries whose click occurred before {@code cutoff}, regardless of
++   * state. Uses {@code idx_click_outbox_occurred_at}. Must run inside a transaction.
++   *
++   * @param cutoff rows with {@code occurred_at < cutoff} are removed
++   * @return number of deleted rows
++   */
++  @Modifying(clearAutomatically = true, flushAutomatically = true)
++  @Query("DELETE FROM ClickOutboxEntry e WHERE e.occurredAt < :cutoff")
++  int deleteOccurredBefore(@Param("cutoff") Instant cutoff);
++}
+diff --git a/src/main/java/com/example/shortener/analytics/repository/ClickStatsRepository.java b/src/main/java/com/example/shortener/analytics/repository/ClickStatsRepository.java
+new file mode 100644
+index 0000000..80b7b59
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/repository/ClickStatsRepository.java
+@@ -0,0 +1,89 @@
++/*
++ * ClickStatsRepository.java — Spring Data JPA repository for the click_stats aggregate plus the
++ * atomic upserts of click_stats and click_stats_daily
++ *
++ * Layer: analytics.repository (depends on analytics.domain only). The consumer increments the
++ * aggregates through the two native upserts; the stats endpoint reads through findById and
++ * findDaily (AC-7, AC-10).
++ */
++package com.example.shortener.analytics.repository;
++
++import com.example.shortener.analytics.domain.ClickStats;
++import com.example.shortener.analytics.domain.ClickStatsDaily;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.util.List;
++import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Modifying;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
++
++/**
++ * Spring Data JPA repository for {@link ClickStats}, also hosting the {@link ClickStatsDaily}
++ * queries so the consumer and the API deal with one data-access type for aggregates.
++ *
++ * <p><b>Concurrency.</b> {@link #incrementTotal} and {@link #incrementDaily} are single-statement
++ * {@code INSERT ... ON CONFLICT DO UPDATE} upserts, so concurrent consumers for different keys
++ * never conflict and same-key increments serialise on the row without lost updates. Singleton proxy
++ * bean; safe for concurrent use.
++ */
++public interface ClickStatsRepository extends JpaRepository<ClickStats, String> {
++
++  /**
++   * Atomically adds one click to the lifetime total of a short code, creating the row if needed and
++   * moving {@code last_clicked_at} forward only (out-of-order events do not move it back).
++   *
++   * @param shortCode the short code
++   * @param clickedAt when the click happened (UTC)
++   * @param now write instant (UTC)
++   * @return number of affected rows (1)
++   */
++  @Modifying(clearAutomatically = true, flushAutomatically = true)
++  @Query(
++      value =
++          "INSERT INTO click_stats (short_code, total_clicks, last_clicked_at, updated_at) VALUES"
++              + " (:shortCode, 1, :clickedAt, :now) ON CONFLICT (short_code) DO UPDATE SET"
++              + " total_clicks = click_stats.total_clicks + 1, last_clicked_at ="
++              + " GREATEST(click_stats.last_clicked_at, EXCLUDED.last_clicked_at), updated_at ="
++              + " EXCLUDED.updated_at",
++      nativeQuery = true)
++  int incrementTotal(
++      @Param("shortCode") String shortCode,
++      @Param("clickedAt") Instant clickedAt,
++      @Param("now") Instant now);
++
++  /**
++   * Atomically adds one click to the daily count of a short code on a UTC day, creating the row if
++   * needed.
++   *
++   * @param shortCode the short code
++   * @param day UTC calendar day of the click
++   * @return number of affected rows (1)
++   */
++  @Modifying(clearAutomatically = true, flushAutomatically = true)
++  @Query(
++      value =
++          "INSERT INTO click_stats_daily (short_code, day, count)"
++              + " VALUES (:shortCode, :day, 1)"
++              + " ON CONFLICT (short_code, day) DO UPDATE SET"
++              + " count = click_stats_daily.count + 1",
++      nativeQuery = true)
++  int incrementDaily(@Param("shortCode") String shortCode, @Param("day") LocalDate day);
++
++  /**
++   * Daily counts of a short code within an inclusive day range, oldest first.
++   *
++   * @param shortCode the short code
++   * @param from first day (inclusive, UTC)
++   * @param to last day (inclusive, UTC)
++   * @return the rows in ascending day order, possibly empty
++   */
++  @Query(
++      "SELECT d FROM ClickStatsDaily d"
++          + " WHERE d.key.shortCode = :shortCode AND d.key.day BETWEEN :from AND :to"
++          + " ORDER BY d.key.day ASC")
++  List<ClickStatsDaily> findDaily(
++      @Param("shortCode") String shortCode,
++      @Param("from") LocalDate from,
++      @Param("to") LocalDate to);
++}
+diff --git a/src/main/java/com/example/shortener/analytics/repository/ProcessedClickEventRepository.java b/src/main/java/com/example/shortener/analytics/repository/ProcessedClickEventRepository.java
+new file mode 100644
+index 0000000..b421d75
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/repository/ProcessedClickEventRepository.java
+@@ -0,0 +1,52 @@
++/*
++ * ProcessedClickEventRepository.java — Spring Data JPA repository for processed_click_event rows
++ *
++ * Layer: analytics.repository (depends on analytics.domain only). Gives the Kafka consumer an
++ * atomic "claim this idempotency key" primitive so redelivered events are applied at most once
++ * (AC-6, AC-12).
++ */
++package com.example.shortener.analytics.repository;
++
++import com.example.shortener.analytics.domain.ProcessedClickEvent;
++import java.time.Instant;
++import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Modifying;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
++
++/**
++ * Spring Data JPA repository for {@link ProcessedClickEvent}.
++ *
++ * <p><b>Usage.</b> The consumer calls {@link #insertIfAbsent} first, in the same transaction as the
++ * aggregate updates; a return value of {@code 0} means the key was already processed and the event
++ * must be skipped. Singleton proxy bean; safe for concurrent use.
++ */
++public interface ProcessedClickEventRepository extends JpaRepository<ProcessedClickEvent, String> {
++
++  /**
++   * Records an idempotency key as processed unless it already is ({@code ON CONFLICT DO NOTHING}).
++   *
++   * @param idempotencyKey the event's key
++   * @param processedAt when the event is being applied (UTC)
++   * @return {@code 1} when the key was newly inserted, {@code 0} when it was already present
++   */
++  @Modifying(clearAutomatically = true, flushAutomatically = true)
++  @Query(
++      value =
++          "INSERT INTO processed_click_event (idempotency_key, processed_at)"
++              + " VALUES (:idempotencyKey, :processedAt)"
++              + " ON CONFLICT (idempotency_key) DO NOTHING",
++      nativeQuery = true)
++  int insertIfAbsent(
++      @Param("idempotencyKey") String idempotencyKey, @Param("processedAt") Instant processedAt);
++
++  /**
++   * Retention purge of dedupe markers older than {@code cutoff}. Must run inside a transaction.
++   *
++   * @param cutoff rows with {@code processed_at < cutoff} are removed
++   * @return number of deleted rows
++   */
++  @Modifying(clearAutomatically = true, flushAutomatically = true)
++  @Query("DELETE FROM ProcessedClickEvent p WHERE p.processedAt < :cutoff")
++  int deleteProcessedBefore(@Param("cutoff") Instant cutoff);
++}
+diff --git a/src/main/resources/db/migration/V2__click_analytics.sql b/src/main/resources/db/migration/V2__click_analytics.sql
+new file mode 100644
+index 0000000..81e72a2
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__click_analytics.sql
+@@ -0,0 +1,60 @@
++-- V2: click analytics persistence (task T2; AC-1, AC-6, AC-7, AC-10, AC-12).
++-- Additive, forward-only Flyway migration: creates four new tables and touches nothing that V1 created.
++-- Every timestamp is timestamptz and is written in UTC by the application; click_stats_daily.day is the
++-- UTC calendar day of the click. Only a salted SHA-256 hex digest of the client address is ever stored
++-- (hashed_ip); no column holds the address itself or any other personal data.
++
++-- Transactional outbox for click events recorded on the redirect path and relayed to Kafka later.
++CREATE TABLE click_outbox (
++    id              bigint        GENERATED BY DEFAULT AS IDENTITY,
++    idempotency_key varchar(128)  NOT NULL,
++    short_code      varchar(32)   NOT NULL,
++    occurred_at     timestamptz   NOT NULL,
++    hashed_ip       varchar(64)   NOT NULL,
++    referrer_host   varchar(255)  NULL,
++    status          varchar(16)   NOT NULL DEFAULT 'PENDING',
++    attempts        integer       NOT NULL DEFAULT 0,
++    next_attempt_at timestamptz   NOT NULL,
++    published_at    timestamptz   NULL,
++    created_at      timestamptz   NOT NULL DEFAULT now(),
++    CONSTRAINT pk_click_outbox PRIMARY KEY (id),
++    CONSTRAINT uq_click_outbox_idempotency_key UNIQUE (idempotency_key),
++    CONSTRAINT click_outbox_status_chk CHECK (status IN ('PENDING', 'PUBLISHED', 'FAILED')),
++    CONSTRAINT click_outbox_hashed_ip_chk CHECK (hashed_ip ~ '^[0-9a-f]{64}$'),
++    CONSTRAINT click_outbox_attempts_chk CHECK (attempts >= 0)
++);
++
++-- Relay scan: SELECT ... WHERE status = 'PENDING' AND next_attempt_at <= now() ... FOR UPDATE SKIP LOCKED.
++CREATE INDEX idx_click_outbox_status_next_attempt_at ON click_outbox (status, next_attempt_at);
++-- Retention scan: purge rows whose occurred_at is older than analytics.retention.days.
++CREATE INDEX idx_click_outbox_occurred_at ON click_outbox (occurred_at);
++
++-- Per-link aggregate maintained by the Kafka consumer (one row per short code).
++CREATE TABLE click_stats (
++    short_code      varchar(32)   NOT NULL,
++    total_clicks    bigint        NOT NULL DEFAULT 0,
++    last_clicked_at timestamptz   NULL,
++    updated_at      timestamptz   NOT NULL DEFAULT now(),
++    CONSTRAINT pk_click_stats PRIMARY KEY (short_code),
++    CONSTRAINT click_stats_total_clicks_chk CHECK (total_clicks >= 0)
++);
++
++-- Per-link, per-UTC-day aggregate.
++CREATE TABLE click_stats_daily (
++    short_code      varchar(32)   NOT NULL,
++    day             date          NOT NULL,
++    count           bigint        NOT NULL DEFAULT 0,
++    CONSTRAINT pk_click_stats_daily PRIMARY KEY (short_code, day),
++    CONSTRAINT click_stats_daily_count_chk CHECK (count >= 0)
++);
++
++-- Consumer-side dedupe: an event whose key is already here has been applied to the aggregates.
++CREATE TABLE processed_click_event (
++    idempotency_key varchar(128)  NOT NULL,
++    processed_at    timestamptz   NOT NULL DEFAULT now(),
++    CONSTRAINT pk_processed_click_event PRIMARY KEY (idempotency_key)
++);
++
++COMMENT ON COLUMN click_outbox.hashed_ip IS 'Salted SHA-256 hex digest (64 lowercase hex chars) of the client address; the address itself is never stored';
++COMMENT ON COLUMN click_outbox.status IS 'PENDING = awaiting relay, PUBLISHED = acknowledged by Kafka, FAILED = retries exhausted';
++COMMENT ON COLUMN click_stats_daily.day IS 'UTC calendar day of the clicks counted in this row';
+diff --git a/src/test/java/com/example/shortener/analytics/repository/ClickAnalyticsMigrationTest.java b/src/test/java/com/example/shortener/analytics/repository/ClickAnalyticsMigrationTest.java
+new file mode 100644
+index 0000000..cbcc803
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/repository/ClickAnalyticsMigrationTest.java
+@@ -0,0 +1,292 @@
++/*
++ * ClickAnalyticsMigrationTest.java — static checks on the V2 click-analytics Flyway migration and
++ * on the repositories' native SQL, without a database.
++ *
++ * Layer: test (unit). Pins src/main/resources/db/migration/V2__click_analytics.sql (task T2; AC-1,
++ * AC-6, AC-7, AC-10, AC-12): additive and forward-only, the four tables with timestamptz columns,
++ * the UNIQUE idempotency_key, the (status, next_attempt_at) and (occurred_at) indexes, the absence
++ * of any raw-address or other personal-data column, and a one-to-one match between every
++ * analytics @Entity's @Column names and the SQL. Also pins that ClickOutboxRepository.claimBatch is
++ * a native SELECT ... LIMIT ... FOR UPDATE SKIP LOCKED. Technique: plain JUnit 5 + regex +
++ * reflection; run with ./mvnw test. The migration is executed for real against PostgreSQL by
++ * ClickAnalyticsRepositoryIT under ./mvnw -Pit verify.
++ */
++package com.example.shortener.analytics.repository;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.example.shortener.analytics.domain.ClickOutboxEntry;
++import com.example.shortener.analytics.domain.ClickStats;
++import com.example.shortener.analytics.domain.ClickStatsDaily;
++import com.example.shortener.analytics.domain.ProcessedClickEvent;
++import jakarta.persistence.Column;
++import jakarta.persistence.Embeddable;
++import jakarta.persistence.EmbeddedId;
++import jakarta.persistence.Entity;
++import jakarta.persistence.Table;
++import java.io.IOException;
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import java.util.stream.Stream;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.springframework.data.jpa.repository.Query;
++
++/**
++ * Static checks on {@code V2__click_analytics.sql} and the analytics repositories. No Docker.
++ *
++ * <p>Fixture strategy: the SQL is read once per class; every test matches case-insensitive regular
++ * expressions against it, and the entities are inspected through reflection so that a column
++ * renamed on one side only is caught before Hibernate's {@code ddl-auto: validate} would fail at IT
++ * start-up.
++ */
++class ClickAnalyticsMigrationTest {
++
++  private static final Path MIGRATION_DIR = Path.of("src/main/resources/db/migration");
++  private static final Path MIGRATION = MIGRATION_DIR.resolve("V2__click_analytics.sql");
++
++  /** Column names that would hold personal data and must never appear in any analytics table. */
++  private static final List<String> FORBIDDEN_COLUMNS =
++      List.of(
++          "ip",
++          "ip_address",
++          "ipaddress",
++          "client_ip",
++          "remote_ip",
++          "remote_addr",
++          "remote_address",
++          "raw_ip",
++          "user_agent",
++          "email",
++          "user_id",
++          "session_id",
++          "cookie");
++
++  private static String sql;
++
++  @BeforeAll
++  static void readMigration() throws IOException {
++    assertThat(MIGRATION).as("migration file").isRegularFile();
++    sql = Files.readString(MIGRATION);
++  }
++
++  /** Given the directory, when listed, then V2 is the single new version and V1 is untouched. */
++  @Test
++  void migrationIsVersionTwoAndDirectoryHoldsOnlyVersionedSql() throws IOException {
++    assertThat(MIGRATION.getFileName().toString()).matches("^V2__[A-Za-z0-9_]+\\.sql$");
++    try (Stream<Path> files = Files.list(MIGRATION_DIR)) {
++      List<String> names = files.map(p -> p.getFileName().toString()).toList();
++      assertThat(names).allMatch(n -> n.matches("^V\\d+(?:[._]\\d+)*__[A-Za-z0-9_]+\\.sql$"));
++      assertThat(names.stream().filter(n -> n.startsWith("V2__")).count()).isEqualTo(1);
++      assertThat(names).contains("V1__create_urls_table.sql");
++    }
++  }
++
++  /**
++   * Given the SQL, when scanned, then it is purely additive: no DROP, TRUNCATE, ALTER or DELETE, so
++   * no existing table (in particular {@code urls}) is altered destructively.
++   */
++  @Test
++  void migrationIsAdditiveAndForwardOnly() {
++    assertThat(sql).doesNotContainPattern(Pattern.compile("(?i)\\bDROP\\b"));
++    assertThat(sql).doesNotContainPattern(Pattern.compile("(?i)\\bTRUNCATE\\b"));
++    assertThat(sql).doesNotContainPattern(Pattern.compile("(?i)\\bALTER\\s+TABLE\\b"));
++    assertThat(sql).doesNotContainPattern(Pattern.compile("(?i)\\bDELETE\\s+FROM\\b"));
++    assertThat(sql).doesNotContainPattern(Pattern.compile("(?i)\\burls\\b"));
++  }
++
++  /** Given the SQL, when scanned, then click_outbox has every contracted column and type. */
++  @Test
++  void createsClickOutboxWithContractedColumns() {
++    assertThat(sql).containsPattern(Pattern.compile("(?i)CREATE\\s+TABLE\\s+click_outbox\\s*\\("));
++    assertThat(sql).containsPattern(column("id", "bigint", true));
++    assertThat(sql).containsPattern(column("idempotency_key", "varchar\\(\\d+\\)", true));
++    assertThat(sql).containsPattern(column("short_code", "varchar\\(32\\)", true));
++    assertThat(sql).containsPattern(column("occurred_at", "timestamptz", true));
++    assertThat(sql).containsPattern(column("hashed_ip", "varchar\\(64\\)", true));
++    assertThat(sql).containsPattern(column("referrer_host", "varchar\\(\\d+\\)", false));
++    assertThat(sql).containsPattern(column("status", "varchar\\(\\d+\\)", true));
++    assertThat(sql).containsPattern(column("attempts", "integer", true));
++    assertThat(sql).containsPattern(column("next_attempt_at", "timestamptz", true));
++    assertThat(sql).containsPattern(column("published_at", "timestamptz", false));
++    assertThat(sql).containsPattern(column("created_at", "timestamptz", true));
++    assertThat(sql)
++        .containsPattern(
++            Pattern.compile(
++                "(?i)CHECK\\s*\\(\\s*status\\s+IN\\s*\\(\\s*'PENDING'\\s*,\\s*'PUBLISHED'\\s*,\\s*'FAILED'\\s*\\)\\s*\\)"));
++  }
++
++  /** Given the SQL, when scanned, then idempotency_key carries a UNIQUE constraint. */
++  @Test
++  void idempotencyKeyIsUnique() {
++    assertThat(sql).containsPattern(Pattern.compile("(?i)UNIQUE\\s*\\(\\s*idempotency_key\\s*\\)"));
++  }
++
++  /**
++   * Given the SQL, when scanned, then the relay index on (status, next_attempt_at) and the
++   * retention index on (occurred_at) exist on click_outbox.
++   */
++  @Test
++  void createsRelayAndRetentionIndexes() {
++    assertThat(sql)
++        .containsPattern(
++            Pattern.compile(
++                "(?i)CREATE\\s+INDEX\\s+\\w+\\s+ON\\s+click_outbox\\s*\\(\\s*status\\s*,\\s*next_attempt_at\\s*\\)"));
++    assertThat(sql)
++        .containsPattern(
++            Pattern.compile(
++                "(?i)CREATE\\s+INDEX\\s+\\w+\\s+ON\\s+click_outbox\\s*\\(\\s*occurred_at\\s*\\)"));
++  }
++
++  /** Given the SQL, when scanned, then the three aggregate/dedupe tables have their keys. */
++  @Test
++  void createsAggregateAndDedupeTablesWithPrimaryKeys() {
++    assertThat(sql).containsPattern(Pattern.compile("(?i)CREATE\\s+TABLE\\s+click_stats\\s*\\("));
++    assertThat(sql).containsPattern(column("total_clicks", "bigint", true));
++    assertThat(sql).containsPattern(column("last_clicked_at", "timestamptz", false));
++    assertThat(sql).containsPattern(column("updated_at", "timestamptz", true));
++    assertThat(sql)
++        .containsPattern(Pattern.compile("(?i)CREATE\\s+TABLE\\s+click_stats_daily\\s*\\("));
++    assertThat(sql).containsPattern(column("day", "date", true));
++    assertThat(sql).containsPattern(column("count", "bigint", true));
++    assertThat(sql)
++        .containsPattern(
++            Pattern.compile("(?i)PRIMARY\\s+KEY\\s*\\(\\s*short_code\\s*,\\s*day\\s*\\)"));
++    assertThat(sql)
++        .containsPattern(Pattern.compile("(?i)CREATE\\s+TABLE\\s+processed_click_event\\s*\\("));
++    assertThat(sql).containsPattern(column("processed_at", "timestamptz", true));
++    assertThat(sql)
++        .containsPattern(Pattern.compile("(?i)PRIMARY\\s+KEY\\s*\\(\\s*idempotency_key\\s*\\)"));
++  }
++
++  /**
++   * Given the SQL, when every timestamp column definition is inspected, then each is timestamptz
++   * (UTC-safe); a plain {@code timestamp} would silently depend on the session time zone.
++   */
++  @Test
++  void everyTimestampColumnIsTimestamptz() {
++    Matcher m = Pattern.compile("(?im)^\\s*(\\w+_at)\\s+(\\w+)").matcher(sql);
++    int found = 0;
++    while (m.find()) {
++      found++;
++      assertThat(m.group(2)).as("type of %s", m.group(1)).isEqualToIgnoringCase("timestamptz");
++    }
++    assertThat(found).isGreaterThanOrEqualTo(7);
++  }
++
++  /**
++   * Given the SQL, when the column definition lines are collected, then none is a forbidden
++   * personal-data column and the only address-derived column is {@code hashed_ip} with a SHA-256
++   * hex check constraint.
++   */
++  @Test
++  void noColumnStoresRawAddressOrOtherPersonalData() {
++    List<String> columns = new ArrayList<>();
++    Matcher m =
++        Pattern.compile("(?im)^\\s*(\\w+)\\s+(?:bigint|varchar|integer|timestamptz|date)\\b")
++            .matcher(sql);
++    while (m.find()) {
++      columns.add(m.group(1).toLowerCase());
++    }
++    assertThat(columns).isNotEmpty();
++    assertThat(columns).doesNotContainAnyElementsOf(FORBIDDEN_COLUMNS);
++    assertThat(columns.stream().filter(c -> c.contains("ip")).toList())
++        .containsExactly("hashed_ip");
++    assertThat(sql)
++        .containsPattern(
++            Pattern.compile(
++                "(?i)CHECK\\s*\\(\\s*hashed_ip\\s*~\\s*'\\^\\[0-9a-f\\]\\{64\\}\\$'\\s*\\)"));
++  }
++
++  /** Given the entities, when inspected by reflection, then their columns match the SQL 1:1. */
++  @Test
++  void entityColumnsMatchTheMigrationOneToOne() {
++    assertEntity(
++        ClickOutboxEntry.class,
++        "click_outbox",
++        "id",
++        "idempotency_key",
++        "short_code",
++        "occurred_at",
++        "hashed_ip",
++        "referrer_host",
++        "status",
++        "attempts",
++        "next_attempt_at",
++        "published_at",
++        "created_at");
++    assertEntity(
++        ClickStats.class,
++        "click_stats",
++        "short_code",
++        "total_clicks",
++        "last_clicked_at",
++        "updated_at");
++    assertEntity(ClickStatsDaily.class, "click_stats_daily", "short_code", "day", "count");
++    assertEntity(
++        ProcessedClickEvent.class, "processed_click_event", "idempotency_key", "processed_at");
++  }
++
++  /**
++   * Given {@link ClickOutboxRepository#claimBatch}, when its {@code @Query} is read, then it is a
++   * native {@code SELECT ... FOR UPDATE SKIP LOCKED} bounded by a {@code LIMIT} parameter and
++   * filtered on the indexed (status, next_attempt_at) pair.
++   */
++  @Test
++  void claimBatchIsNativeSelectForUpdateSkipLockedWithLimit() throws NoSuchMethodException {
++    Method claim =
++        ClickOutboxRepository.class.getMethod("claimBatch", java.time.Instant.class, int.class);
++    Query query = claim.getAnnotation(Query.class);
++    assertThat(query).isNotNull();
++    assertThat(query.nativeQuery()).isTrue();
++    String q = query.value();
++    assertThat(q).containsPattern(Pattern.compile("(?i)^\\s*SELECT\\s+.*FROM\\s+click_outbox\\b"));
++    assertThat(q).containsPattern(Pattern.compile("(?i)status\\s*=\\s*'PENDING'"));
++    assertThat(q).containsPattern(Pattern.compile("(?i)next_attempt_at\\s*<=\\s*:now"));
++    assertThat(q).containsPattern(Pattern.compile("(?i)\\bLIMIT\\s+:limit\\b"));
++    assertThat(q).containsPattern(Pattern.compile("(?i)\\bFOR\\s+UPDATE\\s+SKIP\\s+LOCKED\\s*$"));
++  }
++
++  private static void assertEntity(Class<?> entity, String table, String... expectedColumns) {
++    assertThat(entity.getAnnotation(Entity.class)).as("%s is @Entity", entity).isNotNull();
++    Table t = entity.getAnnotation(Table.class);
++    assertThat(t).isNotNull();
++    assertThat(t.name()).isEqualTo(table);
++    List<String> columns = columnsOf(entity);
++    assertThat(columns).containsExactlyInAnyOrder(expectedColumns);
++    for (String column : columns) {
++      assertThat(sql).as("column %s present in migration", column).containsPattern(column(column));
++    }
++    assertThat(sql).containsPattern(Pattern.compile("(?i)CREATE\\s+TABLE\\s+" + table + "\\s*\\("));
++  }
++
++  /** {@code @Column} names of the entity, descending into an {@code @EmbeddedId} if present. */
++  private static List<String> columnsOf(Class<?> type) {
++    List<String> names = new ArrayList<>();
++    for (Field f : type.getDeclaredFields()) {
++      if (f.isAnnotationPresent(Column.class)) {
++        names.add(f.getAnnotation(Column.class).name());
++      } else if (f.isAnnotationPresent(EmbeddedId.class)) {
++        assertThat(f.getType().getAnnotation(Embeddable.class)).isNotNull();
++        names.addAll(columnsOf(f.getType()));
++      }
++    }
++    return names;
++  }
++
++  private static Pattern column(String name) {
++    return Pattern.compile("(?im)^\\s*" + name + "\\s+\\S+");
++  }
++
++  private static Pattern column(String name, String type, boolean notNull) {
++    String tail =
++        notNull ? "(?:\\s+GENERATED[^,]*)?\\s+NOT\\s+NULL|\\s+GENERATED" : "(?!\\s+NOT\\s+NULL)";
++    return Pattern.compile("(?im)^\\s*" + name + "\\s+" + type + "(?:" + tail + ")");
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/repository/ClickAnalyticsRepositoryIT.java b/src/test/java/com/example/shortener/analytics/repository/ClickAnalyticsRepositoryIT.java
+new file mode 100644
+index 0000000..3d10301
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/repository/ClickAnalyticsRepositoryIT.java
+@@ -0,0 +1,293 @@
++/*
++ * ClickAnalyticsRepositoryIT.java — the click-analytics repositories against a real PostgreSQL.
++ *
++ * Layer: test (integration). Reuses the booted application and Testcontainers fixture of
++ * AbstractIntegrationTest (Flyway applies V1 + V2 on start-up, Hibernate validates the entities
++ * against the schema) and proves, for task T2 (AC-1, AC-6, AC-7, AC-10, AC-12): the migration
++ * applied (all four tables queryable, indexes present), the UNIQUE idempotency_key is enforced,
++ * claimBatch returns at most batchSize rows, skips rows locked by a concurrent transaction and
++ * ignores non-due or non-pending rows, the aggregate upserts are idempotent-per-event and the
++ * dedupe insert returns 0 on a replay. Requires Docker; run by failsafe under ./mvnw -Pit verify.
++ */
++package com.example.shortener.analytics.repository;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.example.shortener.analytics.domain.ClickOutboxEntry;
++import com.example.shortener.analytics.domain.ClickStats;
++import com.example.shortener.analytics.domain.ClickStatsDaily;
++import com.example.shortener.analytics.domain.OutboxStatus;
++import com.example.shortener.it.AbstractIntegrationTest;
++import java.time.Duration;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.time.ZoneOffset;
++import java.util.HexFormat;
++import java.util.List;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DataIntegrityViolationException;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.transaction.PlatformTransactionManager;
++import org.springframework.transaction.support.TransactionTemplate;
++
++/**
++ * Repository tests for the click-analytics tables against PostgreSQL 17 (Testcontainers).
++ *
++ * <p>Fixture strategy: the shared application context from {@link AbstractIntegrationTest}; every
++ * test starts from empty analytics tables ({@link #resetAnalyticsTables()}). Locking behaviour is
++ * exercised with two explicit transactions on two threads via {@link TransactionTemplate}.
++ */
++class ClickAnalyticsRepositoryIT extends AbstractIntegrationTest {
++
++  private static final Instant T0 = Instant.parse("2026-09-14T12:00:00Z");
++  private static final AtomicInteger KEYS = new AtomicInteger();
++
++  @Autowired private ClickOutboxRepository outbox;
++  @Autowired private ClickStatsRepository stats;
++  @Autowired private ProcessedClickEventRepository processed;
++  @Autowired private JdbcTemplate jdbc;
++  @Autowired private PlatformTransactionManager txManager;
++
++  @BeforeEach
++  void resetAnalyticsTables() {
++    jdbc.update("DELETE FROM click_outbox");
++    jdbc.update("DELETE FROM click_stats_daily");
++    jdbc.update("DELETE FROM click_stats");
++    jdbc.update("DELETE FROM processed_click_event");
++  }
++
++  /** Given the booted app, when the schema is inspected, then V2 applied with its indexes. */
++  @Test
++  void migrationCreatesTablesAndIndexes() {
++    Integer version =
++        jdbc.queryForObject(
++            "SELECT count(*) FROM flyway_schema_history WHERE version = '2' AND success",
++            Integer.class);
++    assertThat(version).isEqualTo(1);
++    for (String table :
++        List.of("click_outbox", "click_stats", "click_stats_daily", "processed_click_event")) {
++      assertThat(jdbc.queryForObject("SELECT count(*) FROM " + table, Long.class)).isZero();
++    }
++    List<String> indexDefs =
++        jdbc.queryForList(
++            "SELECT indexdef FROM pg_indexes WHERE tablename = 'click_outbox'", String.class);
++    assertThat(indexDefs)
++        .anyMatch(d -> d.contains("(status, next_attempt_at)"))
++        .anyMatch(d -> d.contains("(occurred_at)"));
++    List<String> columns =
++        jdbc.queryForList(
++            "SELECT column_name FROM information_schema.columns WHERE table_name IN"
++                + " ('click_outbox','click_stats','click_stats_daily','processed_click_event')",
++            String.class);
++    assertThat(columns.stream().filter(c -> c.contains("ip")).toList())
++        .containsExactly("hashed_ip");
++  }
++
++  /** Given an entry, when saved and reloaded, then every column round-trips (AC-1). */
++  @Test
++  void savesAndReloadsAnOutboxEntry() {
++    ClickOutboxEntry saved = outbox.saveAndFlush(entry("abc123", T0, "example.org"));
++    assertThat(saved.getId()).isNotNull();
++
++    ClickOutboxEntry reloaded =
++        outbox.findByIdempotencyKey(saved.getIdempotencyKey()).orElseThrow();
++    assertThat(reloaded.getShortCode()).isEqualTo("abc123");
++    assertThat(reloaded.getOccurredAt()).isEqualTo(T0);
++    assertThat(reloaded.getHashedIp()).hasSize(64);
++    assertThat(reloaded.getReferrerHost()).isEqualTo("example.org");
++    assertThat(reloaded.getStatus()).isEqualTo(OutboxStatus.PENDING);
++    assertThat(reloaded.getAttempts()).isZero();
++    assertThat(reloaded.getNextAttemptAt()).isEqualTo(T0);
++    assertThat(reloaded.getPublishedAt()).isNull();
++    assertThat(outbox.existsByIdempotencyKey(saved.getIdempotencyKey())).isTrue();
++  }
++
++  /** Given a stored key, when a second row with the same key is flushed, then it is rejected. */
++  @Test
++  void uniqueIdempotencyKeyIsEnforced() {
++    ClickOutboxEntry first = outbox.saveAndFlush(entry("abc123", T0, null));
++    ClickOutboxEntry duplicate =
++        new ClickOutboxEntry(
++            first.getIdempotencyKey(), "other1", T0.plusSeconds(1), hash("dup"), null, T0);
++
++    assertThatThrownBy(() -> outbox.saveAndFlush(duplicate))
++        .isInstanceOf(DataIntegrityViolationException.class);
++    assertThat(outbox.count()).isEqualTo(1);
++  }
++
++  /**
++   * Given 5 due rows, when claiming with batchSize 2, then exactly 2 are returned, oldest first.
++   */
++  @Test
++  void claimBatchReturnsAtMostBatchSizeRowsOldestDueFirst() {
++    for (int i = 0; i < 5; i++) {
++      outbox.save(entry("code" + i, T0.plusSeconds(i), null));
++    }
++    outbox.flush();
++
++    List<ClickOutboxEntry> claimed =
++        inTransaction(() -> outbox.claimBatch(T0.plus(Duration.ofHours(1)), 2));
++
++    assertThat(claimed).hasSize(2);
++    assertThat(claimed)
++        .extracting(ClickOutboxEntry::getShortCode)
++        .containsExactly("code0", "code1");
++  }
++
++  /** Given rows locked by another transaction, when claiming, then only unlocked rows come back. */
++  @Test
++  void claimBatchSkipsRowsLockedByAConcurrentTransaction() throws Exception {
++    for (int i = 0; i < 5; i++) {
++      outbox.save(entry("code" + i, T0.plusSeconds(i), null));
++    }
++    outbox.flush();
++    Instant now = T0.plus(Duration.ofHours(1));
++
++    CountDownLatch claimedByA = new CountDownLatch(1);
++    CountDownLatch releaseA = new CountDownLatch(1);
++    ExecutorService pool = Executors.newSingleThreadExecutor();
++    try {
++      Future<List<ClickOutboxEntry>> holder =
++          pool.submit(
++              () ->
++                  inTransaction(
++                      () -> {
++                        List<ClickOutboxEntry> rows = outbox.claimBatch(now, 3);
++                        claimedByA.countDown();
++                        await(releaseA);
++                        return rows;
++                      }));
++      assertThat(claimedByA.await(30, TimeUnit.SECONDS)).as("transaction A claimed").isTrue();
++
++      List<ClickOutboxEntry> claimedByB = inTransaction(() -> outbox.claimBatch(now, 10));
++
++      releaseA.countDown();
++      List<ClickOutboxEntry> rowsA = holder.get(30, TimeUnit.SECONDS);
++
++      assertThat(rowsA).hasSize(3);
++      assertThat(claimedByB).hasSize(2);
++      assertThat(claimedByB)
++          .extracting(ClickOutboxEntry::getIdempotencyKey)
++          .doesNotContainAnyElementsOf(
++              rowsA.stream().map(ClickOutboxEntry::getIdempotencyKey).toList());
++    } finally {
++      pool.shutdownNow();
++    }
++  }
++
++  /** Given future-dated, published and failed rows, when claiming, then none is returned. */
++  @Test
++  void claimBatchIgnoresNotDueAndTerminalRows() {
++    ClickOutboxEntry due = outbox.save(entry("due000", T0, null));
++    outbox.save(entry("later0", T0.plus(Duration.ofDays(1)), null));
++    ClickOutboxEntry published = entry("pub000", T0, null);
++    published.markPublished(T0.plusSeconds(1));
++    outbox.save(published);
++    ClickOutboxEntry failed = entry("fail00", T0, null);
++    failed.markFailed();
++    outbox.save(failed);
++    outbox.flush();
++
++    List<ClickOutboxEntry> claimed = inTransaction(() -> outbox.claimBatch(T0, 100));
++
++    assertThat(claimed)
++        .extracting(ClickOutboxEntry::getIdempotencyKey)
++        .containsExactly(due.getIdempotencyKey());
++    assertThat(outbox.countByStatus(OutboxStatus.PENDING)).isEqualTo(2);
++    assertThat(outbox.countByStatus(OutboxStatus.PUBLISHED)).isEqualTo(1);
++    assertThat(outbox.countByStatus(OutboxStatus.FAILED)).isEqualTo(1);
++  }
++
++  /** Given old and recent rows, when purging, then only rows older than the cutoff go (AC-12). */
++  @Test
++  void retentionPurgeDeletesOnlyRowsOlderThanCutoff() {
++    outbox.save(entry("old000", T0.minus(Duration.ofDays(91)), null));
++    outbox.save(entry("new000", T0.minus(Duration.ofDays(1)), null));
++    outbox.flush();
++
++    int deleted = inTransaction(() -> outbox.deleteOccurredBefore(T0.minus(Duration.ofDays(90))));
++
++    assertThat(deleted).isEqualTo(1);
++    assertThat(outbox.findAll())
++        .extracting(ClickOutboxEntry::getShortCode)
++        .containsExactly("new000");
++  }
++
++  /** Given repeated increments, when read back, then totals and daily rows are upserted (AC-7). */
++  @Test
++  void statsUpsertsCreateThenIncrementAggregates() {
++    Instant later = T0.plus(Duration.ofHours(2));
++    LocalDate day = T0.atZone(ZoneOffset.UTC).toLocalDate();
++
++    inTransaction(() -> stats.incrementTotal("abc123", later, later));
++    inTransaction(() -> stats.incrementTotal("abc123", T0, later.plusSeconds(1)));
++    inTransaction(() -> stats.incrementDaily("abc123", day));
++    inTransaction(() -> stats.incrementDaily("abc123", day));
++    inTransaction(() -> stats.incrementDaily("abc123", day.plusDays(1)));
++
++    ClickStats total = stats.findById("abc123").orElseThrow();
++    assertThat(total.getTotalClicks()).isEqualTo(2);
++    assertThat(total.getLastClickedAt())
++        .as("out-of-order click does not move it back")
++        .isEqualTo(later);
++
++    List<ClickStatsDaily> daily = stats.findDaily("abc123", day.minusDays(7), day.plusDays(7));
++    assertThat(daily).extracting(ClickStatsDaily::getDay).containsExactly(day, day.plusDays(1));
++    assertThat(daily).extracting(ClickStatsDaily::getCount).containsExactly(2L, 1L);
++    assertThat(stats.findDaily("abc123", day.plusDays(2), day.plusDays(9))).isEmpty();
++  }
++
++  /** Given a processed key, when inserted again, then 0 rows are affected (AC-6 dedupe). */
++  @Test
++  void processedEventInsertIfAbsentIsIdempotent() {
++    int first = inTransaction(() -> processed.insertIfAbsent("evt-1", T0));
++    int replay = inTransaction(() -> processed.insertIfAbsent("evt-1", T0.plusSeconds(5)));
++
++    assertThat(first).isEqualTo(1);
++    assertThat(replay).isZero();
++    assertThat(processed.findById("evt-1").orElseThrow().getProcessedAt()).isEqualTo(T0);
++    int purged = inTransaction(() -> processed.deleteProcessedBefore(T0.plusSeconds(1)));
++    assertThat(purged).isEqualTo(1);
++    assertThat(processed.count()).isZero();
++  }
++
++  private static ClickOutboxEntry entry(String shortCode, Instant occurredAt, String referrer) {
++    String key = "it-" + KEYS.incrementAndGet() + "-" + System.nanoTime();
++    return new ClickOutboxEntry(key, shortCode, occurredAt, hash(key), referrer, occurredAt);
++  }
++
++  /** A deterministic 64-char lowercase hex string shaped like a SHA-256 digest. */
++  private static String hash(String seed) {
++    byte[] bytes = new byte[32];
++    int h = seed.hashCode();
++    for (int i = 0; i < bytes.length; i++) {
++      h = h * 31 + i;
++      bytes[i] = (byte) h;
++    }
++    return HexFormat.of().formatHex(bytes);
++  }
++
++  private <T> T inTransaction(java.util.function.Supplier<T> work) {
++    return new TransactionTemplate(txManager).execute(status -> work.get());
++  }
++
++  private static void await(CountDownLatch latch) {
++    try {
++      if (!latch.await(30, TimeUnit.SECONDS)) {
++        throw new IllegalStateException("latch not released in time");
++      }
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
++      throw new IllegalStateException(e);
++    }
++  }
++}

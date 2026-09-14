@@ -1,0 +1,10 @@
+{"node_id": "approval_design", "action": "plan.approve", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "unit_tests", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}

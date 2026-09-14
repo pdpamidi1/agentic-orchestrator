@@ -1,0 +1,38 @@
+{
+  "run_id": "brownfield-859b9d7f",
+  "scenario": "brownfield",
+  "status": "RUNNING",
+  "spec_version": 1,
+  "plan_version": 1,
+  "nodes": {
+    "requirement": "PASSED",
+    "clarify": "PASSED",
+    "planning": "PASSED",
+    "architecture": "PASSED",
+    "impact": "PASSED",
+    "security_review": "PASSED",
+    "risk_analysis": "PASSED",
+    "approval_design": "PASSED",
+    "implementation": "PASSED",
+    "unit_tests": "RUNNING",
+    "code_review": "RUNNING",
+    "integration_tests": "RUNNING",
+    "validation": "INVALIDATED",
+    "diagnose": "PENDING",
+    "documentation": "PENDING",
+    "release_readiness": "PENDING",
+    "approval_release": "PENDING"
+  },
+  "artifact_versions": {},
+  "pending_questions": [],
+  "halt_reason": null,
+  "budget": {
+    "tokens_used": 176511,
+    "cost_usd": 2.28707,
+    "replans": 0,
+    "started_at": "2026-09-14T19:09:15.148474Z",
+    "paused_at": null,
+    "paused_seconds": 518.294261
+  },
+  "updated_at": "2026-09-14T19:23:44.020734Z"
+}

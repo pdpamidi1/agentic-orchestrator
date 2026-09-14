@@ -1,0 +1,1274 @@
+diff --git a/src/main/java/com/example/shortener/analytics/recording/ClickEventRecorder.java b/src/main/java/com/example/shortener/analytics/recording/ClickEventRecorder.java
+new file mode 100644
+index 0000000..198b1ae
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/recording/ClickEventRecorder.java
+@@ -0,0 +1,131 @@
++/*
++ * ClickEventRecorder.java — writes one click_outbox row per successful redirect
++ *
++ * Layer: analytics.recording. The transactional-outbox producer side of click analytics
++ * (AC-1, AC-2, AC-3, AC-10, AC-11, AC-14): hashes the client address (IpHasher), reduces the
++ * Referer to its host (ReferrerHostExtractor) and inserts a PENDING ClickOutboxEntry with a fresh
++ * random UUID idempotency key inside a database transaction that is committed before the redirect
++ * response leaves the server. Performs no Kafka or other network I/O; the relay (analytics.outbox)
++ * publishes asynchronously. This package must never import analytics.kafka or analytics.outbox
++ * (ArchitectureTest rule).
++ */
++package com.example.shortener.analytics.recording;
++
++import com.example.shortener.analytics.domain.ClickOutboxEntry;
++import com.example.shortener.analytics.repository.ClickOutboxRepository;
++import java.time.Clock;
++import java.time.Instant;
++import java.util.Objects;
++import java.util.UUID;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++/**
++ * Records a successful redirect as one {@code click_outbox} row (AC-1, AC-2, AC-3, AC-10, AC-11,
++ * AC-14).
++ *
++ * <p><b>Responsibility.</b> Build and persist exactly one {@link ClickOutboxEntry} per call: {@code
++ * idempotency_key} = a random UUID generated here (per redirect, never derived from the request),
++ * {@code short_code} = the redirected code, {@code occurred_at} = {@code clock.instant()} (UTC),
++ * {@code hashed_ip} = {@link IpHasher#hash}, {@code referrer_host} = {@link
++ * ReferrerHostExtractor#extract}. The raw client address is consumed by the hasher on the first
++ * line and is never stored, logged, or placed in an exception message.
++ *
++ * <p><b>Transaction.</b> {@link #record} is {@link Transactional}: it opens the request's write
++ * transaction (or joins an outer one) and the insert is committed when the method returns, before
++ * the controller writes the {@code 302}. On any failure the transaction is rolled back and the
++ * exception propagates; the caller (the redirect controller) is responsible for containing it so
++ * that the redirect itself is unaffected (AC-3). Nothing here blocks on Kafka, Redis or the
++ * network: the only I/O is the single {@code INSERT}.
++ *
++ * <p><b>Thread-safety and lifecycle.</b> Immutable singleton bean; the repository, hasher,
++ * extractor and clock are thread-safe.
++ */
++@Service
++public class ClickEventRecorder {
++
++  /** DEBUG-only tracing; log lines carry the short code and key, never an address or referrer. */
++  private static final Logger log = LoggerFactory.getLogger(ClickEventRecorder.class);
++
++  /** Target of the single insert. */
++  private final ClickOutboxRepository repository;
++
++  /** Pseudonymises the client address. */
++  private final IpHasher ipHasher;
++
++  /** Reduces the Referer header to its host. */
++  private final ReferrerHostExtractor referrerHostExtractor;
++
++  /** Source of {@code occurred_at} / {@code created_at}; fixed in tests, UTC system clock live. */
++  private final Clock clock;
++
++  /**
++   * Creates the recorder with the system UTC clock (the constructor Spring uses).
++   *
++   * @param repository the {@code click_outbox} repository
++   * @param ipHasher the salted address hasher
++   * @param referrerHostExtractor the Referer host extractor
++   * @throws NullPointerException when any collaborator is {@code null}
++   */
++  @Autowired
++  public ClickEventRecorder(
++      ClickOutboxRepository repository,
++      IpHasher ipHasher,
++      ReferrerHostExtractor referrerHostExtractor) {
++    this(repository, ipHasher, referrerHostExtractor, Clock.systemUTC());
++  }
++
++  /**
++   * Creates the recorder with an explicit clock.
++   *
++   * @param repository the {@code click_outbox} repository
++   * @param ipHasher the salted address hasher
++   * @param referrerHostExtractor the Referer host extractor
++   * @param clock source of the click timestamp
++   * @throws NullPointerException when any argument is {@code null}
++   */
++  public ClickEventRecorder(
++      ClickOutboxRepository repository,
++      IpHasher ipHasher,
++      ReferrerHostExtractor referrerHostExtractor,
++      Clock clock) {
++    this.repository = Objects.requireNonNull(repository, "repository");
++    this.ipHasher = Objects.requireNonNull(ipHasher, "ipHasher");
++    this.referrerHostExtractor =
++        Objects.requireNonNull(referrerHostExtractor, "referrerHostExtractor");
++    this.clock = Objects.requireNonNull(clock, "clock");
++  }
++
++  /**
++   * Inserts one pending outbox row for a redirect that has just been resolved successfully.
++   *
++   * <p>Must be called only after the short code resolved to a live target: unknown or expired codes
++   * never reach this method, so they leave no row and no event (AC-2).
++   *
++   * @param shortCode the redirected short code
++   * @param clientIp raw peer address from the request; hashed immediately, never retained
++   * @param refererHeader raw {@code Referer} header, or {@code null} when absent
++   * @return the persisted entry (status {@code PENDING}, fresh idempotency key)
++   * @throws NullPointerException when {@code shortCode} is {@code null}
++   * @throws RuntimeException any persistence failure, after the transaction was rolled back
++   */
++  @Transactional
++  public ClickOutboxEntry record(String shortCode, String clientIp, String refererHeader) {
++    Objects.requireNonNull(shortCode, "shortCode");
++    String hashedIp = ipHasher.hash(clientIp);
++    String referrerHost = referrerHostExtractor.extract(refererHeader);
++    Instant now = clock.instant();
++    ClickOutboxEntry entry =
++        new ClickOutboxEntry(
++            UUID.randomUUID().toString(), shortCode, now, hashedIp, referrerHost, now);
++    ClickOutboxEntry saved = repository.save(entry);
++    log.debug(
++        "Recorded click for short code '{}' with idempotency key {}",
++        shortCode,
++        saved.getIdempotencyKey());
++    return saved;
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/recording/IpHasher.java b/src/main/java/com/example/shortener/analytics/recording/IpHasher.java
+new file mode 100644
+index 0000000..fe2452e
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/recording/IpHasher.java
+@@ -0,0 +1,102 @@
++/*
++ * IpHasher.java — one-way, salted SHA-256 digest of a client address
++ *
++ * Layer: analytics.recording. The only place in the application, besides the redirect controller
++ * that reads the request, where a raw client address is referenced (ArchitectureTest rule). Turns
++ * the address into the 64-character lowercase hex digest stored in click_outbox.hashed_ip so the
++ * raw IP is never persisted, logged or forwarded (AC-10, AC-11). Depends on AnalyticsProperties
++ * for the static salt only.
++ */
++package com.example.shortener.analytics.recording;
++
++import com.example.shortener.analytics.config.AnalyticsProperties;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.HexFormat;
++import java.util.Objects;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Component;
++
++/**
++ * Computes {@code hex(SHA-256(salt + clientIp))} for the click recorder (AC-10, AC-11).
++ *
++ * <p><b>Responsibility.</b> Pseudonymise the client address with a configured static salt so that
++ * equal addresses map to equal digests (unique-visitor counting stays possible) while the digest
++ * cannot be reversed without the salt. The concatenation order is fixed: salt first, then the
++ * address, UTF-8 encoded, with no separator.
++ *
++ * <p><b>Invariants.</b> The result is always exactly 64 lowercase hexadecimal characters, which is
++ * what {@code ClickOutboxEntry} and {@code click_outbox_hashed_ip_chk} require. A {@code null} or
++ * blank address is hashed as the empty string so that a request without a resolvable peer address
++ * still produces a valid, stable digest. The raw address never appears in a log line, an exception
++ * message or {@link #toString()}.
++ *
++ * <p><b>Thread-safety and lifecycle.</b> Immutable singleton bean; a fresh {@link MessageDigest} is
++ * created per call because digests are not thread-safe.
++ */
++@Component
++public class IpHasher {
++
++  /** Digest algorithm; mandated by the data model (64 hex characters). */
++  static final String ALGORITHM = "SHA-256";
++
++  /** Salt bytes, captured once at construction so the properties object is not kept. */
++  private final byte[] saltBytes;
++
++  /**
++   * Creates the hasher from the validated analytics configuration.
++   *
++   * @param properties bound {@code analytics.*} settings; only {@code salt} is used
++   * @throws NullPointerException when {@code properties} or its salt is {@code null}
++   */
++  @Autowired
++  public IpHasher(AnalyticsProperties properties) {
++    this(Objects.requireNonNull(properties, "properties").salt());
++  }
++
++  /**
++   * Creates the hasher from an explicit salt (tests, or callers without the properties bean).
++   *
++   * @param salt the static secret prepended to every address before hashing
++   * @throws NullPointerException when {@code salt} is {@code null}
++   * @throws IllegalArgumentException when {@code salt} is blank
++   */
++  public IpHasher(String salt) {
++    Objects.requireNonNull(salt, "salt");
++    if (salt.isBlank()) {
++      throw new IllegalArgumentException("salt must not be blank");
++    }
++    this.saltBytes = salt.getBytes(StandardCharsets.UTF_8);
++  }
++
++  /**
++   * Hashes a client address.
++   *
++   * @param clientIp the raw peer address as reported by the servlet container; {@code null} or
++   *     blank is treated as the empty string
++   * @return {@code hex(SHA-256(salt + clientIp))}, 64 lowercase hex characters
++   */
++  public String hash(String clientIp) {
++    String address = clientIp == null ? "" : clientIp.strip();
++    MessageDigest digest = newDigest();
++    digest.update(saltBytes);
++    digest.update(address.getBytes(StandardCharsets.UTF_8));
++    return HexFormat.of().formatHex(digest.digest());
++  }
++
++  /** Never renders the salt. */
++  @Override
++  public String toString() {
++    return "IpHasher{algorithm=" + ALGORITHM + "}";
++  }
++
++  private static MessageDigest newDigest() {
++    try {
++      return MessageDigest.getInstance(ALGORITHM);
++    } catch (NoSuchAlgorithmException e) {
++      // SHA-256 is mandatory in every Java platform implementation; this cannot happen.
++      throw new IllegalStateException(ALGORITHM + " is not available", e);
++    }
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/recording/ReferrerHostExtractor.java b/src/main/java/com/example/shortener/analytics/recording/ReferrerHostExtractor.java
+new file mode 100644
+index 0000000..615ea83
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/recording/ReferrerHostExtractor.java
+@@ -0,0 +1,61 @@
++/*
++ * ReferrerHostExtractor.java — reduces a Referer header to its host component
++ *
++ * Layer: analytics.recording. Pure function over the raw header value: only the host is kept
++ * (no scheme, port, path, query, fragment or userinfo), so the stored referrer_host carries no
++ * per-visit detail. Absent, blank or unparsable headers yield null (AC-1, AC-14).
++ */
++package com.example.shortener.analytics.recording;
++
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.util.Locale;
++import org.springframework.stereotype.Component;
++
++/**
++ * Extracts the host of a {@code Referer} header for {@code click_outbox.referrer_host}.
++ *
++ * <p><b>Responsibility.</b> Map the header value to a lower-cased host name, or {@code null} when
++ * there is nothing trustworthy to store: header absent or blank, not a syntactically valid URI, URI
++ * without an authority (relative references, {@code about:blank}, {@code mailto:}), an empty host,
++ * or a host longer than the {@value #MAX_HOST_LENGTH}-character column.
++ *
++ * <p><b>Invariants.</b> Never throws for any input; never returns an empty string; the result
++ * contains no {@code /}, {@code ?}, {@code #}, {@code @} or {@code :} except inside a bracketed
++ * IPv6 literal, which is returned as {@code java.net.URI} renders it (e.g. {@code [::1]}).
++ *
++ * <p><b>Thread-safety and lifecycle.</b> Stateless singleton bean; also usable without Spring.
++ */
++@Component
++public class ReferrerHostExtractor {
++
++  /** Width of {@code click_outbox.referrer_host}; longer hosts are not valid DNS names anyway. */
++  static final int MAX_HOST_LENGTH = 255;
++
++  /**
++   * Returns the host of a referrer URL.
++   *
++   * @param refererHeader raw {@code Referer} header value, or {@code null} when absent
++   * @return the lower-cased host, or {@code null} when absent, blank, unparsable or host-less
++   */
++  public String extract(String refererHeader) {
++    if (refererHeader == null) {
++      return null;
++    }
++    String value = refererHeader.strip();
++    if (value.isEmpty()) {
++      return null;
++    }
++    URI uri;
++    try {
++      uri = new URI(value);
++    } catch (URISyntaxException | IllegalArgumentException unparsable) {
++      return null;
++    }
++    String host = uri.getHost();
++    if (host == null || host.isEmpty() || host.length() > MAX_HOST_LENGTH) {
++      return null;
++    }
++    return host.toLowerCase(Locale.ROOT);
++  }
++}
+diff --git a/src/main/java/com/example/shortener/read/RedirectController.java b/src/main/java/com/example/shortener/read/RedirectController.java
+index 66ccc7e..2eb07ac 100644
+--- a/src/main/java/com/example/shortener/read/RedirectController.java
++++ b/src/main/java/com/example/shortener/read/RedirectController.java
+@@ -7,10 +7,14 @@
+  * sync by OpenApiContractIT) and is gated with @Profile("!write") so the read surface can be
+  * deployed and scaled independently of the write surface (AC-14). Non-2xx outcomes (404 unknown,
+  * 410 expired, 500 unexpected) are exceptions rendered by GlobalExceptionHandler as problem+json;
+- * no error body is built here.
++ * no error body is built here. Since click analytics, every successful resolution is also handed
++ * to analytics.recording.ClickEventRecorder, which commits one click_outbox row on the request
++ * thread before the 302 is written; recorder failures are contained here and never alter the
++ * response. This is the one place besides IpHasher that reads the raw peer address.
+  */
+ package com.example.shortener.read;
+ 
++import com.example.shortener.analytics.recording.ClickEventRecorder;
+ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.Parameter;
+ import io.swagger.v3.oas.annotations.headers.Header;
+@@ -19,7 +23,12 @@ import io.swagger.v3.oas.annotations.media.Schema;
+ import io.swagger.v3.oas.annotations.responses.ApiResponse;
+ import io.swagger.v3.oas.annotations.responses.ApiResponses;
+ import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.servlet.http.HttpServletRequest;
+ import java.util.Objects;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.ObjectProvider;
++import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.context.annotation.Profile;
+ import org.springframework.http.CacheControl;
+ import org.springframework.http.HttpHeaders;
+@@ -30,6 +39,9 @@ import org.springframework.http.ResponseEntity;
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PathVariable;
+ import org.springframework.web.bind.annotation.RestController;
++import org.springframework.web.context.request.RequestAttributes;
++import org.springframework.web.context.request.RequestContextHolder;
++import org.springframework.web.context.request.ServletRequestAttributes;
+ 
+ /**
+  * {@code GET /{short_code}} (operationId {@code redirectToLongUrl}): the only read endpoint.
+@@ -39,7 +51,17 @@ import org.springframework.web.bind.annotation.RestController;
+  * {@code 302 Found} with {@code Location} set to the stored {@code long_url} verbatim and {@code
+  * Cache-Control: private} (AC-7). Every non-2xx outcome (404 unknown, 410 expired, 500 unexpected)
+  * is rendered by {@code GlobalExceptionHandler} as {@code application/problem+json}; this class
+- * never builds an error body and never catches infrastructure exceptions.
++ * never builds an error body and never catches infrastructure exceptions of the lookup.
++ *
++ * <p>Click recording: after a successful resolution the controller asks {@link ClickEventRecorder}
++ * to commit one {@code click_outbox} row (random UUID idempotency key, salted-hash of the peer
++ * address, Referer host) in its own database transaction on the request thread; nothing on this
++ * path talks to Kafka or waits on the network. Unknown and expired codes throw before the recorder
++ * is reached, so they leave no row. A recorder failure is caught, logged without the client
++ * address, and the redirect is still answered with the same status and {@code Location}: analytics
++ * must never cost a redirect. The recorder is resolved through an {@link ObjectProvider} so the
++ * adapter can also be wired without analytics (standalone tests); in the application context the
++ * bean is always present.
+  *
+  * <p>Why the read/write split: redirects are the high-volume, latency-sensitive path and creations
+  * are rare, so the two surfaces are separately registrable beans selected by {@code
+@@ -51,9 +73,10 @@ import org.springframework.web.bind.annotation.RestController;
+  * would hide a later expiry (410). Combined with {@code Cache-Control: private}, shared caches and
+  * CDNs never store the redirect, so every client eventually observes the database state.
+  *
+- * <p>Relationships: depends only on {@link UrlReadService}; the OpenAPI metadata declared here is
+- * what {@code OpenApiContractIT} compares against {@code src/main/resources/openapi.yaml}.
+- * Thread-safety: stateless apart from the injected service; a singleton shared by all requests.
++ * <p>Relationships: depends on {@link UrlReadService} and (optionally) {@link ClickEventRecorder};
++ * the OpenAPI metadata declared here is what {@code OpenApiContractIT} compares against {@code
++ * src/main/resources/openapi.yaml}. Thread-safety: stateless apart from the injected collaborators;
++ * a singleton shared by all requests.
+  */
+ @RestController
+ @Profile(RedirectController.PROFILE_EXPRESSION)
+@@ -79,17 +102,50 @@ public class RedirectController {
+    */
+   static final CacheControl CACHE_CONTROL = CacheControl.empty().cachePrivate();
+ 
+-  /** Resolves short codes (cache first, then Postgres); the controller's only collaborator. */
++  /** Recorder failures are reported here at WARN; the message never contains the peer address. */
++  private static final Logger log = LoggerFactory.getLogger(RedirectController.class);
++
++  /** Resolves short codes (cache first, then Postgres). */
+   private final UrlReadService service;
+ 
++  /** Commits one outbox row per successful redirect; {@code null} when analytics is not wired. */
++  private final ClickEventRecorder recorder;
++
+   /**
+-   * Creates the controller.
++   * Creates the controller without click recording (standalone wiring, tests).
+    *
+    * @param service the read service resolving short codes to long URLs
+    * @throws NullPointerException when {@code service} is {@code null}
+    */
+   public RedirectController(UrlReadService service) {
++    this(service, (ClickEventRecorder) null);
++  }
++
++  /**
++   * Creates the controller with an explicit recorder.
++   *
++   * @param service the read service resolving short codes to long URLs
++   * @param recorder the click recorder, or {@code null} to disable recording
++   * @throws NullPointerException when {@code service} is {@code null}
++   */
++  public RedirectController(UrlReadService service, ClickEventRecorder recorder) {
+     this.service = Objects.requireNonNull(service, "service");
++    this.recorder = recorder;
++    if (recorder == null) {
++      log.warn("Click recording is disabled: no ClickEventRecorder is wired");
++    }
++  }
++
++  /**
++   * Creates the controller from the application context (the constructor Spring uses).
++   *
++   * @param service the read service resolving short codes to long URLs
++   * @param recorder provider of the click recorder; absent only in reduced test contexts
++   * @throws NullPointerException when any argument is {@code null}
++   */
++  @Autowired
++  public RedirectController(UrlReadService service, ObjectProvider<ClickEventRecorder> recorder) {
++    this(service, Objects.requireNonNull(recorder, "recorder").getIfAvailable());
+   }
+ 
+   /**
+@@ -98,9 +154,13 @@ public class RedirectController {
+    * <p>Delegates to {@link UrlReadService#resolve}. The stored {@code long_url} is placed in {@code
+    * Location} as-is: it was validated as an absolute http/https URL when it was created, and
+    * re-parsing it here could alter percent-encoding or reject a URL that is legitimately stored.
+-   * The response has no body. Failures are not handled here: {@code ShortCodeNotFoundException}
+-   * becomes 404 and {@code ShortCodeExpiredException} becomes 410 in {@code
+-   * GlobalExceptionHandler}; any other exception becomes a 500 without internal details.
++   * The response has no body. Failures of the lookup are not handled here: {@code
++   * ShortCodeNotFoundException} becomes 404 and {@code ShortCodeExpiredException} becomes 410 in
++   * {@code GlobalExceptionHandler}; any other exception becomes a 500 without internal details.
++   *
++   * <p>After a successful lookup exactly one click is recorded through {@link ClickEventRecorder}
++   * (committed before this method returns); its failure is contained and does not affect the
++   * response.
+    *
+    * @param shortCode the short code from the path
+    * @return 302 Found with {@code Location} = long URL and {@code Cache-Control: private}
+@@ -156,6 +216,7 @@ public class RedirectController {
+           @PathVariable("short_code")
+           String shortCode) {
+     String longUrl = service.resolve(shortCode);
++    recordClick(shortCode);
+     // The stored long_url is forwarded verbatim; no re-parsing that could alter or reject it.
+     // ResponseEntity.location(URI) is avoided for the same reason: it would require building a
+     // URI object from the string.
+@@ -164,4 +225,42 @@ public class RedirectController {
+         .cacheControl(CACHE_CONTROL)
+         .build();
+   }
++
++  /**
++   * Hands the current request's peer address and {@code Referer} to the recorder, containing every
++   * failure. The address is read here and passed straight to the recorder, which hashes it first
++   * thing; it is not logged, not kept and not part of the warning below. The request is taken from
++   * {@link RequestContextHolder} rather than a handler parameter so the operation's OpenAPI shape
++   * and method signature stay unchanged.
++   *
++   * @param shortCode the code that just resolved successfully
++   */
++  private void recordClick(String shortCode) {
++    if (recorder == null) {
++      return;
++    }
++    try {
++      HttpServletRequest request = currentRequest();
++      String clientIp = request == null ? null : request.getRemoteAddr();
++      String referer = request == null ? null : request.getHeader(HttpHeaders.REFERER);
++      recorder.record(shortCode, clientIp, referer);
++    } catch (RuntimeException recordingFailed) {
++      // Analytics must never cost a redirect: the 302 and Location are already decided.
++      log.warn(
++          "Click recording failed for short code '{}': {}",
++          shortCode,
++          recordingFailed.getClass().getSimpleName(),
++          recordingFailed);
++    }
++  }
++
++  /**
++   * The servlet request bound to the calling thread, or {@code null} outside a web request.
++   *
++   * @return the current request when one is bound
++   */
++  private static HttpServletRequest currentRequest() {
++    RequestAttributes attributes = RequestContextHolder.getRequestAttributes();
++    return attributes instanceof ServletRequestAttributes servlet ? servlet.getRequest() : null;
++  }
+ }
+diff --git a/src/test/java/com/example/shortener/analytics/recording/ClickEventRecorderTest.java b/src/test/java/com/example/shortener/analytics/recording/ClickEventRecorderTest.java
+new file mode 100644
+index 0000000..25d063a
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/recording/ClickEventRecorderTest.java
+@@ -0,0 +1,152 @@
++/*
++ * ClickEventRecorderTest.java — one PENDING click_outbox row per successful redirect
++ *
++ * Layer: test (unit). Pins, with a Mockito ClickOutboxRepository, a real IpHasher and extractor
++ * and a fixed clock: exactly one save per call; the row carries the short code, occurred_at =
++ * created_at = clock.instant(), hashed_ip = hasher.hash(ip), referrer_host = extractor result,
++ * status PENDING; the idempotency key is a fresh random UUID per call; the raw address is nowhere
++ * in the entity; record() is @Transactional; persistence failures propagate (containment is the
++ * controller's job) (AC-1, AC-2, AC-3, AC-10, AC-11, AC-14). No Spring context.
++ */
++package com.example.shortener.analytics.recording;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoMoreInteractions;
++import static org.mockito.Mockito.when;
++
++import com.example.shortener.analytics.domain.ClickOutboxEntry;
++import com.example.shortener.analytics.domain.OutboxStatus;
++import com.example.shortener.analytics.repository.ClickOutboxRepository;
++import java.time.Clock;
++import java.time.Instant;
++import java.time.ZoneOffset;
++import java.util.UUID;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.springframework.dao.DataAccessResourceFailureException;
++import org.springframework.transaction.annotation.Transactional;
++
++/** Unit tests of {@link ClickEventRecorder}. */
++class ClickEventRecorderTest {
++
++  private static final String SALT = "unit-test-salt-0123456789";
++  private static final String CODE = "promo2024";
++  private static final String IP = "203.0.113.7";
++  private static final Instant NOW = Instant.parse("2026-09-14T10:15:30Z");
++
++  private final ClickOutboxRepository repository = mock(ClickOutboxRepository.class);
++  private final IpHasher hasher = new IpHasher(SALT);
++  private final ReferrerHostExtractor extractor = new ReferrerHostExtractor();
++  private final ClickEventRecorder recorder =
++      new ClickEventRecorder(repository, hasher, extractor, Clock.fixed(NOW, ZoneOffset.UTC));
++
++  /** Exactly one row is saved and it carries the mapped, pseudonymised fields. */
++  @Test
++  void recordsExactlyOnePendingRowWithHashedIpAndReferrerHost() {
++    when(repository.save(any(ClickOutboxEntry.class))).thenAnswer(inv -> inv.getArgument(0));
++
++    ClickOutboxEntry saved = recorder.record(CODE, IP, "https://news.example.org/a?b=1");
++
++    ArgumentCaptor<ClickOutboxEntry> captor = ArgumentCaptor.forClass(ClickOutboxEntry.class);
++    verify(repository, times(1)).save(captor.capture());
++    verifyNoMoreInteractions(repository);
++    ClickOutboxEntry entry = captor.getValue();
++    assertThat(saved).isSameAs(entry);
++    assertThat(entry.getShortCode()).isEqualTo(CODE);
++    assertThat(entry.getOccurredAt()).isEqualTo(NOW);
++    assertThat(entry.getCreatedAt()).isEqualTo(NOW);
++    assertThat(entry.getNextAttemptAt()).isEqualTo(NOW);
++    assertThat(entry.getHashedIp()).isEqualTo(hasher.hash(IP)).matches("^[0-9a-f]{64}$");
++    assertThat(entry.getReferrerHost()).isEqualTo("news.example.org");
++    assertThat(entry.getStatus()).isEqualTo(OutboxStatus.PENDING);
++    assertThat(entry.getAttempts()).isZero();
++    assertThat(entry.getPublishedAt()).isNull();
++  }
++
++  /** The idempotency key is a random UUID, different for every redirect. */
++  @Test
++  void idempotencyKeyIsAFreshRandomUuidPerCall() {
++    when(repository.save(any(ClickOutboxEntry.class))).thenAnswer(inv -> inv.getArgument(0));
++
++    ClickOutboxEntry first = recorder.record(CODE, IP, null);
++    ClickOutboxEntry second = recorder.record(CODE, IP, null);
++
++    assertThat(first.getIdempotencyKey()).isNotEqualTo(second.getIdempotencyKey());
++    assertThat(UUID.fromString(first.getIdempotencyKey()).toString())
++        .isEqualTo(first.getIdempotencyKey());
++    assertThat(UUID.fromString(second.getIdempotencyKey()).toString())
++        .isEqualTo(second.getIdempotencyKey());
++    verify(repository, times(2)).save(any(ClickOutboxEntry.class));
++  }
++
++  /** Missing or garbage Referer gives a null referrer_host; the row is still written. */
++  @Test
++  void missingOrGarbageRefererYieldsNullHost() {
++    when(repository.save(any(ClickOutboxEntry.class))).thenAnswer(inv -> inv.getArgument(0));
++
++    assertThat(recorder.record(CODE, IP, null).getReferrerHost()).isNull();
++    assertThat(recorder.record(CODE, IP, "").getReferrerHost()).isNull();
++    assertThat(recorder.record(CODE, IP, "not a url at all").getReferrerHost()).isNull();
++    verify(repository, times(3)).save(any(ClickOutboxEntry.class));
++  }
++
++  /** The raw address appears nowhere in the persisted entity; a null address still records. */
++  @Test
++  void rawIpIsNeverStored() {
++    when(repository.save(any(ClickOutboxEntry.class))).thenAnswer(inv -> inv.getArgument(0));
++
++    ClickOutboxEntry entry = recorder.record(CODE, IP, "https://example.com/");
++    assertThat(entry.getHashedIp()).doesNotContain(IP);
++    assertThat(entry.toString()).doesNotContain(IP);
++
++    ClickOutboxEntry withoutAddress = recorder.record(CODE, null, null);
++    assertThat(withoutAddress.getHashedIp()).isEqualTo(hasher.hash(null));
++  }
++
++  /** Persistence failures propagate unchanged so the caller can contain them. */
++  @Test
++  void persistenceFailurePropagates() {
++    when(repository.save(any(ClickOutboxEntry.class)))
++        .thenThrow(new DataAccessResourceFailureException("database unavailable"));
++
++    assertThatThrownBy(() -> recorder.record(CODE, IP, null))
++        .isInstanceOf(DataAccessResourceFailureException.class);
++  }
++
++  /** A null short code is a programming error and is rejected before any I/O. */
++  @Test
++  void nullShortCodeIsRejected() {
++    assertThatThrownBy(() -> recorder.record(null, IP, null))
++        .isInstanceOf(NullPointerException.class);
++    verifyNoMoreInteractions(repository);
++  }
++
++  /** The insert runs inside a Spring-managed transaction committed before the 302 is written. */
++  @Test
++  void recordIsTransactional() throws NoSuchMethodException {
++    Transactional annotation =
++        ClickEventRecorder.class
++            .getMethod("record", String.class, String.class, String.class)
++            .getAnnotation(Transactional.class);
++    assertThat(annotation).isNotNull();
++    assertThat(annotation.readOnly()).isFalse();
++  }
++
++  /** Every collaborator is mandatory. */
++  @Test
++  void nullCollaboratorsAreRejected() {
++    assertThatThrownBy(() -> new ClickEventRecorder(null, hasher, extractor))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickEventRecorder(repository, null, extractor))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickEventRecorder(repository, hasher, null))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickEventRecorder(repository, hasher, extractor, null))
++        .isInstanceOf(NullPointerException.class);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/recording/IpHasherTest.java b/src/test/java/com/example/shortener/analytics/recording/IpHasherTest.java
+new file mode 100644
+index 0000000..b1ee104
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/recording/IpHasherTest.java
+@@ -0,0 +1,96 @@
++/*
++ * IpHasherTest.java — determinism, shape and salt sensitivity of the client-IP hash
++ *
++ * Layer: test (unit). Pins hex(SHA-256(salt + ip)) against an independently computed digest, that
++ * equal inputs give equal digests and different salts / addresses give different ones, the
++ * null / blank handling, the 64-lowercase-hex shape required by click_outbox_hashed_ip_chk, the
++ * AnalyticsProperties constructor and that the raw address and salt never leak via toString
++ * (AC-10, AC-11). No Spring context.
++ */
++package com.example.shortener.analytics.recording;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.example.shortener.analytics.config.AnalyticsProperties;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.HexFormat;
++import org.junit.jupiter.api.Test;
++
++/** Unit tests of {@link IpHasher}. */
++class IpHasherTest {
++
++  private static final String SALT = "unit-test-salt-0123456789";
++  private static final String IP = "203.0.113.7";
++
++  private final IpHasher hasher = new IpHasher(SALT);
++
++  /** The digest is SHA-256 over salt then address, UTF-8, rendered as lowercase hex. */
++  @Test
++  void hashIsSha256OfSaltFollowedByAddressInLowercaseHex() throws NoSuchAlgorithmException {
++    MessageDigest digest = MessageDigest.getInstance("SHA-256");
++    String expected =
++        HexFormat.of().formatHex(digest.digest((SALT + IP).getBytes(StandardCharsets.UTF_8)));
++
++    assertThat(hasher.hash(IP)).isEqualTo(expected).matches("^[0-9a-f]{64}$");
++  }
++
++  /** Same salt and same address always give the same digest (unique-visitor counting). */
++  @Test
++  void hashIsDeterministic() {
++    assertThat(hasher.hash(IP)).isEqualTo(hasher.hash(IP)).isEqualTo(new IpHasher(SALT).hash(IP));
++  }
++
++  /** A different address or a different salt changes the digest. */
++  @Test
++  void hashDependsOnAddressAndSalt() {
++    assertThat(hasher.hash(IP)).isNotEqualTo(hasher.hash("203.0.113.8"));
++    assertThat(hasher.hash(IP)).isNotEqualTo(new IpHasher("another-salt-0123456789").hash(IP));
++  }
++
++  /** IPv6 and surrounding whitespace are handled; whitespace is stripped before hashing. */
++  @Test
++  void ipv6AndWhitespaceAreNormalised() {
++    assertThat(hasher.hash("2001:db8::1")).matches("^[0-9a-f]{64}$");
++    assertThat(hasher.hash("  " + IP + "\n")).isEqualTo(hasher.hash(IP));
++  }
++
++  /** Null and blank addresses hash as the empty string: still a valid, stable digest. */
++  @Test
++  void nullAndBlankAddressesHashAsEmptyString() {
++    String ofEmpty = hasher.hash("");
++    assertThat(ofEmpty).matches("^[0-9a-f]{64}$");
++    assertThat(hasher.hash(null)).isEqualTo(ofEmpty);
++    assertThat(hasher.hash("   ")).isEqualTo(ofEmpty);
++  }
++
++  /** The digest never contains the raw address, and toString reveals neither address nor salt. */
++  @Test
++  void rawAddressAndSaltNeverLeak() {
++    assertThat(hasher.hash(IP)).doesNotContain(IP);
++    assertThat(hasher.toString()).doesNotContain(SALT).doesNotContain(IP);
++  }
++
++  /** The Spring constructor takes the salt from AnalyticsProperties and hashes identically. */
++  @Test
++  void propertiesConstructorUsesConfiguredSalt() {
++    AnalyticsProperties properties =
++        new AnalyticsProperties(
++            SALT,
++            new AnalyticsProperties.Outbox(500, 100),
++            new AnalyticsProperties.Retry(5, 100, 10_000, AnalyticsProperties.Jitter.FULL),
++            new AnalyticsProperties.Kafka(5_000),
++            new AnalyticsProperties.Retention(90));
++
++    assertThat(new IpHasher(properties).hash(IP)).isEqualTo(hasher.hash(IP));
++  }
++
++  /** A missing or blank salt is rejected at construction. */
++  @Test
++  void blankOrNullSaltIsRejected() {
++    assertThatThrownBy(() -> new IpHasher("  ")).isInstanceOf(IllegalArgumentException.class);
++    assertThatThrownBy(() -> new IpHasher((String) null)).isInstanceOf(NullPointerException.class);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/recording/ReferrerHostExtractorTest.java b/src/test/java/com/example/shortener/analytics/recording/ReferrerHostExtractorTest.java
+new file mode 100644
+index 0000000..f0421dd
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/recording/ReferrerHostExtractorTest.java
+@@ -0,0 +1,75 @@
++/*
++ * ReferrerHostExtractorTest.java — host-only reduction of the Referer header
++ *
++ * Layer: test (unit). Pins that only the host survives (scheme, port, path, query, fragment and
++ * userinfo are dropped), that hosts are lower-cased, that absent / blank / garbage / host-less
++ * values give null without throwing, and the column-width guard (AC-1, AC-14). No Spring context.
++ */
++package com.example.shortener.analytics.recording;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.CsvSource;
++import org.junit.jupiter.params.provider.NullAndEmptySource;
++import org.junit.jupiter.params.provider.ValueSource;
++
++/** Unit tests of {@link ReferrerHostExtractor}. */
++class ReferrerHostExtractorTest {
++
++  private final ReferrerHostExtractor extractor = new ReferrerHostExtractor();
++
++  /** Only the host component is returned, whatever else the URL carries. */
++  @ParameterizedTest
++  @CsvSource({
++    "https://example.com/, example.com",
++    "https://example.com, example.com",
++    "http://Example.COM:8080/some/path?q=1&r=2#frag, example.com",
++    "https://user:secret@news.example.org/article, news.example.org",
++    "https://sub.domain.example.co.uk/x, sub.domain.example.co.uk",
++    "http://192.0.2.10/path, 192.0.2.10",
++    "http://[2001:db8::1]:8080/path, [2001:db8::1]",
++    "'  https://example.com/padded  ', example.com"
++  })
++  void returnsHostComponentOnly(String referer, String expectedHost) {
++    assertThat(extractor.extract(referer)).isEqualTo(expectedHost);
++  }
++
++  /** Absent or blank header: null. */
++  @ParameterizedTest
++  @NullAndEmptySource
++  @ValueSource(strings = {" ", "\t"})
++  void absentOrBlankRefererIsNull(String referer) {
++    assertThat(extractor.extract(referer)).isNull();
++  }
++
++  /** Garbage and host-less references never throw and give null. */
++  @ParameterizedTest
++  @ValueSource(
++      strings = {
++        "not a url",
++        "http://",
++        "http:///path-without-host",
++        "/relative/path?x=1",
++        "about:blank",
++        "mailto:someone@example.com",
++        "https://exa mple.com/",
++        "http://[::1",
++        "%%%",
++        "javascript:alert(1)"
++      })
++  void garbageOrHostlessRefererIsNull(String referer) {
++    assertThat(extractor.extract(referer)).isNull();
++  }
++
++  /** A host longer than the referrer_host column is rejected rather than truncated. */
++  @Test
++  void hostLongerThanColumnIsNull() {
++    String label = "a".repeat(63);
++    String tooLong = String.join(".", label, label, label, label, label); // 319 chars
++    assertThat(extractor.extract("https://" + tooLong + "/")).isNull();
++    String maxLength = String.join(".", label, label, label, "b".repeat(63)); // 255 chars
++    assertThat(extractor.extract("https://" + maxLength + "/")).isEqualTo(maxLength);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/redirect/RedirectClickRecordingIT.java b/src/test/java/com/example/shortener/redirect/RedirectClickRecordingIT.java
+new file mode 100644
+index 0000000..ac07884
+--- /dev/null
++++ b/src/test/java/com/example/shortener/redirect/RedirectClickRecordingIT.java
+@@ -0,0 +1,139 @@
++/*
++ * RedirectClickRecordingIT.java — click_outbox rows committed by real redirects, end to end
++ *
++ * Layer: test (integration). Boots the whole application on Testcontainers Postgres/Redis via
++ * AbstractIntegrationTest and proves over real HTTP: one 302 commits exactly one PENDING
++ * click_outbox row with a UUID idempotency key, the short code, a UTC occurred_at, a salted hash of
++ * the peer address (never the address) and the Referer host (AC-1, AC-10, AC-11, AC-14); two
++ * redirects give two rows with distinct keys; a cache hit records too; 404 and 410 commit nothing
++ * (AC-2); the response is written only after the row is visible (AC-3). Requires Docker; run by
++ * failsafe under ./mvnw -Pit verify.
++ */
++package com.example.shortener.redirect;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.example.shortener.analytics.config.AnalyticsProperties;
++import com.example.shortener.analytics.domain.ClickOutboxEntry;
++import com.example.shortener.analytics.domain.OutboxStatus;
++import com.example.shortener.analytics.recording.IpHasher;
++import com.example.shortener.analytics.repository.ClickOutboxRepository;
++import com.example.shortener.domain.CodeSource;
++import com.example.shortener.domain.UrlMapping;
++import com.example.shortener.it.AbstractIntegrationTest;
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.time.Instant;
++import java.time.temporal.ChronoUnit;
++import java.util.List;
++import java.util.UUID;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++
++/** Transactional click recording on {@code GET /{short_code}} against the real stack. */
++class RedirectClickRecordingIT extends AbstractIntegrationTest {
++
++  /** Loopback addresses the JDK client may connect from; the peer address is one of them. */
++  private static final List<String> LOOPBACK = List.of("127.0.0.1", "0:0:0:0:0:0:0:1", "::1");
++
++  private static final HttpClient CLIENT =
++      HttpClient.newBuilder()
++          .followRedirects(HttpClient.Redirect.NEVER)
++          .connectTimeout(Duration.ofSeconds(10))
++          .build();
++
++  @Autowired private ClickOutboxRepository outbox;
++
++  @Autowired private AnalyticsProperties analyticsProperties;
++
++  @BeforeEach
++  void emptyOutbox() {
++    outbox.deleteAllInBatch();
++  }
++
++  /** One redirect with a Referer commits exactly one fully populated PENDING row. */
++  @Test
++  void successfulRedirectCommitsExactlyOneOutboxRow() {
++    String shortCode = createShortCode(uniqueLongUrl());
++    Instant before = Instant.now().minusSeconds(1);
++
++    HttpResponse<String> response =
++        getWithReferer("/" + shortCode, "https://News.Example.org/x?y=1");
++
++    assertThat(response.statusCode()).isEqualTo(302);
++    List<ClickOutboxEntry> rows = outbox.findAll();
++    assertThat(rows).hasSize(1);
++    ClickOutboxEntry row = rows.get(0);
++    assertThat(row.getShortCode()).isEqualTo(shortCode);
++    assertThat(row.getStatus()).isEqualTo(OutboxStatus.PENDING);
++    assertThat(row.getAttempts()).isZero();
++    assertThat(row.getPublishedAt()).isNull();
++    assertThat(UUID.fromString(row.getIdempotencyKey()).toString())
++        .isEqualTo(row.getIdempotencyKey());
++    assertThat(row.getOccurredAt()).isBetween(before, Instant.now().plusSeconds(1));
++    assertThat(row.getCreatedAt()).isEqualTo(row.getOccurredAt());
++    assertThat(row.getReferrerHost()).isEqualTo("news.example.org");
++    IpHasher hasher = new IpHasher(analyticsProperties);
++    assertThat(row.getHashedIp())
++        .matches("^[0-9a-f]{64}$")
++        .isIn(LOOPBACK.stream().map(hasher::hash).toList());
++    for (String address : LOOPBACK) {
++      assertThat(row.getHashedIp()).doesNotContain(address);
++    }
++  }
++
++  /** Two redirects (second one a cache hit) commit two rows with distinct idempotency keys. */
++  @Test
++  void everyRedirectIncludingCacheHitsRecordsItsOwnRow() {
++    String shortCode = createShortCode(uniqueLongUrl());
++
++    assertThat(get("/" + shortCode).statusCode()).isEqualTo(302);
++    assertThat(get("/" + shortCode).statusCode()).isEqualTo(302);
++
++    List<ClickOutboxEntry> rows = outbox.findAll();
++    assertThat(rows).hasSize(2);
++    assertThat(rows.get(0).getIdempotencyKey()).isNotEqualTo(rows.get(1).getIdempotencyKey());
++    assertThat(rows).allSatisfy(row -> assertThat(row.getReferrerHost()).isNull());
++  }
++
++  /** Unknown and expired codes leave the outbox empty. */
++  @Test
++  void unknownAndExpiredCodesRecordNothing() {
++    Instant now = Instant.now();
++    repository.saveAndFlush(
++        new UrlMapping(
++            "expiredIT2",
++            "https://example.com/expired",
++            now.minus(2, ChronoUnit.DAYS),
++            now.minus(1, ChronoUnit.DAYS),
++            CodeSource.REDIS));
++
++    assertThat(getWithReferer("/doesNotExist", "https://example.com/").statusCode()).isEqualTo(404);
++    assertThat(getWithReferer("/expiredIT2", "https://example.com/").statusCode()).isEqualTo(410);
++
++    assertThat(outbox.count()).isZero();
++  }
++
++  private HttpResponse<String> getWithReferer(String path, String referer) {
++    HttpRequest request =
++        HttpRequest.newBuilder(URI.create(origin() + path))
++            .header("Referer", referer)
++            .timeout(Duration.ofSeconds(60))
++            .GET()
++            .build();
++    try {
++      return CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
++    } catch (IOException e) {
++      throw new UncheckedIOException(e);
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
++      throw new IllegalStateException("interrupted while waiting for the response", e);
++    }
++  }
++}
+diff --git a/src/test/java/com/example/shortener/redirect/RedirectClickRecordingTest.java b/src/test/java/com/example/shortener/redirect/RedirectClickRecordingTest.java
+new file mode 100644
+index 0000000..d4df39e
+--- /dev/null
++++ b/src/test/java/com/example/shortener/redirect/RedirectClickRecordingTest.java
+@@ -0,0 +1,273 @@
++/*
++ * RedirectClickRecordingTest.java — click recording on the redirect path, adapter level
++ *
++ * Layer: test (unit). Standalone MockMvcTester over RedirectController with a mocked
++ * UrlReadService and a mocked ClickEventRecorder plus the real GlobalExceptionHandler. Pins: a
++ * successful redirect asks the recorder exactly once with the short code, the peer address and the
++ * Referer header (AC-1); 404 and 410 never reach the recorder (AC-2); a throwing recorder leaves
++ * status, Location and Cache-Control untouched and is logged at WARN without the raw address
++ * (AC-3, AC-11); a missing Referer is passed as null (AC-14); the Spring constructor tolerates an
++ * absent recorder bean and picks it up when present. No Spring Boot context, no database.
++ */
++package com.example.shortener.redirect;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.isNull;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.verifyNoMoreInteractions;
++import static org.mockito.Mockito.when;
++
++import ch.qos.logback.classic.Level;
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.core.read.ListAppender;
++import com.example.shortener.analytics.recording.ClickEventRecorder;
++import com.example.shortener.api.error.GlobalExceptionHandler;
++import com.example.shortener.api.error.ShortCodeExpiredException;
++import com.example.shortener.api.error.ShortCodeNotFoundException;
++import com.example.shortener.read.RedirectController;
++import com.example.shortener.read.UrlReadService;
++import java.time.Instant;
++import java.util.List;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.test.context.runner.ApplicationContextRunner;
++import org.springframework.dao.DataAccessResourceFailureException;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpStatus;
++import org.springframework.test.web.servlet.assertj.MockMvcTester;
++import org.springframework.test.web.servlet.assertj.MvcTestResult;
++
++/**
++ * {@link RedirectController} + {@link ClickEventRecorder} interaction behind standalone MockMvc.
++ */
++class RedirectClickRecordingTest {
++
++  private static final String CODE = "promo2024";
++  private static final String LONG_URL = "https://example.com/some/path?x=1&y=2";
++  private static final String CLIENT_IP = "203.0.113.7";
++  private static final String REFERER = "https://news.example.org/story?id=42";
++
++  private final UrlReadService service = mock(UrlReadService.class);
++  private final ClickEventRecorder recorder = mock(ClickEventRecorder.class);
++
++  private final MockMvcTester mvc =
++      MockMvcTester.of(
++          List.of(new RedirectController(service, recorder)),
++          builder -> builder.setControllerAdvice(new GlobalExceptionHandler()).build());
++
++  private final ListAppender<ILoggingEvent> logEvents = new ListAppender<>();
++  private final Logger controllerLog = (Logger) LoggerFactory.getLogger(RedirectController.class);
++
++  @BeforeEach
++  void captureLog() {
++    logEvents.start();
++    controllerLog.addAppender(logEvents);
++  }
++
++  @AfterEach
++  void releaseLog() {
++    controllerLog.detachAppender(logEvents);
++    logEvents.stop();
++  }
++
++  // --- AC-1: one record per successful redirect ------------------------------------------------
++
++  /** A resolved code records exactly one click with code, peer address and Referer. */
++  @Test
++  void successfulRedirectRecordsExactlyOneClick() {
++    when(service.resolve(CODE)).thenReturn(LONG_URL);
++
++    MvcTestResult result = get(CODE, CLIENT_IP, REFERER);
++
++    assertThat(result).hasStatus(HttpStatus.FOUND);
++    assertThat(result).headers().hasValue(HttpHeaders.LOCATION, LONG_URL);
++    assertThat(result).headers().hasValue(HttpHeaders.CACHE_CONTROL, "private");
++    verify(recorder, times(1)).record(anyString(), any(), any());
++    verify(recorder).record(CODE, CLIENT_IP, REFERER);
++    verifyNoMoreInteractions(recorder);
++  }
++
++  // --- AC-14: missing Referer ----------------------------------------------------------------
++
++  /** Without a Referer header the recorder receives null for it and the redirect is unchanged. */
++  @Test
++  void missingRefererIsPassedAsNull() {
++    when(service.resolve(CODE)).thenReturn(LONG_URL);
++
++    MvcTestResult result = get(CODE, CLIENT_IP, null);
++
++    assertThat(result).hasStatus(HttpStatus.FOUND);
++    verify(recorder).record(CODE, CLIENT_IP, null);
++  }
++
++  /** A garbage Referer is forwarded verbatim; reducing it to a host is the recorder's job. */
++  @Test
++  void garbageRefererIsForwardedToTheRecorder() {
++    when(service.resolve(CODE)).thenReturn(LONG_URL);
++
++    MvcTestResult result = get(CODE, CLIENT_IP, "not a url");
++
++    assertThat(result).hasStatus(HttpStatus.FOUND);
++    verify(recorder).record(CODE, CLIENT_IP, "not a url");
++  }
++
++  // --- AC-2: no row for unknown or expired codes -----------------------------------------------
++
++  /** 404: the recorder is never consulted. */
++  @Test
++  void unknownCodeRecordsNothing() {
++    when(service.resolve("nope123")).thenThrow(new ShortCodeNotFoundException("nope123"));
++
++    MvcTestResult result = get("nope123", CLIENT_IP, REFERER);
++
++    assertThat(result).hasStatus(HttpStatus.NOT_FOUND);
++    verifyNoInteractions(recorder);
++  }
++
++  /** 410: the recorder is never consulted. */
++  @Test
++  void expiredCodeRecordsNothing() {
++    when(service.resolve("old456"))
++        .thenThrow(new ShortCodeExpiredException("old456", Instant.parse("2020-01-01T00:00:00Z")));
++
++    MvcTestResult result = get("old456", CLIENT_IP, REFERER);
++
++    assertThat(result).hasStatus(HttpStatus.GONE);
++    verifyNoInteractions(recorder);
++  }
++
++  /** An unexpected lookup failure (500) also records nothing: only successes are clicks. */
++  @Test
++  void lookupFailureRecordsNothing() {
++    when(service.resolve(CODE)).thenThrow(new IllegalStateException("pool exhausted"));
++
++    MvcTestResult result = get(CODE, CLIENT_IP, REFERER);
++
++    assertThat(result).hasStatus(HttpStatus.INTERNAL_SERVER_ERROR);
++    verifyNoInteractions(recorder);
++  }
++
++  // --- AC-3 / AC-11: recorder failures are contained and logged without the address -----------
++
++  /** A throwing recorder changes neither status nor headers, and the warning has no raw IP. */
++  @Test
++  void recorderFailureDoesNotChangeTheRedirectAndIsLoggedWithoutRawIp() {
++    when(service.resolve(CODE)).thenReturn(LONG_URL);
++    when(recorder.record(anyString(), any(), any()))
++        .thenThrow(new DataAccessResourceFailureException("database unavailable"));
++
++    MvcTestResult result = get(CODE, CLIENT_IP, REFERER);
++
++    assertThat(result).hasStatus(HttpStatus.FOUND);
++    assertThat(result).headers().hasValue(HttpHeaders.LOCATION, LONG_URL);
++    assertThat(result).headers().hasValue(HttpHeaders.CACHE_CONTROL, "private");
++    assertThat(result).body().isEmpty();
++    verify(recorder).record(CODE, CLIENT_IP, REFERER);
++
++    List<ILoggingEvent> warnings =
++        logEvents.list.stream().filter(e -> e.getLevel() == Level.WARN).toList();
++    assertThat(warnings).hasSize(1);
++    ILoggingEvent warning = warnings.get(0);
++    assertThat(warning.getFormattedMessage())
++        .contains(CODE)
++        .contains("DataAccessResourceFailureException")
++        .doesNotContain(CLIENT_IP)
++        .doesNotContain(REFERER);
++    assertThat(warning.getThrowableProxy()).isNotNull();
++    assertThat(warning.getThrowableProxy().getMessage()).doesNotContain(CLIENT_IP);
++  }
++
++  /** Even a RuntimeException that is not a Spring data exception is contained. */
++  @Test
++  void anyRuntimeExceptionFromTheRecorderIsContained() {
++    when(service.resolve(CODE)).thenReturn(LONG_URL);
++    when(recorder.record(anyString(), any(), isNull()))
++        .thenThrow(new IllegalArgumentException("hashedIp must be a 64-character digest"));
++
++    MvcTestResult result = get(CODE, CLIENT_IP, null);
++
++    assertThat(result).hasStatus(HttpStatus.FOUND);
++    assertThat(result).headers().hasValue(HttpHeaders.LOCATION, LONG_URL);
++  }
++
++  // --- wiring ----------------------------------------------------------------------------------
++
++  /** The single-argument constructor disables recording; redirects still work. */
++  @Test
++  void controllerWithoutRecorderStillRedirects() {
++    when(service.resolve(CODE)).thenReturn(LONG_URL);
++    MockMvcTester bare =
++        MockMvcTester.of(
++            List.of(new RedirectController(service)),
++            builder -> builder.setControllerAdvice(new GlobalExceptionHandler()).build());
++
++    MvcTestResult result = bare.get().uri("/" + CODE).exchange();
++
++    assertThat(result).hasStatus(HttpStatus.FOUND);
++    verifyNoInteractions(recorder);
++  }
++
++  /** Spring wires the recorder when its bean exists and tolerates a context without one. */
++  @Test
++  void springConstructorPicksUpTheRecorderBeanWhenPresent() {
++    ApplicationContextRunner runner =
++        new ApplicationContextRunner()
++            .withBean(UrlReadService.class, () -> service)
++            .withUserConfiguration(RedirectController.class);
++
++    runner.run(context -> assertThat(context).hasSingleBean(RedirectController.class));
++    runner
++        .withBean(ClickEventRecorder.class, () -> recorder)
++        .run(
++            context -> {
++              assertThat(context).hasSingleBean(RedirectController.class);
++              when(service.resolve(CODE)).thenReturn(LONG_URL);
++              MockMvcTester wired =
++                  MockMvcTester.of(
++                      List.of(context.getBean(RedirectController.class)),
++                      builder -> builder.build());
++              wired
++                  .get()
++                  .uri("/" + CODE)
++                  .with(
++                      request -> {
++                        request.setRemoteAddr(CLIENT_IP);
++                        return request;
++                      })
++                  .exchange();
++              verify(recorder).record(CODE, CLIENT_IP, null);
++            });
++  }
++
++  /** The service is mandatory whichever constructor is used. */
++  @Test
++  void nullServiceIsRejected() {
++    org.assertj.core.api.Assertions.assertThatThrownBy(() -> new RedirectController(null, recorder))
++        .isInstanceOf(NullPointerException.class);
++  }
++
++  // --- helpers ---------------------------------------------------------------------------------
++
++  private MvcTestResult get(String shortCode, String remoteAddr, String referer) {
++    var request =
++        mvc.get()
++            .uri("/" + shortCode)
++            .with(
++                req -> {
++                  req.setRemoteAddr(remoteAddr);
++                  return req;
++                });
++    if (referer != null) {
++      request = request.header(HttpHeaders.REFERER, referer);
++    }
++    return request.exchange();
++  }
++}

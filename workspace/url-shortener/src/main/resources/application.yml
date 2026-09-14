@@ -22,6 +22,9 @@ spring:
       host: ${SHORTENER_REDIS_HOST:localhost}
       port: ${SHORTENER_REDIS_PORT:6379}
       timeout: 2s
+  kafka:
+    # Click-analytics event bus. Nothing connects until the first event is published.
+    bootstrap-servers: ${SHORTENER_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
 
 server:
   port: ${SERVER_PORT:8080}
@@ -44,3 +47,29 @@ shortener:
   cache-ttl: 24h
   # Offset added to the raw counter before base62 encoding (AMB-11); 62^5 => codes of >= 6 chars.
   counter-seed-offset: 916132832
+
+# Click analytics (bound and validated by analytics.config.AnalyticsProperties; see docs/analytics.md).
+# Every value below repeats the code default so that AnalyticsPropertiesTest can pin the two together.
+analytics:
+  # Secret salt mixed into the client-IP hash so raw IPs are never stored (AMB-12). Supplied by the
+  # environment like the database credentials above; the fallback is a non-secret local-dev marker
+  # and production deployments MUST set SHORTENER_ANALYTICS_IP_SALT (at least 16 characters).
+  salt: ${SHORTENER_ANALYTICS_IP_SALT:local-dev-only-not-a-secret}
+  outbox:
+    # How often the outbox relay polls for unpublished click events (AMB-16).
+    poll-interval-ms: 500
+    # Maximum events handed to Kafka per relay pass (AMB-16).
+    batch-size: 100
+  retry:
+    # Publish retry policy (AMB-17): 5 attempts, exponential backoff from 100ms capped at 10s,
+    # "full" jitter (sleep = random(0, min(cap, base * 2^attempt))). Also accepts equal | none.
+    max-attempts: 5
+    base-backoff-ms: 100
+    max-backoff-ms: 10000
+    jitter: full
+  kafka:
+    # Upper bound for a single produce request before it counts as a failed attempt (AMB-17).
+    timeout-ms: 5000
+  retention:
+    # Raw click events older than this are purged by the retention job (AMB-18).
+    days: 90

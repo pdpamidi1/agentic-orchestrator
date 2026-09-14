@@ -1,0 +1,253 @@
+{
+  "schema": "Spec",
+  "output": {
+    "run_id": "brownfield-36dc2247",
+    "version": 1,
+    "summary": "Extend the existing Java URL shortener with click analytics: every successful redirect on GET /{short_code} records a url.clicked event via a transactional outbox table (never blocking or failing the redirect), an outbox publisher forwards events to the Kafka topic url.clicked, an analytics consumer aggregates them into click_stats (total_clicks, last_clicked_at, clicks_by_day), and a new additive endpoint GET /api/v1/urls/{short_code}/stats exposes the aggregate (404 for unknown short codes). Raw client IPs are never persisted (salted SHA-256 only), click events are retained 90 days, and all cross-process interactions use bounded retries with exponential backoff + jitter, timeouts, and idempotency keys, with no latency regression or breaking change to the existing redirect contract.",
+    "stories": [
+      {
+        "id": "US-1",
+        "as_a": "end user following a short link",
+        "i_want": "the redirect to behave exactly as before, even when Kafka or the analytics pipeline is degraded",
+        "so_that": "link resolution stays fast and reliable"
+      },
+      {
+        "id": "US-2",
+        "as_a": "platform engineer",
+        "i_want": "each successful redirect to write a url.clicked event into an outbox table in the same transaction as the redirect handling",
+        "so_that": "no click is lost and the redirect never blocks on the message broker"
+      },
+      {
+        "id": "US-3",
+        "as_a": "platform engineer",
+        "i_want": "an outbox publisher that delivers pending events to the Kafka topic url.clicked with timeouts, bounded retries using exponential backoff with jitter, and idempotency keys",
+        "so_that": "transient broker failures self-heal without duplicate or lost aggregation"
+      },
+      {
+        "id": "US-4",
+        "as_a": "analytics consumer owner",
+        "i_want": "a consumer that aggregates url.clicked events into click_stats {short_code, total_clicks, last_clicked_at, clicks_by_day}",
+        "so_that": "per-link usage is queryable without scanning raw events"
+      },
+      {
+        "id": "US-5",
+        "as_a": "API client / link owner",
+        "i_want": "GET /api/v1/urls/{short_code}/stats to return the aggregate for a known short code and 404 for an unknown one",
+        "so_that": "I can display click analytics for my links"
+      },
+      {
+        "id": "US-6",
+        "as_a": "data protection officer",
+        "i_want": "raw IP addresses never persisted (salted SHA-256 only) and click events purged after 90 days",
+        "so_that": "the service meets privacy and retention obligations"
+      }
+    ],
+    "acceptance_criteria": [
+      {
+        "id": "AC-1",
+        "given": "an existing active short code and a running service",
+        "when": "a client issues GET /{short_code}",
+        "then": "the response status, Location header and body match the pre-change contract byte-for-byte (additive changes only) and exactly one row is inserted into the outbox table within the same database transaction"
+      },
+      {
+        "id": "AC-2",
+        "given": "Kafka is unreachable or the broker times out",
+        "when": "a client issues GET /{short_code}",
+        "then": "the redirect still succeeds with its normal status and latency and the click event remains in the outbox in PENDING state for later delivery"
+      },
+      {
+        "id": "AC-3",
+        "given": "a benchmark of GET /{short_code} recorded before the change",
+        "when": "the same benchmark is re-run after the change under identical load",
+        "then": "p95 and p99 latency do not regress beyond the agreed threshold defined in AMB-6"
+      },
+      {
+        "id": "AC-4",
+        "given": "a pending outbox row",
+        "when": "the outbox publisher runs",
+        "then": "it publishes url.clicked to topic url.clicked with payload fields {short_code, occurred_at, hashed_ip, referrer_host}, marks the row PUBLISHED, and includes a stable idempotency key derived from the outbox event id"
+      },
+      {
+        "id": "AC-5",
+        "given": "the broker rejects or times out a publish attempt",
+        "when": "the publisher retries",
+        "then": "retries are bounded by a configured maximum attempt count with exponential backoff plus jitter and a per-attempt timeout, and after exhaustion the row is moved to a failed/dead-letter state without crashing the publisher"
+      },
+      {
+        "id": "AC-6",
+        "given": "the same url.clicked event (same idempotency key) is delivered twice to the analytics consumer",
+        "when": "the consumer processes both deliveries",
+        "then": "click_stats.total_clicks is incremented exactly once and clicks_by_day for that day is incremented exactly once"
+      },
+      {
+        "id": "AC-7",
+        "given": "three url.clicked events for short code 'abc123' on two distinct days",
+        "when": "the consumer has processed all of them",
+        "then": "click_stats for 'abc123' shows total_clicks=3, last_clicked_at equal to the latest occurred_at, and clicks_by_day containing per-day counts summing to 3"
+      },
+      {
+        "id": "AC-8",
+        "given": "a short code with aggregated click_stats",
+        "when": "a client calls GET /api/v1/urls/{short_code}/stats",
+        "then": "the response is 200 with a JSON body containing short_code, total_clicks, last_clicked_at and clicks_by_day"
+      },
+      {
+        "id": "AC-9",
+        "given": "a short code that does not exist in the URL store",
+        "when": "a client calls GET /api/v1/urls/{short_code}/stats",
+        "then": "the response is 404 with the service's standard error body and no aggregate is created"
+      },
+      {
+        "id": "AC-10",
+        "given": "a known short code that exists but has never been clicked",
+        "when": "a client calls GET /api/v1/urls/{short_code}/stats",
+        "then": "the response is 200 with total_clicks=0, empty clicks_by_day and null last_clicked_at"
+      },
+      {
+        "id": "AC-11",
+        "given": "a redirect request originating from client IP 203.0.113.7",
+        "when": "the click event is written to the outbox and published",
+        "then": "no column, log line, trace attribute or Kafka payload field contains the raw IP, and hashed_ip equals SHA-256(salt || 203.0.113.7) as a hex/base64 digest"
+      },
+      {
+        "id": "AC-12",
+        "given": "click event rows older than 90 days exist",
+        "when": "the retention job executes",
+        "then": "those rows are deleted and rows younger than 90 days are retained"
+      },
+      {
+        "id": "AC-13",
+        "given": "the outbox publisher and analytics consumer are deployed",
+        "when": "an operator inspects health/metrics endpoints",
+        "then": "counters for published, retried and failed events plus outbox backlog size are exposed so delivery failures are observable"
+      }
+    ],
+    "non_goals": [],
+    "ambiguities": [
+      {
+        "id": "AMB-1",
+        "question": "Where does the IP hashing salt come from and is it rotated?",
+        "options": [
+          "Single static salt from application config/secret manager, no rotation",
+          "Per-deployment secret with manual rotation and re-hash not applied to historical data",
+          "Daily rotating salt stored in a salt table (day-scoped hashes)"
+        ],
+        "default_if_unanswered": "Single static salt read from the existing secret/config mechanism, no rotation"
+      },
+      {
+        "id": "AMB-2",
+        "question": "How should the outbox publisher move events to Kafka?",
+        "options": [
+          "In-process scheduled poller with SELECT ... FOR UPDATE SKIP LOCKED",
+          "Debezium/CDC on the outbox table",
+          "Separate standalone publisher service"
+        ],
+        "default_if_unanswered": "In-process scheduled poller with FOR UPDATE SKIP LOCKED batching"
+      },
+      {
+        "id": "AMB-3",
+        "question": "What shape and time window should clicks_by_day have in the stats response?",
+        "options": [
+          "Full history map of date -> count",
+          "Last 30 days only",
+          "Last 90 days (matching event retention)",
+          "Caller-specified from/to query parameters"
+        ],
+        "default_if_unanswered": "Last 30 days as an ordered list of {date, count}"
+      },
+      {
+        "id": "AMB-4",
+        "question": "Which timezone defines a 'day' for clicks_by_day and occurred_at bucketing?",
+        "options": [
+          "UTC",
+          "Service-configured default timezone",
+          "Per-link owner timezone"
+        ],
+        "default_if_unanswered": "UTC"
+      },
+      {
+        "id": "AMB-5",
+        "question": "Does the 90-day retention apply only to raw click events, or also to click_stats aggregates?",
+        "options": [
+          "Raw events only; aggregates retained indefinitely",
+          "Both raw events and aggregates purged after 90 days",
+          "Raw events 90 days; aggregates trimmed to the exposed window"
+        ],
+        "default_if_unanswered": "Raw events only; click_stats aggregates retained indefinitely"
+      },
+      {
+        "id": "AMB-6",
+        "question": "What is the acceptable latency regression threshold for GET /{short_code} and how is it verified?",
+        "options": [
+          "Zero measurable regression in p95 (statistically indistinguishable)",
+          "<=5% p95 increase verified by a load-test gate in CI",
+          "<=10% p95 increase verified manually pre-release"
+        ],
+        "default_if_unanswered": "<=5% p95 increase verified by an automated load-test gate"
+      },
+      {
+        "id": "AMB-7",
+        "question": "Does GET /api/v1/urls/{short_code}/stats require authentication or authorization?",
+        "options": [
+          "Public, same as the redirect endpoint",
+          "Requires the same auth scheme already used by existing /api/v1 endpoints",
+          "Restricted to the link owner only"
+        ],
+        "default_if_unanswered": "Reuse whatever auth scheme existing /api/v1 endpoints already enforce"
+      },
+      {
+        "id": "AMB-8",
+        "question": "How should referrer_host be derived and what value is used when the Referer header is absent or unparsable?",
+        "options": [
+          "Registrable host only; null when absent/unparsable",
+          "Host including subdomain; the literal 'direct' when absent",
+          "Full referrer URL retained"
+        ],
+        "default_if_unanswered": "Host component only (no path/query), null when the header is absent or unparsable"
+      },
+      {
+        "id": "AMB-9",
+        "question": "What freshness guarantee should stats have, and should the endpoint signal staleness?",
+        "options": [
+          "Eventual consistency, no staleness indicator",
+          "Eventual consistency with an 'as_of' timestamp in the response",
+          "Read-your-writes within N seconds enforced by test"
+        ],
+        "default_if_unanswered": "Eventual consistency with an 'as_of' timestamp field in the response"
+      },
+      {
+        "id": "AMB-10",
+        "question": "What Kafka topic configuration should be assumed (partitions, key, existing or new topic creation)?",
+        "options": [
+          "New topic created by infrastructure, keyed by short_code",
+          "Topic auto-created by the application with defaults, keyed by short_code",
+          "Topic already exists and is provided; key unspecified"
+        ],
+        "default_if_unanswered": "Topic url.clicked provisioned by infrastructure, messages keyed by short_code for per-code ordering"
+      },
+      {
+        "id": "AMB-11",
+        "question": "Should bot/crawler or non-successful redirects (e.g. expired or disabled links) generate click events?",
+        "options": [
+          "Only successful redirects, no bot filtering",
+          "Only successful redirects, with basic user-agent bot filtering",
+          "All redirect attempts including errors, flagged by outcome"
+        ],
+        "default_if_unanswered": "Only successful redirects, with no bot filtering"
+      }
+    ],
+    "assumptions": [
+      "The change is brownfield: an existing Java URL shortener with GET /{short_code} and a relational database is present in the workspace and is extended rather than rewritten.",
+      "Kafka topic name is exactly 'url.clicked' and the event type is 'url.clicked'.",
+      "The click event payload contains exactly the fields short_code, occurred_at, hashed_ip, referrer_host.",
+      "The existing GET /{short_code} contract may only be extended additively; no status codes, headers or body fields may be removed or changed.",
+      "hashed_ip is a salted SHA-256 digest; the raw IP is never persisted in any store, log or message.",
+      "Outbox writes occur in the same local transaction as the redirect request handling so that redirect success and event capture are atomic from the service's perspective."
+    ]
+  },
+  "usage": {
+    "tokens_in": 2213,
+    "tokens_out": 4124,
+    "cost_usd": 0.11417
+  }
+}

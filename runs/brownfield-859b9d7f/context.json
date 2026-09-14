@@ -1,0 +1,89 @@
+{
+  "scenario": "brownfield",
+  "replay": false,
+  "record": true,
+  "target_stack": "java",
+  "producers": {
+    "integration_result": "integration_tests",
+    "spec": "clarify",
+    "requirement_text": "intake",
+    "repo_map": "intake",
+    "impact": "impact",
+    "validation_result": "validation",
+    "changeset": "implementation",
+    "plan": "planning",
+    "risk_register": "risk_analysis",
+    "unit_result": "unit_tests",
+    "approval_brief": "intake",
+    "security_findings": "security_review",
+    "review": "code_review",
+    "design": "architecture"
+  },
+  "feedback": {
+    "implementation": {
+      "task": "T7",
+      "reason": "task T7 errored: claude code timeout",
+      "attempt": 2
+    },
+    "validation": {
+      "findings": [
+        {
+          "file": ".github/workflows/ci.yml",
+          "line": null,
+          "rule": "change_control.protected_path",
+          "message": "requires human approval: release.config",
+          "suggested_fix": null
+        },
+        {
+          "file": "Dockerfile",
+          "line": null,
+          "rule": "change_control.protected_path",
+          "message": "requires human approval: infrastructure.change",
+          "suggested_fix": null
+        },
+        {
+          "file": null,
+          "line": null,
+          "rule": "gate.integration",
+          "message": "exit 137",
+          "suggested_fix": "see stdout_tail"
+        }
+      ],
+      "reason": "validation: 3 blocking findings",
+      "attempt": 1
+    }
+  },
+  "answers": {
+    "AMB-1": "Single static salt read from the existing secret/config mechanism, no rotation",
+    "AMB-2": "In-process scheduled poller with FOR UPDATE SKIP LOCKED batching",
+    "AMB-3": "Last 30 days as an ordered list of {date, count}",
+    "AMB-4": "UTC",
+    "AMB-5": "Raw events only; click_stats aggregates retained indefinitely",
+    "AMB-6": "<=5% p95 increase verified by an automated load-test gate",
+    "AMB-7": "Reuse whatever auth scheme existing /api/v1 endpoints already enforce",
+    "AMB-8": "Host component only (no path/query), null when the header is absent or unparsable",
+    "AMB-9": "Eventual consistency with an 'as_of' timestamp field in the response",
+    "AMB-10": "Topic url.clicked provisioned by infrastructure, messages keyed by short_code for per-code ordering",
+    "AMB-11": "Only successful redirects, with no bot filtering"
+  },
+  "approvals": [
+    "approval_design",
+    "dependency.major_version",
+    "schema.migration",
+    "scope:T2:src/main/java/com/example/shortener/analytics/domain/ClickOutboxEntry.java",
+    "scope:T2:src/main/java/com/example/shortener/analytics/domain/ClickStats.java",
+    "scope:T2:src/main/java/com/example/shortener/analytics/domain/ClickStatsDaily.java",
+    "scope:T2:src/main/java/com/example/shortener/analytics/domain/OutboxStatus.java",
+    "scope:T2:src/main/java/com/example/shortener/analytics/domain/ProcessedClickEvent.java",
+    "scope:T2:src/main/java/com/example/shortener/analytics/repository/ClickOutboxRepository.java",
+    "scope:T2:src/main/java/com/example/shortener/analytics/repository/ClickStatsRepository.java",
+    "scope:T2:src/main/java/com/example/shortener/analytics/repository/ProcessedClickEventRepository.java",
+    "scope:T2:src/test/java/com/example/shortener/analytics/repository/ClickAnalyticsMigrationTest.java",
+    "scope:T2:src/test/java/com/example/shortener/analytics/repository/ClickAnalyticsRepositoryIT.java",
+    "scope:T7:src/test/java/com/example/shortener/it/OpenApiContractIT.java",
+    "secrets.or_config",
+    "task:T1",
+    "task:T2",
+    "task:T8"
+  ]
+}

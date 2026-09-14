@@ -1,0 +1,103 @@
+{
+  "schema": "Review",
+  "output": {
+    "criteria": [
+      {
+        "id": "AC-1",
+        "verdict": "FAIL",
+        "evidence": "T3 note (commit cb36162) states: \"The outbox insert is committed in ClickEventRecorder's own @Transactional write transaction on the request thread before the 302 is written; UrlReadService (not in allowed files) keeps its read-only lookup transaction.\" The AC requires the outbox row to be committed in the SAME database transaction as the redirect handling; src/main/java/com/example/shortener/analytics/recording/ClickEventRecorder.java uses an independent write transaction, so the transactional-outbox atomicity guarantee is not met (a committed click can survive a failed/aborted redirect and vice versa). Field-level content (short_code, occurred_at, hashed_ip, referrer_host, idempotency key) is covered by ClickEventRecorderTest and RedirectClickRecordingIT, but the transaction-scope clause is not."
+      },
+      {
+        "id": "AC-2",
+        "verdict": "PASS",
+        "evidence": "src/test/java/com/example/shortener/redirect/RedirectClickRecordingTest.java and RedirectClickRecordingIT.java; T3 note: \"404/410 never reach the recorder\"; recorder invocation sits in RedirectController.java only on the success branch."
+      },
+      {
+        "id": "AC-3",
+        "verdict": "PASS",
+        "evidence": "src/test/java/com/example/shortener/analytics/it/KafkaUnavailableRedirectIT.java (redirect keeps status + Location with broker down, row stays PENDING); T3 note: \"No Kafka or network I/O on the redirect path\"; publishing is done off-thread by OutboxPoller on analyticsTaskScheduler (OutboxSchedulingConfig.java)."
+      },
+      {
+        "id": "AC-4",
+        "verdict": "PASS",
+        "evidence": "src/main/java/com/example/shortener/analytics/repository/ClickOutboxRepository.java claimBatch (FOR UPDATE SKIP LOCKED, bounded by analytics.outbox.batch-size); src/main/java/com/example/shortener/analytics/outbox/OutboxPoller.java; tests OutboxPollerTest.java and OutboxPublishServiceTest.java cover batch bounds, short_code key, idempotency-key header and no-duplicate publish on second poll."
+      },
+      {
+        "id": "AC-5",
+        "verdict": "PASS",
+        "evidence": "src/main/java/com/example/shortener/analytics/support/RetryExecutor.java (bounded attempts, exponential backoff, full/equal jitter, per-attempt timeout) with src/test/java/com/example/shortener/analytics/outbox/RetryExecutorTest.java; exhaustion -> OutboxStatus.FAILED counted in OutboxMetrics.java (OutboxPublishServiceTest) and consumer EXHAUSTED state in ConsumerMetrics.java (ConsumerMetricsTest, ClickEventConsumerTest)."
+      },
+      {
+        "id": "AC-6",
+        "verdict": "PASS",
+        "evidence": "processed_click_event table (src/main/resources/db/migration/V2__click_analytics.sql) + ProcessedClickEventRepository; src/test/java/com/example/shortener/analytics/aggregation/ClickStatsAggregatorTest.java and ClickStatsAggregatorIT.java duplicate-delivery cases; ClickAnalyticsEndToEndIT.java asserts exactly-once aggregation on duplicate delivery."
+      },
+      {
+        "id": "AC-7",
+        "verdict": "PASS",
+        "evidence": "click_stats and click_stats_daily in V2__click_analytics.sql; ClickStatsAggregator.java upserts total_clicks/last_clicked_at/updated_at and UTC day buckets; ClickStatsAggregatorTest.java covers UTC midnight-boundary bucketing and out-of-order last_clicked_at."
+      },
+      {
+        "id": "AC-8",
+        "verdict": "PASS",
+        "evidence": "src/main/java/com/example/shortener/analytics/api/ClickStatsController.java + ClickStatsResponse/ClickStatsDayEntry; src/test/java/com/example/shortener/analytics/api/ClickStatsControllerTest.java (8 tests) and ClickStatsQueryServiceTest.java (8 tests) cover 200 with data, empty case and the 30-day window boundary. Caveat: the auth clause is unverified \u2014 T7 note says \"the codebase has no /api/v1 auth scheme or security dependency\", so no credential/401 test exists."
+      },
+      {
+        "id": "AC-9",
+        "verdict": "PASS",
+        "evidence": "ClickStatsControllerTest.java unknown-short-code case returning 404 via the existing error representation; 404 response documented in src/main/resources/openapi.yaml (verified by src/test/java/com/example/shortener/it/OpenApiContractIT.java)."
+      },
+      {
+        "id": "AC-10",
+        "verdict": "PASS",
+        "evidence": "src/main/java/com/example/shortener/analytics/recording/IpHasher.java (SHA-256 over configured static salt + IP) with IpHasherTest.java determinism tests; schema stores only hashed_ip (V2__click_analytics.sql); ClickEventMessage.java carries hashed_ip only (ClickEventMessageTest); T3/T4/T5/T6 notes confirm logging excludes raw IP. Residual risk noted in concerns (local non-secret salt fallback in application.yml)."
+      },
+      {
+        "id": "AC-11",
+        "verdict": "PASS",
+        "evidence": "src/main/java/com/example/shortener/analytics/recording/ReferrerHostExtractor.java with src/test/java/com/example/shortener/analytics/recording/ReferrerHostExtractorTest.java covering host-only extraction and null for absent/unparsable Referer."
+      },
+      {
+        "id": "AC-12",
+        "verdict": "PASS",
+        "evidence": "src/main/java/com/example/shortener/analytics/retention/ClickRetentionJob.java (bounded batches, cron 0 0 3 * * * UTC) with ClickRetentionJobTest.java (8/8) and ClickRetentionJobIT.java (3/3 on Testcontainers PostgreSQL) asserting rows straddling the 90-day boundary and that click_stats/click_stats_daily are untouched. See concern about PENDING rows."
+      },
+      {
+        "id": "AC-13",
+        "verdict": "PASS",
+        "evidence": "src/test/java/com/example/shortener/analytics/it/RedirectLatencyBudgetIT.java plus src/test/resources/analytics/redirect-latency-baseline.properties and the `-Pit verify` step in .github/workflows/ci.yml. Weak evidence: T8 note says \"Integration profile not run per instructions\", so the gate has never been executed end-to-end in this run."
+      },
+      {
+        "id": "AC-14",
+        "verdict": "PASS",
+        "evidence": "T3 note: full suite of 304 tests including the unmodified RedirectControllerTest and ArchitectureTest pass; src/main/resources/openapi.yaml changed additively (only getUrlClickStats added) and validated by src/test/java/com/example/shortener/it/OpenApiContractIT.java; no existing API DTOs or endpoints appear in files_changed apart from RedirectController.java (recorder call only)."
+      },
+      {
+        "id": "AC-15",
+        "verdict": "PASS",
+        "evidence": "ClickStatsResponse exposes as_of sourced from click_stats.updated_at (now when no aggregate exists) per ClickStatsQueryService.java; ClickStatsQueryServiceTest.java asserts as_of semantics and ClickAnalyticsEndToEndIT.java exercises the published-then-consumed lag path."
+      }
+    ],
+    "concerns": [
+      "AC-1 atomicity deviation (blocking): the click row is written in ClickEventRecorder's own @Transactional boundary, not in the redirect handling transaction. This is a design change from the spec's transactional-outbox guarantee and was self-declared in the T3 note rather than raised as an ambiguity. Either the redirect path must join a single transaction, or the deviation needs an explicit ADR/spec amendment describing the accepted failure window (click recorded for a redirect that subsequently errors, or lost click if the commit fails after the lookup).",
+      "Security/authorization gap: T7 reports the codebase has no /api/v1 auth scheme, so GET /api/v1/urls/{short_code}/stats is served unauthenticated and per-link click volume for any guessable short code is publicly readable. AC-8 assumes an existing scheme exists; the plan DoD also required a 401 response in openapi.yaml and an unauthenticated test, neither of which was delivered. This is an unresolved ambiguity, not a safe default \u2014 escalate before release.",
+      "Retention scope risk: plan T6 risk_notes explicitly required the purge to exclude rows still awaiting publication, but the notes/data-model slice describe deleting click_outbox where occurred_at < now - retention.days with no status filter. If a row has been PENDING/FAILED for >90 days it is silently deleted (data loss, and FAILED rows lose their forensic trail). Confirm ClickRetentionJob filters on OutboxStatus and add a test for a 91-day-old PENDING row.",
+      "Verification gaps: T4, T6, T7 and T8 all report that `-Pit verify` was not executed (T1 too, \"needs Docker\"). The end-to-end IT, KafkaUnavailableRedirectIT, RedirectLatencyBudgetIT and the OpenAPI contract dump comparison are therefore unproven on the final tree. At minimum one clean `./mvnw -Pit verify` run on the merged branch should be evidenced before merge.",
+      "Latency gate credibility: the baseline is a committed static file (src/test/resources/analytics/redirect-latency-baseline.properties). Document how/when it was measured and ensure the IT uses warmup and a fixed sample size as the plan required, otherwise AC-13 is self-certifying.",
+      "PII gate handling in T8: the compliance finding was resolved by \"rewording the README privacy bullet so it no longer spells the forbidden term\". That is a scanner workaround, not a substantive fix. Confirm the scanner hit was genuinely a false positive in prose and that no code path logs or persists a client IP (spot-check ClickEventRecorder/RedirectController logging and any exception messages).",
+      "Secret handling: T1 notes a \"non-secret local fallback\" for SHORTENER_ANALYTICS_IP_SALT in application.yml. A defaulted salt that silently applies in a non-local profile would weaken every hashed_ip. Recommend fail-fast validation (@NotBlank plus a profile guard) so a missing salt aborts startup outside local/test.",
+      "Layering workaround: AnalyticsProperties is registered via a nested @Configuration because the application class was outside allowed_files (T1 note). Works, but leaves configuration wiring in an unusual place; flag for follow-up cleanup rather than leaving as precedent.",
+      "Observability: OutboxMetrics/ConsumerMetrics are hand-rolled because micrometer-core is absent. AC-5 asks for metered terminal failures; counters that are not exported to the platform's metrics backend give operators no alerting path. Confirm with the platform owner whether an in-memory counter satisfies the operator story (US-5).",
+      "No dead-letter/replay path: on retry exhaustion the consumer acks the record and marks EXHAUSTED, and the publisher marks the row FAILED and never retries. This matches AC-5's letter, but there is no documented operational procedure to replay FAILED/EXHAUSTED events; README/docs should state that these clicks are permanently lost.",
+      "Minor file-scope deviation: src/test/java/com/example/shortener/it/OpenApiContractIT.java was added under T7 whose allowed_files were src/test/java/**/analytics/api/**/*.java and src/main/resources/openapi.yaml. Harmless content-wise, but it sits outside the task's declared globs; record it or move it under the analytics package.",
+      "Lingering advisory failure: spotless:check has failed on src/test/java/com/example/shortener/analytics/aggregation/ClickStatsAggregatorTest.java since T5 and was deferred by T6, T7 and T8 as \"outside allowed files\". Since T5 authored it, it should be fixed rather than carried forward.",
+      "Migration numbering: V2__click_analytics.sql is the only migration added; confirm no collision with an existing V2 in the brownfield baseline (ClickAnalyticsMigrationTest should assert the full migration history applies from a clean schema, not just the new tables)."
+    ],
+    "recommendation": "REVISE"
+  },
+  "usage": {
+    "tokens_in": 18498,
+    "tokens_out": 6882,
+    "cost_usd": 0.26454
+  }
+}

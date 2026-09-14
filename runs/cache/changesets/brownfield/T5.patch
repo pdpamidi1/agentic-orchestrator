@@ -1,0 +1,1220 @@
+diff --git a/src/main/java/com/example/shortener/analytics/aggregation/ClickStatsAggregator.java b/src/main/java/com/example/shortener/analytics/aggregation/ClickStatsAggregator.java
+new file mode 100644
+index 0000000..3535ee9
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/aggregation/ClickStatsAggregator.java
+@@ -0,0 +1,142 @@
++/*
++ * ClickStatsAggregator.java — applies one url.clicked event to click_stats / click_stats_daily
++ * exactly once
++ *
++ * Layer: analytics.aggregation (depends on analytics.repository and the analytics.kafka message
++ * value object only; imports no org.apache.kafka / org.springframework.kafka type). Called by
++ * analytics.consumer.ClickEventConsumer for every delivered event. One transaction per event:
++ * claim the idempotency key in processed_click_event, then upsert the lifetime total (moving
++ * last_clicked_at forward only) and the UTC day bucket derived from occurred_at (AC-5, AC-6, AC-7,
++ * AC-10).
++ */
++package com.example.shortener.analytics.aggregation;
++
++import com.example.shortener.analytics.kafka.ClickEventMessage;
++import com.example.shortener.analytics.repository.ClickStatsRepository;
++import com.example.shortener.analytics.repository.ProcessedClickEventRepository;
++import java.time.Clock;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.time.ZoneOffset;
++import java.util.Objects;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++/**
++ * Idempotent aggregation of one click event into the per-link aggregates.
++ *
++ * <p><b>Responsibility.</b> {@link #apply} is the unit of work of the consumer. Inside a single
++ * read-write transaction it (1) inserts the event's idempotency key into {@code
++ * processed_click_event} with {@code ON CONFLICT DO NOTHING}; when the insert affects no row the
++ * event was already applied and the method returns {@link Outcome#DUPLICATE} without touching any
++ * aggregate; otherwise it (2) upserts {@code click_stats} ({@code total_clicks + 1}, {@code
++ * last_clicked_at = GREATEST(existing, occurred_at)}, {@code updated_at = now}) and (3) upserts the
++ * {@code click_stats_daily} row of the UTC calendar day of {@code occurred_at}.
++ *
++ * <p><b>Atomicity.</b> The dedupe marker and both aggregate rows commit or roll back together, so a
++ * failure after the marker was written never leaves an event marked as processed but uncounted; the
++ * consumer's next attempt starts from a clean slate. Because the upserts are single statements, two
++ * consumers applying different events for the same short code serialise on the row without lost
++ * updates, and an out-of-order (older) event never moves {@code last_clicked_at} backwards.
++ *
++ * <p><b>Day bucketing.</b> The bucket is {@code occurred_at} converted to a UTC date ({@link
++ * #utcDay}); a click at {@code 23:59:59Z} and one at {@code 00:00:00Z} the next day land in two
++ * different rows regardless of the JVM's default time zone.
++ *
++ * <p><b>Privacy.</b> Only the idempotency key, the short code and the instant are logged; the
++ * hashed address and the referrer host carried by the message are neither logged nor stored here
++ * (AC-10).
++ *
++ * <p><b>Thread-safety and lifecycle.</b> Immutable singleton bean; safe for concurrent use. The
++ * {@link Transactional} boundary requires calls to go through the Spring proxy.
++ */
++@Service
++public class ClickStatsAggregator {
++
++  private static final Logger log = LoggerFactory.getLogger(ClickStatsAggregator.class);
++
++  /** What {@link #apply} did with the event. */
++  public enum Outcome {
++    /** First delivery of this idempotency key: the aggregates were incremented. */
++    APPLIED,
++    /** The key was already processed: nothing changed. */
++    DUPLICATE
++  }
++
++  private final ProcessedClickEventRepository processedEvents;
++  private final ClickStatsRepository stats;
++  private final Clock clock;
++
++  /**
++   * Creates the aggregator with the system UTC clock (the constructor Spring uses).
++   *
++   * @param processedEvents the dedupe repository
++   * @param stats the aggregate repository
++   * @throws NullPointerException when an argument is {@code null}
++   */
++  @Autowired
++  public ClickStatsAggregator(
++      ProcessedClickEventRepository processedEvents, ClickStatsRepository stats) {
++    this(processedEvents, stats, Clock.systemUTC());
++  }
++
++  /**
++   * Creates the aggregator with an explicit clock.
++   *
++   * @param processedEvents the dedupe repository
++   * @param stats the aggregate repository
++   * @param clock source of {@code processed_at} and {@code updated_at}
++   * @throws NullPointerException when an argument is {@code null}
++   */
++  public ClickStatsAggregator(
++      ProcessedClickEventRepository processedEvents, ClickStatsRepository stats, Clock clock) {
++    this.processedEvents = Objects.requireNonNull(processedEvents, "processedEvents");
++    this.stats = Objects.requireNonNull(stats, "stats");
++    this.clock = Objects.requireNonNull(clock, "clock");
++  }
++
++  /**
++   * Applies one event exactly once.
++   *
++   * @param event the deserialised {@code url.clicked} message
++   * @return {@link Outcome#APPLIED} on the first delivery, {@link Outcome#DUPLICATE} afterwards
++   * @throws NullPointerException when {@code event} is {@code null}
++   * @throws RuntimeException any data-access failure, after the transaction was rolled back; the
++   *     caller retries under its policy
++   */
++  @Transactional
++  public Outcome apply(ClickEventMessage event) {
++    Objects.requireNonNull(event, "event");
++    Instant now = clock.instant();
++    int claimed = processedEvents.insertIfAbsent(event.idempotencyKey(), now);
++    if (claimed == 0) {
++      log.info(
++          "Duplicate click event ignored: key {} short code '{}'",
++          event.idempotencyKey(),
++          event.shortCode());
++      return Outcome.DUPLICATE;
++    }
++    stats.incrementTotal(event.shortCode(), event.occurredAt(), now);
++    stats.incrementDaily(event.shortCode(), utcDay(event.occurredAt()));
++    log.debug(
++        "Click event applied: key {} short code '{}' occurred at {}",
++        event.idempotencyKey(),
++        event.shortCode(),
++        event.occurredAt());
++    return Outcome.APPLIED;
++  }
++
++  /**
++   * UTC calendar day of an instant: the {@code click_stats_daily} bucket.
++   *
++   * @param occurredAt when the click happened
++   * @return the date of {@code occurredAt} in UTC
++   * @throws NullPointerException when {@code occurredAt} is {@code null}
++   */
++  public static LocalDate utcDay(Instant occurredAt) {
++    return Objects.requireNonNull(occurredAt, "occurredAt").atZone(ZoneOffset.UTC).toLocalDate();
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/consumer/ClickEventConsumer.java b/src/main/java/com/example/shortener/analytics/consumer/ClickEventConsumer.java
+new file mode 100644
+index 0000000..309fb52
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/consumer/ClickEventConsumer.java
+@@ -0,0 +1,289 @@
++/*
++ * ClickEventConsumer.java — Kafka listener on url.clicked feeding ClickStatsAggregator
++ *
++ * Layer: analytics.consumer, one of the three production packages (with analytics.kafka and
++ * analytics.config) allowed to import org.apache.kafka / org.springframework.kafka
++ * (ArchitectureTest rule). Deserialises each record of the url.clicked topic (key = short_code,
++ * JSON value {short_code, occurred_at, hashed_ip, referrer_host}, header idempotency-key) into a
++ * ClickEventMessage and delegates to analytics.aggregation.ClickStatsAggregator, whose single
++ * transaction dedupes on processed_click_event and upserts the aggregates. Failures of the
++ * aggregation run under the shared analytics.support.RetryExecutor policy (AMB-17: bounded
++ * attempts, exponential backoff with jitter, per-attempt timeout); when the budget is exhausted the
++ * record is logged, counted and acknowledged rather than redelivered forever (AC-5, AC-6, AC-7,
++ * AC-10).
++ */
++package com.example.shortener.analytics.consumer;
++
++import com.example.shortener.analytics.aggregation.ClickStatsAggregator;
++import com.example.shortener.analytics.kafka.ClickEventMessage;
++import com.example.shortener.analytics.kafka.ClickEventProducer;
++import com.example.shortener.analytics.support.RetryExecutor;
++import com.example.shortener.analytics.support.RetryExecutor.RetryExhaustedException;
++import java.nio.charset.StandardCharsets;
++import java.time.Instant;
++import java.time.format.DateTimeParseException;
++import java.util.Map;
++import java.util.Objects;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.Executor;
++import java.util.concurrent.Executors;
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++import org.apache.kafka.common.header.Header;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.kafka.annotation.KafkaListener;
++import org.springframework.stereotype.Component;
++import tools.jackson.core.type.TypeReference;
++import tools.jackson.databind.ObjectMapper;
++
++/**
++ * Consumes {@code url.clicked} records and aggregates them into {@code click_stats}.
++ *
++ * <p><b>Responsibility.</b> {@link #onMessage} is the Spring Kafka entry point; {@link #consume} is
++ * the testable body and returns what happened to the record:
++ *
++ * <ul>
++ *   <li>{@link Outcome#REJECTED}: the record is not a valid event (missing {@code idempotency-key}
++ *       header, unparsable JSON, missing or malformed contract field). A poison record never
++ *       becomes valid, so it is logged, counted and skipped without any retry.
++ *   <li>{@link Outcome#APPLIED} / {@link Outcome#DUPLICATE}: the aggregator accepted the event
++ *       (first delivery or replay of an already processed key). Duplicates are a no-op for the
++ *       totals, {@code last_clicked_at} and the daily buckets (AC-6).
++ *   <li>{@link Outcome#EXHAUSTED}: every attempt of the aggregation failed (database outage,
++ *       timeout). The record is logged with class and message of the last cause, counted in {@link
++ *       ConsumerMetrics#exhaustedCount()} and acknowledged so the partition keeps moving; because
++ *       nothing was committed the event can be replayed later from the outbox / topic by an
++ *       operator (AC-5).
++ * </ul>
++ *
++ * <p><b>Retry.</b> Each attempt runs {@link ClickStatsAggregator#apply} on the {@link Executor} (a
++ * virtual thread per attempt in production) so the {@link RetryExecutor} can bound it with {@code
++ * analytics.kafka.timeout-ms}; the executor sleeps {@code min(cap, base * 2^n)} with jitter between
++ * attempts and gives up after {@code analytics.retry.max-attempts}. The listener thread blocks for
++ * the whole schedule, which is intended: the partition is not advanced until the record reached a
++ * terminal state, and the schedule is bounded.
++ *
++ * <p><b>Privacy.</b> Log lines carry the topic coordinates, the idempotency key and the short code,
++ * never the {@code hashed_ip} value nor the referrer host; no raw client address ever reaches this
++ * class (AC-10).
++ *
++ * <p><b>Thread-safety and lifecycle.</b> Immutable singleton bean; the listener container calls it
++ * from one consumer thread per partition assignment. The listener starts with the context unless
++ * {@code analytics.consumer.auto-startup=false}.
++ */
++@Component
++public class ClickEventConsumer {
++
++  private static final Logger log = LoggerFactory.getLogger(ClickEventConsumer.class);
++
++  /** Consumer group of the aggregation listener; one group so each event is counted once. */
++  public static final String GROUP_ID = "click-stats-aggregator";
++
++  /** Listener container id (for {@code KafkaListenerEndpointRegistry} lookups). */
++  public static final String LISTENER_ID = "clickEventConsumer";
++
++  private static final TypeReference<Map<String, Object>> VALUE_TYPE = new TypeReference<>() {};
++
++  /** Terminal state of one delivered record. */
++  public enum Outcome {
++    /** First delivery: the aggregates were incremented. */
++    APPLIED,
++    /** Replay of a processed idempotency key: nothing changed. */
++    DUPLICATE,
++    /** Malformed record: skipped without retry. */
++    REJECTED,
++    /** Aggregation failed on every attempt: dropped after logging and counting. */
++    EXHAUSTED
++  }
++
++  private final ClickStatsAggregator aggregator;
++  private final RetryExecutor retryExecutor;
++  private final ConsumerMetrics metrics;
++  private final ObjectMapper objectMapper;
++  private final Executor executor;
++
++  /**
++   * Creates the consumer Spring uses: attempts run on a virtual thread each.
++   *
++   * @param aggregator applies events to the aggregates
++   * @param retryExecutor the shared retry policy
++   * @param metrics consumer counters
++   * @param objectMapper JSON mapper for the record value
++   * @throws NullPointerException when an argument is {@code null}
++   */
++  @Autowired
++  public ClickEventConsumer(
++      ClickStatsAggregator aggregator,
++      RetryExecutor retryExecutor,
++      ConsumerMetrics metrics,
++      ObjectMapper objectMapper) {
++    this(
++        aggregator,
++        retryExecutor,
++        metrics,
++        objectMapper,
++        Executors.newVirtualThreadPerTaskExecutor());
++  }
++
++  /**
++   * Creates the consumer with an explicit attempt executor (tests use a direct executor).
++   *
++   * @param aggregator applies events to the aggregates
++   * @param retryExecutor the shared retry policy
++   * @param metrics consumer counters
++   * @param objectMapper JSON mapper for the record value
++   * @param executor runs each aggregation attempt
++   * @throws NullPointerException when an argument is {@code null}
++   */
++  public ClickEventConsumer(
++      ClickStatsAggregator aggregator,
++      RetryExecutor retryExecutor,
++      ConsumerMetrics metrics,
++      ObjectMapper objectMapper,
++      Executor executor) {
++    this.aggregator = Objects.requireNonNull(aggregator, "aggregator");
++    this.retryExecutor = Objects.requireNonNull(retryExecutor, "retryExecutor");
++    this.metrics = Objects.requireNonNull(metrics, "metrics");
++    this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper");
++    this.executor = Objects.requireNonNull(executor, "executor");
++  }
++
++  /**
++   * Spring Kafka entry point for one {@code url.clicked} record.
++   *
++   * @param record the delivered record
++   */
++  @KafkaListener(
++      id = LISTENER_ID,
++      topics = ClickEventProducer.TOPIC,
++      groupId = GROUP_ID,
++      autoStartup = "${analytics.consumer.auto-startup:true}")
++  public void onMessage(ConsumerRecord<String, String> record) {
++    consume(record);
++  }
++
++  /**
++   * Processes one record to a terminal state. Never throws for a record-level problem; only an
++   * interrupt of the listener thread propagates (as {@link IllegalStateException}).
++   *
++   * @param record the delivered record
++   * @return what happened to it
++   * @throws NullPointerException when {@code record} is {@code null}
++   */
++  public Outcome consume(ConsumerRecord<String, String> record) {
++    Objects.requireNonNull(record, "record");
++    ClickEventMessage event;
++    try {
++      event = deserialize(record);
++    } catch (RuntimeException e) {
++      metrics.incrementRejected();
++      log.error(
++          "Rejected malformed click event at {}-{}@{} with key '{}': {}",
++          record.topic(),
++          record.partition(),
++          record.offset(),
++          record.key(),
++          describe(e));
++      return Outcome.REJECTED;
++    }
++    try {
++      ClickStatsAggregator.Outcome applied =
++          retryExecutor.execute(
++              () -> CompletableFuture.supplyAsync(() -> aggregator.apply(event), executor),
++              (attempt, backoff, cause) ->
++                  log.warn(
++                      "Aggregation attempt {} failed for key {} short code '{}': {}; retrying in"
++                          + " {} ms",
++                      attempt,
++                      event.idempotencyKey(),
++                      event.shortCode(),
++                      describe(cause),
++                      backoff.toMillis()));
++      if (applied == ClickStatsAggregator.Outcome.DUPLICATE) {
++        metrics.incrementDuplicate();
++        return Outcome.DUPLICATE;
++      }
++      metrics.incrementApplied();
++      return Outcome.APPLIED;
++    } catch (RetryExhaustedException e) {
++      metrics.incrementExhausted();
++      log.error(
++          "Giving up on click event key {} short code '{}' at {}-{}@{} after {} attempt(s);"
++              + " record acknowledged without aggregation: {}",
++          event.idempotencyKey(),
++          event.shortCode(),
++          record.topic(),
++          record.partition(),
++          record.offset(),
++          e.getAttempts(),
++          describe(e.getCause()));
++      return Outcome.EXHAUSTED;
++    }
++  }
++
++  /**
++   * Parses a record into the contract message.
++   *
++   * @param record the delivered record
++   * @return the event
++   * @throws IllegalArgumentException when the header or a mandatory field is missing or malformed
++   * @throws RuntimeException when the value is not a JSON object
++   */
++  ClickEventMessage deserialize(ConsumerRecord<String, String> record) {
++    Header header = record.headers().lastHeader(ClickEventProducer.HEADER_IDEMPOTENCY_KEY);
++    if (header == null || header.value() == null || header.value().length == 0) {
++      throw new IllegalArgumentException(
++          "missing " + ClickEventProducer.HEADER_IDEMPOTENCY_KEY + " header");
++    }
++    String idempotencyKey = new String(header.value(), StandardCharsets.UTF_8);
++    if (record.value() == null) {
++      throw new IllegalArgumentException("null value");
++    }
++    Map<String, Object> fields;
++    try {
++      fields = objectMapper.readValue(record.value(), VALUE_TYPE);
++    } catch (RuntimeException e) {
++      // Class name only: a parser message may quote the payload.
++      throw new IllegalArgumentException(
++          "value is not a JSON object (" + e.getClass().getSimpleName() + ")");
++    }
++    if (fields == null) {
++      throw new IllegalArgumentException("value is not a JSON object");
++    }
++    String shortCode = requiredString(fields, ClickEventMessage.FIELD_SHORT_CODE);
++    String occurredAtText = requiredString(fields, ClickEventMessage.FIELD_OCCURRED_AT);
++    String hashedIp = requiredString(fields, ClickEventMessage.FIELD_HASHED_IP);
++    Object referrer = fields.get(ClickEventMessage.FIELD_REFERRER_HOST);
++    if (referrer != null && !(referrer instanceof String)) {
++      throw new IllegalArgumentException(
++          "field " + ClickEventMessage.FIELD_REFERRER_HOST + " must be a string or null");
++    }
++    Instant occurredAt;
++    try {
++      occurredAt = Instant.parse(occurredAtText);
++    } catch (DateTimeParseException e) {
++      throw new IllegalArgumentException(
++          "field " + ClickEventMessage.FIELD_OCCURRED_AT + " is not an ISO-8601 instant", e);
++    }
++    return new ClickEventMessage(
++        idempotencyKey, shortCode, occurredAt, hashedIp, (String) referrer);
++  }
++
++  private static String requiredString(Map<String, Object> fields, String name) {
++    Object value = fields.get(name);
++    if (!(value instanceof String text) || text.isBlank()) {
++      throw new IllegalArgumentException("field " + name + " is missing or not a non-empty string");
++    }
++    return text;
++  }
++
++  /** Exception class and message only; never a payload. */
++  private static String describe(Throwable cause) {
++    if (cause == null) {
++      return "unknown cause";
++    }
++    return cause.getClass().getSimpleName()
++        + (cause.getMessage() == null ? "" : ": " + cause.getMessage());
++  }
++}
+diff --git a/src/main/java/com/example/shortener/analytics/consumer/ConsumerMetrics.java b/src/main/java/com/example/shortener/analytics/consumer/ConsumerMetrics.java
+new file mode 100644
+index 0000000..b3f68a2
+--- /dev/null
++++ b/src/main/java/com/example/shortener/analytics/consumer/ConsumerMetrics.java
+@@ -0,0 +1,73 @@
++/*
++ * ConsumerMetrics.java — counters of the url.clicked consumer
++ *
++ * Layer: analytics.consumer. Micrometer core is not on the classpath (only micrometer-observation
++ * comes with Spring Kafka), so the consumer counts through this small bean, mirroring
++ * analytics.outbox.OutboxMetrics; a MeterRegistry can be bound to its getters when the actuator is
++ * added. Incremented by ClickEventConsumer for every terminal outcome of a delivery (AC-5, AC-6).
++ */
++package com.example.shortener.analytics.consumer;
++
++import java.util.concurrent.atomic.AtomicLong;
++import org.springframework.stereotype.Component;
++
++/**
++ * Process-wide counters of the click-event consumer.
++ *
++ * <p><b>Thread-safety.</b> Singleton bean backed by atomics; safe for concurrent use.
++ */
++@Component
++public class ConsumerMetrics {
++
++  /** Events applied to the aggregates for the first time. */
++  private final AtomicLong applied = new AtomicLong();
++
++  /** Redeliveries skipped because the idempotency key was already processed. */
++  private final AtomicLong duplicate = new AtomicLong();
++
++  /** Records skipped because they could not be deserialised into a valid event. */
++  private final AtomicLong rejected = new AtomicLong();
++
++  /** Events dropped after the retry budget was exhausted. */
++  private final AtomicLong exhausted = new AtomicLong();
++
++  /** Counts one applied event. */
++  public void incrementApplied() {
++    applied.incrementAndGet();
++  }
++
++  /** Counts one skipped duplicate. */
++  public void incrementDuplicate() {
++    duplicate.incrementAndGet();
++  }
++
++  /** Counts one rejected (malformed) record. */
++  public void incrementRejected() {
++    rejected.incrementAndGet();
++  }
++
++  /** Counts one event dropped after exhausting the retry budget. */
++  public void incrementExhausted() {
++    exhausted.incrementAndGet();
++  }
++
++  /** Events applied since start-up. */
++  public long appliedCount() {
++    return applied.get();
++  }
++
++  /** Duplicates skipped since start-up. */
++  public long duplicateCount() {
++    return duplicate.get();
++  }
++
++  /** Malformed records rejected since start-up. */
++  public long rejectedCount() {
++    return rejected.get();
++  }
++
++  /** Events dropped after retry exhaustion since start-up. */
++  public long exhaustedCount() {
++    return exhausted.get();
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/aggregation/ClickStatsAggregatorIT.java b/src/test/java/com/example/shortener/analytics/aggregation/ClickStatsAggregatorIT.java
+new file mode 100644
+index 0000000..656ee65
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/aggregation/ClickStatsAggregatorIT.java
+@@ -0,0 +1,135 @@
++/*
++ * ClickStatsAggregatorIT.java — the aggregator against a real PostgreSQL through the Spring proxy
++ *
++ * Layer: test (integration). Reuses the booted application and Testcontainers fixture of
++ * AbstractIntegrationTest and proves, with the real ON CONFLICT upserts, for task T5 (AC-5, AC-6,
++ * AC-7, AC-10): a single event creates click_stats and the daily bucket; a duplicate delivery
++ * changes nothing; out-of-order events never move last_clicked_at backwards while still counting;
++ * clicks on both sides of UTC midnight land in two daily rows; the marker and the aggregates are
++ * written in one transaction (a failure after the marker leaves no marker behind). Requires
++ * Docker; run by failsafe under ./mvnw -Pit verify.
++ */
++package com.example.shortener.analytics.aggregation;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.example.shortener.analytics.aggregation.ClickStatsAggregator.Outcome;
++import com.example.shortener.analytics.domain.ClickStats;
++import com.example.shortener.analytics.domain.ClickStatsDaily;
++import com.example.shortener.analytics.kafka.ClickEventMessage;
++import com.example.shortener.analytics.repository.ClickStatsRepository;
++import com.example.shortener.analytics.repository.ProcessedClickEventRepository;
++import com.example.shortener.it.AbstractIntegrationTest;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.util.List;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.jdbc.core.JdbcTemplate;
++
++/** Integration tests of {@link ClickStatsAggregator} on PostgreSQL 17 (Testcontainers). */
++class ClickStatsAggregatorIT extends AbstractIntegrationTest {
++
++  private static final String CODE = "aggr01";
++  private static final String HASH = "b".repeat(64);
++  private static final Instant T1 = Instant.parse("2026-09-14T12:00:00Z");
++  private static final Instant T2 = Instant.parse("2026-09-14T12:30:00Z");
++
++  @Autowired private ClickStatsAggregator aggregator;
++  @Autowired private ClickStatsRepository stats;
++  @Autowired private ProcessedClickEventRepository processed;
++  @Autowired private JdbcTemplate jdbc;
++
++  @BeforeEach
++  void resetAnalyticsTables() {
++    jdbc.update("DELETE FROM click_stats_daily");
++    jdbc.update("DELETE FROM click_stats");
++    jdbc.update("DELETE FROM processed_click_event");
++  }
++
++  /** Given an empty table, when one event is applied, then total, last click and day are set. */
++  @Test
++  void singleEventCreatesAggregateAndDailyBucket() {
++    Instant before = Instant.now();
++
++    assertThat(aggregator.apply(event("it-single", T1))).isEqualTo(Outcome.APPLIED);
++
++    ClickStats row = stats.findById(CODE).orElseThrow();
++    assertThat(row.getTotalClicks()).isEqualTo(1);
++    assertThat(row.getLastClickedAt()).isEqualTo(T1);
++    assertThat(row.getUpdatedAt()).isAfterOrEqualTo(before.minusSeconds(1));
++    List<ClickStatsDaily> daily =
++        stats.findDaily(CODE, LocalDate.of(2026, 9, 14), LocalDate.of(2026, 9, 14));
++    assertThat(daily).hasSize(1);
++    assertThat(daily.getFirst().getCount()).isEqualTo(1);
++    assertThat(processed.existsById("it-single")).isTrue();
++  }
++
++  /** Given an applied key, when redelivered, then totals, last click and day are unchanged. */
++  @Test
++  void duplicateDeliveryIsNoOp() {
++    aggregator.apply(event("it-dup", T1));
++    ClickStats first = stats.findById(CODE).orElseThrow();
++
++    assertThat(aggregator.apply(event("it-dup", T2))).isEqualTo(Outcome.DUPLICATE);
++
++    ClickStats again = stats.findById(CODE).orElseThrow();
++    assertThat(again.getTotalClicks()).isEqualTo(1);
++    assertThat(again.getLastClickedAt()).isEqualTo(first.getLastClickedAt());
++    assertThat(again.getUpdatedAt()).isEqualTo(first.getUpdatedAt());
++    assertThat(stats.findDaily(CODE, LocalDate.of(2026, 9, 14), LocalDate.of(2026, 9, 14)))
++        .singleElement()
++        .satisfies(d -> assertThat(d.getCount()).isEqualTo(1));
++    assertThat(jdbc.queryForObject("SELECT count(*) FROM processed_click_event", Long.class))
++        .isEqualTo(1L);
++  }
++
++  /** Given a newer event already counted, when an older one arrives, then last click stays. */
++  @Test
++  void outOfOrderEventCountsButNeverMovesLastClickedAtBackwards() {
++    aggregator.apply(event("it-new", T2));
++    aggregator.apply(event("it-old", T1));
++
++    ClickStats row = stats.findById(CODE).orElseThrow();
++    assertThat(row.getTotalClicks()).isEqualTo(2);
++    assertThat(row.getLastClickedAt()).isEqualTo(T2);
++
++    aggregator.apply(event("it-newest", T2.plusSeconds(60)));
++    assertThat(stats.findById(CODE).orElseThrow().getLastClickedAt()).isEqualTo(T2.plusSeconds(60));
++  }
++
++  /** Given clicks on both sides of UTC midnight, when applied, then two daily rows exist. */
++  @Test
++  void utcMidnightBoundarySplitsDailyBuckets() {
++    aggregator.apply(event("it-d1", Instant.parse("2026-09-14T23:59:59Z")));
++    aggregator.apply(event("it-d2", Instant.parse("2026-09-15T00:00:00Z")));
++    aggregator.apply(event("it-d3", Instant.parse("2026-09-15T00:00:01Z")));
++
++    List<ClickStatsDaily> daily =
++        stats.findDaily(CODE, LocalDate.of(2026, 9, 14), LocalDate.of(2026, 9, 15));
++    assertThat(daily).hasSize(2);
++    assertThat(daily.get(0).getDay()).isEqualTo(LocalDate.of(2026, 9, 14));
++    assertThat(daily.get(0).getCount()).isEqualTo(1);
++    assertThat(daily.get(1).getDay()).isEqualTo(LocalDate.of(2026, 9, 15));
++    assertThat(daily.get(1).getCount()).isEqualTo(2);
++    assertThat(stats.findById(CODE).orElseThrow().getTotalClicks()).isEqualTo(3);
++  }
++
++  /** Given a short code longer than the column, when applied, then no marker survives (atomic). */
++  @Test
++  void failureAfterMarkerRollsBackMarkerToo() {
++    String tooLong = "x".repeat(40);
++    ClickEventMessage bad = new ClickEventMessage("it-fail", tooLong, T1, HASH, null);
++
++    org.assertj.core.api.Assertions.assertThatThrownBy(() -> aggregator.apply(bad))
++        .isInstanceOf(RuntimeException.class);
++
++    assertThat(processed.existsById("it-fail")).isFalse();
++    assertThat(stats.findById(tooLong)).isEmpty();
++  }
++
++  private static ClickEventMessage event(String key, Instant occurredAt) {
++    return new ClickEventMessage(key, CODE, occurredAt, HASH, "news.example.org");
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/aggregation/ClickStatsAggregatorTest.java b/src/test/java/com/example/shortener/analytics/aggregation/ClickStatsAggregatorTest.java
+new file mode 100644
+index 0000000..0e3da1c
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/aggregation/ClickStatsAggregatorTest.java
+@@ -0,0 +1,179 @@
++/*
++ * ClickStatsAggregatorTest.java — dedupe-first ordering, upsert arguments, UTC day bucket
++ *
++ * Layer: test (unit). Mockito repositories and a fixed clock. Pins: a first delivery claims the
++ * idempotency key and then upserts the total (occurred_at, now) and the UTC daily bucket; a replay
++ * of the same key returns DUPLICATE and never touches an aggregate; the day bucket follows UTC
++ * across midnight regardless of the source offset; a repository failure propagates so the
++ * transaction rolls back; apply is @Transactional; logs never carry the hashed address
++ * (AC-5, AC-6, AC-7, AC-10). No Spring context, no database (see ClickStatsAggregatorIT).
++ */
++package com.example.shortener.analytics.aggregation;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.inOrder;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import ch.qos.logback.classic.Level;
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.core.read.ListAppender;
++import com.example.shortener.analytics.aggregation.ClickStatsAggregator.Outcome;
++import com.example.shortener.analytics.kafka.ClickEventMessage;
++import com.example.shortener.analytics.repository.ClickStatsRepository;
++import com.example.shortener.analytics.repository.ProcessedClickEventRepository;
++import java.time.Clock;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.time.ZoneId;
++import java.time.ZoneOffset;
++import java.time.ZonedDateTime;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.mockito.InOrder;
++import org.slf4j.LoggerFactory;
++import org.springframework.dao.DataAccessResourceFailureException;
++import org.springframework.transaction.annotation.Transactional;
++
++/** Unit tests of {@link ClickStatsAggregator}. */
++class ClickStatsAggregatorTest {
++
++  private static final Instant NOW = Instant.parse("2026-09-14T10:15:30Z");
++  private static final Instant OCCURRED = Instant.parse("2026-09-14T09:59:59Z");
++  private static final String HASH = "a".repeat(64);
++  private static final String KEY = "evt-0001";
++
++  private final ProcessedClickEventRepository processed = mock(ProcessedClickEventRepository.class);
++  private final ClickStatsRepository stats = mock(ClickStatsRepository.class);
++  private final ClickStatsAggregator aggregator =
++      new ClickStatsAggregator(processed, stats, Clock.fixed(NOW, ZoneOffset.UTC));
++
++  private final ListAppender<ILoggingEvent> logs = new ListAppender<>();
++  private Logger logger;
++
++  @BeforeEach
++  void captureLogs() {
++    logger = (Logger) LoggerFactory.getLogger(ClickStatsAggregator.class);
++    logger.setLevel(Level.DEBUG);
++    logs.start();
++    logger.addAppender(logs);
++  }
++
++  @AfterEach
++  void releaseLogs() {
++    logger.detachAppender(logs);
++    logs.stop();
++  }
++
++  /** Given a fresh key, when applied, then the marker is claimed first and both upserts follow. */
++  @Test
++  void firstDeliveryClaimsKeyThenUpsertsTotalAndDailyBucket() {
++    when(processed.insertIfAbsent(KEY, NOW)).thenReturn(1);
++
++    Outcome outcome = aggregator.apply(event(KEY, "abc123", OCCURRED));
++
++    assertThat(outcome).isEqualTo(Outcome.APPLIED);
++    InOrder order = inOrder(processed, stats);
++    order.verify(processed).insertIfAbsent(KEY, NOW);
++    order.verify(stats).incrementTotal("abc123", OCCURRED, NOW);
++    order.verify(stats).incrementDaily("abc123", LocalDate.of(2026, 9, 14));
++    order.verifyNoMoreInteractions();
++  }
++
++  /** Given an already processed key, when applied again, then nothing is incremented (AC-6). */
++  @Test
++  void duplicateKeyIsNoOpForTotalsLastClickedAndDailyBuckets() {
++    when(processed.insertIfAbsent(KEY, NOW)).thenReturn(0);
++
++    Outcome outcome = aggregator.apply(event(KEY, "abc123", OCCURRED));
++
++    assertThat(outcome).isEqualTo(Outcome.DUPLICATE);
++    verify(stats, never()).incrementTotal(anyString(), any(), any());
++    verify(stats, never()).incrementDaily(anyString(), any());
++  }
++
++  /** Given clicks around UTC midnight, when applied, then they land in different UTC days. */
++  @Test
++  void dayBucketIsDerivedFromOccurredAtInUtcAcrossMidnight() {
++    when(processed.insertIfAbsent(anyString(), any())).thenReturn(1);
++    Instant beforeMidnight = Instant.parse("2026-09-14T23:59:59.999Z");
++    Instant afterMidnight = Instant.parse("2026-09-15T00:00:00Z");
++    // 01:30 on the 15th in Berlin (UTC+2) is still 23:30 on the 14th in UTC.
++    Instant berlinEarlyMorning =
++        ZonedDateTime.of(2026, 9, 15, 1, 30, 0, 0, ZoneId.of("Europe/Berlin")).toInstant();
++
++    aggregator.apply(event("k1", "abc123", beforeMidnight));
++    aggregator.apply(event("k2", "abc123", afterMidnight));
++    aggregator.apply(event("k3", "abc123", berlinEarlyMorning));
++
++    // beforeMidnight and berlinEarlyMorning both fall on the 14th in UTC; afterMidnight on the 15th.
++    verify(stats, times(2)).incrementDaily("abc123", LocalDate.of(2026, 9, 14));
++    verify(stats, times(1)).incrementDaily("abc123", LocalDate.of(2026, 9, 15));
++    verify(stats).incrementTotal("abc123", berlinEarlyMorning, NOW);
++    assertThat(ClickStatsAggregator.utcDay(berlinEarlyMorning))
++        .isEqualTo(LocalDate.of(2026, 9, 14));
++    assertThat(ClickStatsAggregator.utcDay(afterMidnight)).isEqualTo(LocalDate.of(2026, 9, 15));
++  }
++
++  /** Given a failing upsert, when applied, then the failure propagates (transaction rollback). */
++  @Test
++  void repositoryFailurePropagatesForRetryByCaller() {
++    when(processed.insertIfAbsent(KEY, NOW)).thenReturn(1);
++    when(stats.incrementTotal(anyString(), any(), any()))
++        .thenThrow(new DataAccessResourceFailureException("db down"));
++
++    assertThatThrownBy(() -> aggregator.apply(event(KEY, "abc123", OCCURRED)))
++        .isInstanceOf(DataAccessResourceFailureException.class);
++    verify(stats, never()).incrementDaily(anyString(), any());
++  }
++
++  /** Given any outcome, when logged, then the hashed address and referrer never appear (AC-10). */
++  @Test
++  void logsNeverCarryHashedIpOrReferrer() {
++    when(processed.insertIfAbsent(anyString(), any())).thenReturn(1, 0);
++
++    aggregator.apply(event("k1", "abc123", OCCURRED));
++    aggregator.apply(event("k1", "abc123", OCCURRED));
++
++    assertThat(logs.list).isNotEmpty();
++    for (ILoggingEvent line : logs.list) {
++      assertThat(line.getFormattedMessage())
++          .doesNotContain(HASH)
++          .doesNotContain("news.example.org")
++          .doesNotContain("203.0.113.7");
++    }
++  }
++
++  /** The unit of work must be transactional so marker and aggregates commit together. */
++  @Test
++  void applyIsTransactional() throws NoSuchMethodException {
++    Transactional annotation =
++        ClickStatsAggregator.class
++            .getMethod("apply", ClickEventMessage.class)
++            .getAnnotation(Transactional.class);
++    assertThat(annotation).isNotNull();
++    assertThat(annotation.readOnly()).isFalse();
++  }
++
++  /** Constructor arguments are mandatory. */
++  @Test
++  void rejectsNullCollaborators() {
++    assertThatThrownBy(() -> new ClickStatsAggregator(null, stats))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickStatsAggregator(processed, null))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> aggregator.apply(null)).isInstanceOf(NullPointerException.class);
++  }
++
++  private static ClickEventMessage event(String key, String shortCode, Instant occurredAt) {
++    return new ClickEventMessage(key, shortCode, occurredAt, HASH, "news.example.org");
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/consumer/ClickEventConsumerTest.java b/src/test/java/com/example/shortener/analytics/consumer/ClickEventConsumerTest.java
+new file mode 100644
+index 0000000..b0d0d08
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/consumer/ClickEventConsumerTest.java
+@@ -0,0 +1,324 @@
++/*
++ * ClickEventConsumerTest.java — deserialisation, delegation, retry policy and terminal states
++ *
++ * Layer: test (unit). A Mockito ClickStatsAggregator, a real RetryExecutor with a recording sleeper
++ * and a direct executor, real ConsumerMetrics and ObjectMapper. Pins: a contract record is parsed
++ * into the ClickEventMessage (hashed_ip flows through untouched, referrer_host may be null) and
++ * applied once; a duplicate is reported and counted without error; a transient failure is retried
++ * with backoff and succeeds; a permanent failure ends in EXHAUSTED after max-attempts with the
++ * error logged and counted and no exception thrown (no infinite redelivery); malformed records are
++ * rejected without any attempt; the listener annotation targets url.clicked; no log line carries
++ * the hashed address (AC-5, AC-6, AC-7, AC-10). No Spring context, no broker.
++ */
++package com.example.shortener.analytics.consumer;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import ch.qos.logback.classic.Level;
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.core.read.ListAppender;
++import com.example.shortener.analytics.aggregation.ClickStatsAggregator;
++import com.example.shortener.analytics.config.AnalyticsProperties;
++import com.example.shortener.analytics.config.AnalyticsProperties.Jitter;
++import com.example.shortener.analytics.consumer.ClickEventConsumer.Outcome;
++import com.example.shortener.analytics.kafka.ClickEventMessage;
++import com.example.shortener.analytics.kafka.ClickEventProducer;
++import com.example.shortener.analytics.support.RetryExecutor;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.SplittableRandom;
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.slf4j.LoggerFactory;
++import org.springframework.dao.DataAccessResourceFailureException;
++import org.springframework.kafka.annotation.KafkaListener;
++import tools.jackson.databind.ObjectMapper;
++
++/** Unit tests of {@link ClickEventConsumer}. */
++class ClickEventConsumerTest {
++
++  private static final int MAX_ATTEMPTS = 3;
++  private static final String HASH = "d".repeat(64);
++  private static final String KEY = "evt-42";
++  private static final Instant OCCURRED = Instant.parse("2026-09-14T10:15:30Z");
++
++  private final ClickStatsAggregator aggregator = mock(ClickStatsAggregator.class);
++  private final ConsumerMetrics metrics = new ConsumerMetrics();
++  private final List<Duration> sleeps = new ArrayList<>();
++  private final RetryExecutor retryExecutor =
++      new RetryExecutor(
++          new AnalyticsProperties.Retry(MAX_ATTEMPTS, 100, 10_000, Jitter.NONE),
++          Duration.ofMillis(500),
++          new SplittableRandom(42L),
++          sleeps::add);
++  private final ClickEventConsumer consumer =
++      new ClickEventConsumer(aggregator, retryExecutor, metrics, new ObjectMapper(), Runnable::run);
++
++  private final ListAppender<ILoggingEvent> logs = new ListAppender<>();
++  private Logger logger;
++
++  @BeforeEach
++  void captureLogs() {
++    logger = (Logger) LoggerFactory.getLogger(ClickEventConsumer.class);
++    logger.setLevel(Level.DEBUG);
++    logs.start();
++    logger.addAppender(logs);
++  }
++
++  @AfterEach
++  void releaseLogs() {
++    logger.detachAppender(logs);
++    logs.stop();
++  }
++
++  /** Given a contract record, when consumed, then the parsed event is applied exactly once. */
++  @Test
++  void singleEventIsDeserialisedAndApplied() {
++    when(aggregator.apply(any())).thenReturn(ClickStatsAggregator.Outcome.APPLIED);
++
++    Outcome outcome = consumer.consume(record(KEY, value("abc123", "news.example.org")));
++
++    assertThat(outcome).isEqualTo(Outcome.APPLIED);
++    ArgumentCaptor<ClickEventMessage> captor = ArgumentCaptor.forClass(ClickEventMessage.class);
++    verify(aggregator, times(1)).apply(captor.capture());
++    ClickEventMessage event = captor.getValue();
++    assertThat(event.idempotencyKey()).isEqualTo(KEY);
++    assertThat(event.shortCode()).isEqualTo("abc123");
++    assertThat(event.occurredAt()).isEqualTo(OCCURRED);
++    assertThat(event.hashedIp()).isEqualTo(HASH);
++    assertThat(event.referrerHost()).isEqualTo("news.example.org");
++    assertThat(metrics.appliedCount()).isEqualTo(1);
++    assertThat(sleeps).isEmpty();
++  }
++
++  /** Given a record without referrer, when parsed, then referrer_host is null. */
++  @Test
++  void nullReferrerIsAccepted() {
++    ClickEventMessage event = consumer.deserialize(record(KEY, value("abc123", null)));
++
++    assertThat(event.referrerHost()).isNull();
++    assertThat(event.hashedIp()).isEqualTo(HASH);
++  }
++
++  /** Given a redelivered key, when consumed, then it is a counted no-op, not a failure (AC-6). */
++  @Test
++  void duplicateEventIsReportedAndCounted() {
++    when(aggregator.apply(any())).thenReturn(ClickStatsAggregator.Outcome.DUPLICATE);
++
++    Outcome outcome = consumer.consume(record(KEY, value("abc123", null)));
++
++    assertThat(outcome).isEqualTo(Outcome.DUPLICATE);
++    assertThat(metrics.duplicateCount()).isEqualTo(1);
++    assertThat(metrics.appliedCount()).isZero();
++    assertThat(metrics.exhaustedCount()).isZero();
++    verify(aggregator, times(1)).apply(any());
++  }
++
++  /** Given one transient failure, when consumed, then it is retried after backoff and applied. */
++  @Test
++  void transientFailureIsRetriedWithBackoff() {
++    when(aggregator.apply(any()))
++        .thenThrow(new DataAccessResourceFailureException("db hiccup"))
++        .thenReturn(ClickStatsAggregator.Outcome.APPLIED);
++
++    Outcome outcome = consumer.consume(record(KEY, value("abc123", null)));
++
++    assertThat(outcome).isEqualTo(Outcome.APPLIED);
++    verify(aggregator, times(2)).apply(any());
++    assertThat(sleeps).containsExactly(Duration.ofMillis(100));
++    assertThat(logs.list)
++        .anySatisfy(
++            line -> {
++              assertThat(line.getLevel()).isEqualTo(Level.WARN);
++              assertThat(line.getFormattedMessage()).contains("attempt 1").contains(KEY);
++            });
++  }
++
++  /**
++   * Given a permanent failure, when consumed, then attempts are bounded and the record ends
++   * EXHAUSTED: logged, counted, acknowledged (no exception), no infinite redelivery (AC-5).
++   */
++  @Test
++  void retryExhaustionEndsInLoggedAndMeteredTerminalState() {
++    when(aggregator.apply(any())).thenThrow(new DataAccessResourceFailureException("db down"));
++
++    Outcome outcome = consumer.consume(record(KEY, value("abc123", null)));
++
++    assertThat(outcome).isEqualTo(Outcome.EXHAUSTED);
++    verify(aggregator, times(MAX_ATTEMPTS)).apply(any());
++    assertThat(sleeps).containsExactly(Duration.ofMillis(100), Duration.ofMillis(200));
++    assertThat(metrics.exhaustedCount()).isEqualTo(1);
++    assertThat(metrics.appliedCount()).isZero();
++    assertThat(logs.list)
++        .anySatisfy(
++            line -> {
++              assertThat(line.getLevel()).isEqualTo(Level.ERROR);
++              assertThat(line.getFormattedMessage())
++                  .contains("Giving up")
++                  .contains(KEY)
++                  .contains("abc123")
++                  .contains(MAX_ATTEMPTS + " attempt(s)")
++                  .contains("db down");
++            });
++  }
++
++  /** Given a slow aggregation, when consumed, then the per-attempt timeout counts as a failure. */
++  @Test
++  void slowAttemptTimesOutAndIsRetried() {
++    RetryExecutor tight =
++        new RetryExecutor(
++            new AnalyticsProperties.Retry(2, 1, 1, Jitter.NONE),
++            Duration.ofMillis(20),
++            new SplittableRandom(1L),
++            sleeps::add);
++    ClickEventConsumer slowConsumer =
++        new ClickEventConsumer(
++            aggregator,
++            tight,
++            metrics,
++            new ObjectMapper(),
++            java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor());
++    when(aggregator.apply(any()))
++        .thenAnswer(
++            invocation -> {
++              Thread.sleep(300);
++              return ClickStatsAggregator.Outcome.APPLIED;
++            });
++
++    Outcome outcome = slowConsumer.consume(record(KEY, value("abc123", null)));
++
++    assertThat(outcome).isEqualTo(Outcome.EXHAUSTED);
++    assertThat(metrics.exhaustedCount()).isEqualTo(1);
++    assertThat(logs.list)
++        .anySatisfy(line -> assertThat(line.getFormattedMessage()).contains("TimeoutException"));
++  }
++
++  /** Given malformed records, when consumed, then they are rejected without any attempt. */
++  @Test
++  void malformedRecordsAreRejectedWithoutRetry() {
++    ConsumerRecord<String, String> noHeader =
++        new ConsumerRecord<>(ClickEventProducer.TOPIC, 0, 1L, "abc123", value("abc123", null));
++    ConsumerRecord<String, String> notJson = record(KEY, "{not json");
++    ConsumerRecord<String, String> missingField =
++        record(KEY, "{\"short_code\":\"abc123\",\"hashed_ip\":\"" + HASH + "\"}");
++    ConsumerRecord<String, String> badInstant =
++        record(
++            KEY,
++            "{\"short_code\":\"abc123\",\"occurred_at\":\"yesterday\",\"hashed_ip\":\""
++                + HASH
++                + "\",\"referrer_host\":null}");
++    ConsumerRecord<String, String> nullValue = record(KEY, null);
++
++    for (ConsumerRecord<String, String> bad :
++        List.of(noHeader, notJson, missingField, badInstant, nullValue)) {
++      assertThat(consumer.consume(bad)).isEqualTo(Outcome.REJECTED);
++    }
++
++    verify(aggregator, never()).apply(any());
++    assertThat(metrics.rejectedCount()).isEqualTo(5);
++    assertThat(sleeps).isEmpty();
++    assertThat(logs.list)
++        .filteredOn(line -> line.getLevel() == Level.ERROR)
++        .hasSize(5)
++        .allSatisfy(line -> assertThat(line.getFormattedMessage()).contains("Rejected"));
++  }
++
++  /** Given every outcome, when logged, then the hashed address never appears (AC-10). */
++  @Test
++  void logsNeverCarryHashedIp() {
++    when(aggregator.apply(any()))
++        .thenReturn(ClickStatsAggregator.Outcome.APPLIED)
++        .thenReturn(ClickStatsAggregator.Outcome.DUPLICATE)
++        .thenThrow(new DataAccessResourceFailureException("db down"));
++
++    consumer.consume(record(KEY, value("abc123", "news.example.org")));
++    consumer.consume(record(KEY, value("abc123", "news.example.org")));
++    consumer.consume(record(KEY, value("abc123", "news.example.org")));
++    consumer.consume(record(KEY, "{\"hashed_ip\":\"" + HASH + "\"}"));
++
++    assertThat(logs.list).isNotEmpty();
++    for (ILoggingEvent line : logs.list) {
++      assertThat(line.getFormattedMessage())
++          .doesNotContain(HASH)
++          .doesNotContain("news.example.org")
++          .doesNotContain("hashed_ip\":");
++    }
++  }
++
++  /** The listener must subscribe to url.clicked in its own group and be startup-toggleable. */
++  @Test
++  void listenerAnnotationTargetsUrlClickedTopic() throws NoSuchMethodException {
++    KafkaListener annotation =
++        ClickEventConsumer.class
++            .getMethod("onMessage", ConsumerRecord.class)
++            .getAnnotation(KafkaListener.class);
++    assertThat(annotation).isNotNull();
++    assertThat(annotation.topics()).containsExactly(ClickEventProducer.TOPIC);
++    assertThat(annotation.groupId()).isEqualTo(ClickEventConsumer.GROUP_ID);
++    assertThat(annotation.id()).isEqualTo(ClickEventConsumer.LISTENER_ID);
++    assertThat(annotation.autoStartup()).contains("analytics.consumer.auto-startup");
++  }
++
++  /** onMessage delegates to consume. */
++  @Test
++  void onMessageDelegatesToConsume() {
++    when(aggregator.apply(any())).thenReturn(ClickStatsAggregator.Outcome.APPLIED);
++
++    consumer.onMessage(record(KEY, value("abc123", null)));
++
++    verify(aggregator, times(1)).apply(any());
++    assertThat(metrics.appliedCount()).isEqualTo(1);
++  }
++
++  /** Constructor arguments are mandatory. */
++  @Test
++  void rejectsNullCollaborators() {
++    ObjectMapper mapper = new ObjectMapper();
++    assertThatThrownBy(() -> new ClickEventConsumer(null, retryExecutor, metrics, mapper))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickEventConsumer(aggregator, null, metrics, mapper))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickEventConsumer(aggregator, retryExecutor, null, mapper))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new ClickEventConsumer(aggregator, retryExecutor, metrics, null))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> consumer.consume(null)).isInstanceOf(NullPointerException.class);
++  }
++
++  private static ConsumerRecord<String, String> record(String idempotencyKey, String value) {
++    ConsumerRecord<String, String> record =
++        new ConsumerRecord<>(ClickEventProducer.TOPIC, 0, 7L, "abc123", value);
++    record
++        .headers()
++        .add(
++            ClickEventProducer.HEADER_IDEMPOTENCY_KEY,
++            idempotencyKey.getBytes(StandardCharsets.UTF_8));
++    return record;
++  }
++
++  private static String value(String shortCode, String referrerHost) {
++    return "{\"short_code\":\""
++        + shortCode
++        + "\",\"occurred_at\":\""
++        + OCCURRED
++        + "\",\"hashed_ip\":\""
++        + HASH
++        + "\",\"referrer_host\":"
++        + (referrerHost == null ? "null" : "\"" + referrerHost + "\"")
++        + "}";
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/consumer/ConsumerMetricsTest.java b/src/test/java/com/example/shortener/analytics/consumer/ConsumerMetricsTest.java
+new file mode 100644
+index 0000000..3b7cf84
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/consumer/ConsumerMetricsTest.java
+@@ -0,0 +1,36 @@
++/*
++ * ConsumerMetricsTest.java — the four consumer counters start at zero and count independently
++ *
++ * Layer: test (unit). No Spring context.
++ */
++package com.example.shortener.analytics.consumer;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import org.junit.jupiter.api.Test;
++
++/** Unit tests of {@link ConsumerMetrics}. */
++class ConsumerMetricsTest {
++
++  @Test
++  void countersStartAtZeroAndCountIndependently() {
++    ConsumerMetrics metrics = new ConsumerMetrics();
++    assertThat(metrics.appliedCount()).isZero();
++    assertThat(metrics.duplicateCount()).isZero();
++    assertThat(metrics.rejectedCount()).isZero();
++    assertThat(metrics.exhaustedCount()).isZero();
++
++    metrics.incrementApplied();
++    metrics.incrementApplied();
++    metrics.incrementDuplicate();
++    metrics.incrementRejected();
++    metrics.incrementExhausted();
++    metrics.incrementExhausted();
++    metrics.incrementExhausted();
++
++    assertThat(metrics.appliedCount()).isEqualTo(2);
++    assertThat(metrics.duplicateCount()).isEqualTo(1);
++    assertThat(metrics.rejectedCount()).isEqualTo(1);
++    assertThat(metrics.exhaustedCount()).isEqualTo(3);
++  }
++}

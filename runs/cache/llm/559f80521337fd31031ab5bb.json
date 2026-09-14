@@ -1,0 +1,138 @@
+{
+  "schema": "SecurityFindings",
+  "output": {
+    "findings": [
+      {
+        "id": "SEC-001",
+        "severity": "high",
+        "area": "authorization",
+        "description": "GET /api/v1/urls/{short_code}/stats is specified only as 'reuses the existing /api/v1 auth scheme'. The design's ClickStatsQueryService performs an existence check but no ownership/tenancy check, so any authenticated caller (or any holder of any valid token) can read the click history of any short code - an IDOR on link-owner data (US-1/US-3 name the 'link owner' as the data subject).",
+        "requirement": "The stats endpoint MUST apply exactly the same authorization predicate as the pre-existing getShortUrl operation, including any owner/tenant scoping, and MUST return the same status (404, not 403) for codes the caller may not see so it is not an existence oracle. If the existing /api/v1 scheme has no ownership concept, this is an ambiguity to be answered before implementation (authorization model for per-link analytics) - do not invent one."
+      },
+      {
+        "id": "SEC-002",
+        "severity": "high",
+        "area": "pii / cryptography",
+        "description": "hashed_ip is SHA-256 over a single static salt concatenated with the client IP. The IPv4 space is ~2^32, so once the salt is known (or brute-forced/leaked from config, heap dump, or a backup) every hashed_ip is reversible by exhaustive precomputation; plain concatenation also invites length-extension/ordering mistakes. Salt rotation is an explicit non-goal, so the control must be strong at first write.",
+        "requirement": "Implement the digest as HMAC-SHA256(key=salt, message=normalised client IP) or SHA-256(salt || 0x00 || ip) with the salt being a >=32-byte high-entropy secret injected at runtime from the existing secret mechanism (env/secret store), never a literal in application.yml, Flyway scripts, tests, or fixtures. IpHasher MUST hold the salt in a non-printable wrapper (no toString/equals leakage), MUST NOT log input or output, and the non-rotatable static salt plus residual re-identification risk MUST be recorded as an accepted risk with DPO sign-off referenced by AC-10/US-4."
+      },
+      {
+        "id": "SEC-003",
+        "severity": "high",
+        "area": "input validation / untrusted deserialization",
+        "description": "ClickEventConsumer deserialises JSON from the url.clicked topic. If the JSON deserialiser is configured with default/polymorphic typing or without trusted-package restrictions, a crafted or replayed message from any principal with produce rights becomes a deserialization gadget; without field validation, a hostile or buggy producer can inject over-long short_code/referrer_host, non-hex hashed_ip, or occurred_at values far in the past/future that pollute click_stats_daily buckets and the 30-day window.",
+        "requirement": "Configure the Kafka JSON deserialiser with an explicit target type and TRUSTED_PACKAGES restricted to the analytics wire package, disable default/polymorphic typing, and enable ErrorHandlingDeserializer so a poison payload is logged+metered, not retried forever. Validate every consumed ClickEventMessage before aggregation: short_code matches ^[A-Za-z0-9_-]{1,64}$, hashed_ip is null or ^[0-9a-f]{64}$, referrer_host <=255 chars with no control characters, idempotency_key is a valid UUID, schema_version is known, and occurred_at is within a configured sane window (e.g. not in the future beyond clock skew, not older than retention.days); invalid messages are rejected to the terminal logged/metered state without touching aggregates."
+      },
+      {
+        "id": "SEC-004",
+        "severity": "high",
+        "area": "secret handling / transport security",
+        "description": "AnalyticsKafkaConfig introduces broker connectivity but the design does not state transport security or credential sourcing for producer and consumer, nor topic ACLs. Plaintext PLAINTEXT bootstrap or credentials committed to application properties would expose click events (hashed IPs, referrer hosts, short codes) on the wire and allow any network peer to produce forged url.clicked events.",
+        "requirement": "Producer and consumer MUST use TLS (SSL/SASL_SSL) with hostname verification enabled and credentials/keystore passwords resolved from the existing secret mechanism only (no literals, no secrets in git, no secrets in Flyway/tests/CI logs). Request the infrastructure-owned topic ACLs so only this service's principal may produce to and consume from url.clicked with a dedicated consumer group; document that the topic and ACLs are infra-owned (spec non-goal) but that the service will fail closed if credentials are absent."
+      },
+      {
+        "id": "SEC-005",
+        "severity": "high",
+        "area": "pii / retention",
+        "description": "The retention purge intentionally excludes PENDING click_outbox rows. If the broker is unavailable or rows are stuck (attempts not yet exhausted, poller disabled), raw click rows containing hashed_ip and referrer_host can persist indefinitely, breaching the 90-day raw-event retention promise in US-4/AC-12. FAILED rows keep a last_error string that can absorb driver/broker messages containing host or network identifiers.",
+        "requirement": "Bound the lifetime of every raw row: PENDING rows older than a configured max-age MUST be transitioned to FAILED (logged and metered) so the 90-day purge can collect them, and the purge MUST guarantee no click_outbox or processed_click_event row survives beyond analytics.retention.days regardless of status; add a metric/alert for oldest PENDING age. last_error MUST be sanitised (allow-listed exception type + safe message, control characters stripped) before truncation to 512 chars and MUST never contain an IP, header value, connection string, or credential."
+      },
+      {
+        "id": "SEC-006",
+        "severity": "medium",
+        "area": "input validation / client identity",
+        "description": "The client IP used for hashing on an unauthenticated public endpoint is typically taken from X-Forwarded-For/Forwarded, which is attacker-controlled unless the proxy chain is trusted. An untrusted source lets a caller fabricate or pollute hashed_ip values and, worse, smuggle arbitrary text (including CRLF) into the hashing/logging path.",
+        "requirement": "Derive the client IP only via the framework's forwarded-headers support restricted to a configured trusted-proxy list (or the socket remote address when no trusted proxy is configured); parse the value as an InetAddress and treat unparsable input as unavailable (hashed_ip = NULL) rather than hashing raw header text. The raw address MUST NOT be returned, stored, or logged anywhere outside IpHasher, per the stated layering rule."
+      },
+      {
+        "id": "SEC-007",
+        "severity": "medium",
+        "area": "input validation / stored untrusted data",
+        "description": "referrer_host is derived from the attacker-controlled Referer header and persisted (VARCHAR(255)) and republished. Without normalisation, values may contain userinfo, punycode/IDN homographs, embedded credentials (user:pass@host), uppercase/trailing-dot variants that fragment aggregates, control characters enabling log injection, or oversize input causing insert failures on the redirect path.",
+        "requirement": "ReferrerHostExtractor MUST parse with java.net.URI, take the host component only (dropping scheme, userinfo, port, path, query, fragment), lowercase it, strip a trailing dot, reject values containing characters outside [a-z0-9.:-] or longer than 255 chars by returning null, and never throw to the caller. AC-11 tests MUST include userinfo, IDN/punycode, CRLF, oversize, and unparsable inputs."
+      },
+      {
+        "id": "SEC-008",
+        "severity": "medium",
+        "area": "availability / rate limiting",
+        "description": "Every unauthenticated GET /{short_code} now performs an additional INSERT, so an attacker hammering one or many short codes converts a cheap read into sustained write amplification: outbox growth, WAL/disk pressure, poller backlog, Kafka volume, and connection-pool contention that can breach the 5% p95 budget (AC-13) and degrade the existing redirect SLO. The new stats endpoint is also an unbounded read of a 30-day window.",
+        "requirement": "Apply rate limiting / throttling: reuse or add per-client (trusted-IP-derived or token-based) rate limits on GET /{short_code} and on GET /api/v1/urls/{short_code}/stats, plus a hard configured ceiling on outbox backlog size or insert rate with a fail-open-for-redirect / drop-analytics behaviour (analytics loss must never turn into a redirect error). Bound poller batch size, retention purge batch size, scheduler pool size, and consumer max.poll.records via validated @ConfigurationProperties (positive, capped) and document the resulting worst-case DB/Kafka load."
+      },
+      {
+        "id": "SEC-009",
+        "severity": "medium",
+        "area": "availability / brownfield regression",
+        "description": "ClickEventRecorder runs inside the redirect's transaction and 'swallows and logs' its own failures. In Spring/JPA, a failed statement or a swallowed exception in a participating transaction marks it rollback-only, so the swallow does not protect the caller: the redirect can fail with 500 (or a UnexpectedRollbackException) on an analytics-only error, violating AC-3/AC-14 and turning a database hiccup into a user-facing outage on the existing contract.",
+        "requirement": "Guarantee that no analytics failure can change the redirect outcome: either execute the outbox insert so that its failure cannot poison the caller's transaction (e.g. a clearly bounded strategy verified by test) or establish the behaviour by an explicit test that injects an insert failure and asserts the redirect still returns its normal status and Location header. The chosen transactional strategy MUST be stated and covered by tests; a design revision is required if the same-transaction requirement of AC-1 and this isolation requirement cannot both be met."
+      },
+      {
+        "id": "SEC-010",
+        "severity": "medium",
+        "area": "logging hygiene",
+        "description": "New components log retries, terminal failures, purge counts, and consumer errors. Attacker-controlled values (short_code, referrer_host, Referer, idempotency key) reaching log statements unescaped permit log injection/forging of log lines, and any accidental logging of the client IP, the salt, the hashed_ip, or broker credentials breaches AC-10 and US-4.",
+        "requirement": "Establish logging hygiene rules and enforce them: never log raw client IP, the salt, Kafka credentials, full event payloads, or Authorization headers; log short_code and referrer_host only after control-character stripping/encoding; log counts and identifiers (idempotency key, outbox id) rather than payloads; keep exception messages sanitised as in SEC-005. Add an automated check (architecture/unit test or static rule) asserting that no analytics class other than IpHasher references a remote-address/InetAddress value and that no log statement interpolates the raw Referer header, satisfying the stated layering rule and AC-10."
+      },
+      {
+        "id": "SEC-011",
+        "severity": "medium",
+        "area": "sql / data integrity",
+        "description": "The design specifies native SQL for the SKIP LOCKED claim, the ON CONFLICT upserts, and the batched retention deletes, with :batchSize/:cutoff/:shortCode placeholders. Any string concatenation of batch size, cutoff, short code, or ordering into these statements is an injection vector reachable from consumer input (short_code) and configuration. Additionally, the hashed_ip format CHECK constraint listed in the table definition is missing from the actual migration body, so a malformed or non-hex value (e.g. a raw IP) could be persisted undetected.",
+        "requirement": "All native queries MUST use bound parameters exclusively (including LIMIT via parameter or a validated integer property) with no string interpolation of any request-, message-, or config-derived value. Add the missing defence-in-depth constraint ck_click_outbox_hashed_ip CHECK (hashed_ip IS NULL OR hashed_ip ~ '^[0-9a-f]{64}$') to the forward migration so the database itself rejects any non-hash value in the IP column, and assert it with a migration test."
+      },
+      {
+        "id": "SEC-012",
+        "severity": "medium",
+        "area": "dependency policy",
+        "description": "The change introduces new runtime dependencies (spring-kafka / kafka-clients, JSON serialisation, metrics) into a brownfield service. Unpinned, transitively upgraded, or vulnerable versions (notably Jackson and Kafka client CVEs) would be a supply-chain regression, and new test infrastructure (embedded Kafka / Testcontainers images) adds untrusted image pulls.",
+        "requirement": "Add dependencies only through the existing Spring Boot/managed BOM with pinned, non-SNAPSHOT versions; run the project's SCA/vulnerability gate (e.g. dependency-check/OWASP or equivalent already in the build) and fail the build on new High/Critical findings; pin any test container images by digest or explicit version tag; record a license check for each added artifact and list the exact added coordinates in the PR for dependency approval."
+      },
+      {
+        "id": "SEC-013",
+        "severity": "low",
+        "area": "observability / resource exhaustion",
+        "description": "AnalyticsMetrics exposes counters, timers, and an outbox backlog gauge. Tagging any metric with short_code, referrer_host, or idempotency key creates unbounded label cardinality driven by unauthenticated traffic - a memory-exhaustion DoS on the application and the metrics backend - and also publishes per-link usage data on a potentially less-protected endpoint.",
+        "requirement": "Metrics MUST use only bounded, low-cardinality tags (outcome, status, topic, job); no short_code, referrer_host, hashed_ip, idempotency key, or exception message may appear as a tag or metric name, matching the design's 'emits no payload fields' statement. Confirm the actuator/metrics endpoints remain exposed exactly as before (no new unauthenticated actuator surface) and that the new stats data is not readable via metrics."
+      },
+      {
+        "id": "SEC-014",
+        "severity": "low",
+        "area": "replay / idempotency",
+        "description": "The idempotency key is a random per-redirect UUID carried in a Kafka header while the consumer dedupes on the message body's idempotency_key. A mismatch between header and body, or a producer that re-uses/forges a key, lets an actor with produce rights suppress legitimate clicks (by pre-inserting a key) or bypass dedupe (by varying the key), and processed_click_event purge at 90 days re-opens a replay window for older events.",
+        "requirement": "Define one authoritative source for the dedupe key (body field), validate that the header and body agree and reject the message to the terminal logged/metered state when they do not, and rely on the unique-insert-first guard for AC-6. Combine the replay guard with the occurred_at sanity window of SEC-003 so events older than the retention cutoff (whose dedupe ledger row may already be purged) cannot be replayed into aggregates."
+      },
+      {
+        "id": "SEC-015",
+        "severity": "low",
+        "area": "privacy governance",
+        "description": "Salted hashed IPs remain personal data under GDPR-style regimes, click_stats aggregates are retained indefinitely, and salt rotation / historical re-hashing is an explicit non-goal. There is no stated handling for data-subject erasure or for the privacy assessment of the new processing purpose.",
+        "requirement": "Before release, obtain DPO acknowledgement (referencing US-4/AC-10/AC-12) that: hashed_ip is treated as pseudonymised personal data with 90-day retention, click_stats/click_stats_daily contain only non-identifying counters and are retained indefinitely, no salt rotation is performed in this release, and any erasure or salt-rotation obligation is tracked as follow-up work rather than silently out of scope."
+      }
+    ],
+    "required_controls": [
+      "Input validation: validate short_code against ^[A-Za-z0-9_-]{1,64}$ at the controller boundary; validate every consumed ClickEventMessage field (short_code pattern, hashed_ip 64-hex or null, UUID key, known schema_version, referrer_host <=255 chars without control characters, occurred_at inside a configured skew/retention window); normalise and constrain referrer host (host-only, lowercase, no userinfo/port/path/query, allow-listed character set); parse client IP as InetAddress or treat as unavailable; validate all @ConfigurationProperties (positive, capped batch sizes, intervals, attempts, timeouts, retention days) with fail-fast startup binding.",
+      "Rate limiting and backpressure: per-client throttling on the public redirect and on the new stats endpoint; hard caps on outbox claim batch size, consumer max.poll.records, retention purge batch size, and the dedicated analytics scheduler/executor pool; bounded per-attempt Kafka timeouts and bounded total attempts (no infinite producer retries); an outbox backlog ceiling with analytics-drop-before-redirect-degradation behaviour; separate/limited DB connection usage so analytics jobs cannot starve the redirect path.",
+      "Secret handling: IP salt and all Kafka credentials/keystore passwords resolved at runtime from the existing secret mechanism; no secrets, salts, or bootstrap credentials in application.yml defaults, Flyway scripts, test fixtures, docker-compose, or CI logs; salt held in a non-printable wrapper with no getter/toString exposure; fail-closed startup when the salt or broker credentials are missing; TLS with hostname verification for broker connections.",
+      "PII handling: raw client IP never stored, returned, logged, or passed outside IpHasher; HMAC-SHA256 (or salt-delimited SHA-256) with a >=32-byte secret salt; DB CHECK constraint enforcing hex-digest format on hashed_ip; stats API exposes no hashed_ip or referrer data; raw rows (click_outbox, processed_click_event) bounded to 90 days for all statuses including stuck PENDING; aggregates limited to non-identifying counters; documented DPO acceptance of the static-salt and indefinite-aggregate decisions.",
+      "Logging hygiene: no raw IP, salt, credentials, Authorization header, or full event payload in any log or error field; control-character stripping/encoding for short_code, referrer_host, and exception text before interpolation; sanitised and truncated last_error; retention and poller jobs log counts and identifiers only; automated architecture/static test enforcing the 'no raw IP outside IpHasher' and 'no raw Referer in logs' rules; error responses only via the existing global problem+json handler so no internal detail leaks.",
+      "Dependency policy: new dependencies only via the managed Boot/Kafka BOM with pinned non-SNAPSHOT versions; SCA/CVE gate failing the build on new High/Critical vulnerabilities; license check and explicit PR listing of added coordinates; test container/embedded-broker images pinned; ErrorHandlingDeserializer plus TRUSTED_PACKAGES and no default/polymorphic typing for JSON deserialisation."
+    ],
+    "high_impact_actions_expected": [
+      "Adding new runtime dependencies (spring-kafka/kafka-clients, JSON serialisation, metrics registry) to the existing build - dependency approval expected.",
+      "Creating and applying a forward-only Flyway migration that adds click_outbox, click_stats, click_stats_daily, processed_click_event plus indexes and CHECK constraints to the production database schema (expand-only, no ALTERs on existing tables) - schema change approval expected.",
+      "Provisioning a new long-lived secret (the >=32-byte IP hashing salt) in the existing secret store and wiring it as a required, fail-closed startup property - secret creation/handling approval expected.",
+      "Requesting infrastructure-owned Kafka assets: url.clicked topic access, a dedicated consumer group, produce/consume ACLs for the service principal, and TLS/SASL credentials - external infrastructure change approval expected.",
+      "Modifying the pre-existing RedirectService/RedirectController hot path (the public, unauthenticated redirect) to invoke the recorder inside the existing transaction - brownfield behaviour-change approval expected, gated by the unchanged contract test suite and the 5% p95 load-test gate.",
+      "Touching security configuration to bring GET /api/v1/urls/{short_code}/stats under the existing auth scheme and to add the owner/tenant authorization predicate - authorization model change approval expected (and an ambiguity answer if the existing scheme has no ownership concept).",
+      "Enabling forwarded-header handling / trusted-proxy configuration so the client IP used for hashing is not attacker-controlled - request-pipeline configuration approval expected.",
+      "Enabling Spring scheduling with a new dedicated bounded TaskScheduler/executor and two @Scheduled jobs (outbox poller, retention purge) that run continuously in every application instance, including a bulk DELETE job against production data - background-job and data-deletion approval expected.",
+      "Introducing rate limiting/throttling on the public redirect endpoint and the new stats endpoint, which can change observable behaviour for existing clients (429s) - contract-impact approval expected.",
+      "Adding the automated load-test gate and the committed openapi.yaml reconciliation to CI, including failing the build on p95 regression or contract drift - pipeline change approval expected.",
+      "Recording accepted risks with sign-off: non-rotatable static salt with residual IP re-identification risk, indefinite retention of click_stats aggregates, and eventual-consistency of the stats endpoint."
+    ]
+  },
+  "usage": {
+    "tokens_in": 24176,
+    "tokens_out": 9148,
+    "cost_usd": 0.34958
+  }
+}

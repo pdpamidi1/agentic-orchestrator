@@ -78,17 +78,38 @@ class OpenApiContractIT extends AbstractIntegrationTest {
 
   /**
    * Given only the committed document, when inspected, then it describes exactly {@code POST
-   * /api/v1/urls} ({@code createShortUrl}: 201 JSON, 400/409/500 problem+json, JSON request body)
-   * and {@code GET /{short_code}} ({@code redirectToLongUrl}: 302 with Location and Cache-Control
-   * headers and no body, 404/410/500 problem+json), and the three component schemas carry the
-   * contract's snake_case property names. This pins the README's endpoint tables independently of
-   * what springdoc happens to generate.
+   * /api/v1/urls} ({@code createShortUrl}: 201 JSON, 400/409/500 problem+json, JSON request body),
+   * {@code GET /{short_code}} ({@code redirectToLongUrl}: 302 with Location and Cache-Control
+   * headers and no body, 404/410/500 problem+json) and the additive {@code GET
+   * /api/v1/urls/{short_code}/stats} ({@code getUrlClickStats}: 200 JSON, 404/500 problem+json,
+   * {@code short_code} path parameter), and the component schemas carry the contract's snake_case
+   * property names. This pins the README's endpoint tables independently of what springdoc happens
+   * to generate.
    */
   @Test
-  void committedDocumentDescribesExactlyTheTwoOperations() {
+  void committedDocumentDescribesExactlyTheThreeOperations() {
     Map<String, Object> paths = map(committedDocument().get("paths"));
 
-    assertThat(paths.keySet()).containsExactlyInAnyOrder("/api/v1/urls", "/{short_code}");
+    assertThat(paths.keySet())
+        .containsExactlyInAnyOrder(
+            "/api/v1/urls", "/{short_code}", "/api/v1/urls/{short_code}/stats");
+
+    Map<String, Object> statsItem = map(paths.get("/api/v1/urls/{short_code}/stats"));
+    Map<String, Object> statsOp = map(statsItem.get("get"));
+    assertThat(statsItem.keySet()).containsExactly("get");
+    assertThat(statsOp.get("operationId")).isEqualTo("getUrlClickStats");
+    assertThat(statsOp).doesNotContainKey("requestBody");
+    assertThat(parameterNames(statsOp.get("parameters")))
+        .containsExactly("path:short_code:required=true");
+    assertThat(map(statsOp.get("responses")).keySet())
+        .containsExactlyInAnyOrder("200", "404", "500");
+    assertThat(map(map(map(statsOp.get("responses")).get("200")).get("content")).keySet())
+        .containsExactly("application/json");
+    for (String status : List.of("404", "500")) {
+      assertThat(map(map(map(statsOp.get("responses")).get(status)).get("content")).keySet())
+          .as("getUrlClickStats %s", status)
+          .containsExactly("application/problem+json");
+    }
 
     Map<String, Object> create = map(map(paths.get("/api/v1/urls")).get("post"));
     assertThat(map(paths.get("/api/v1/urls")).keySet()).containsExactly("post");
@@ -127,6 +148,10 @@ class OpenApiContractIT extends AbstractIntegrationTest {
         .containsExactlyInAnyOrder(
             "short_url", "short_code", "long_url", "expires_at", "code_source");
     assertThat(schemas).containsKey("ProblemDetail");
+    assertThat(map(map(schemas.get("ClickStatsResponse")).get("properties")).keySet())
+        .containsExactlyInAnyOrder("total_clicks", "last_clicked_at", "as_of", "clicks_by_day");
+    assertThat(map(map(schemas.get("ClickStatsDayEntry")).get("properties")).keySet())
+        .containsExactlyInAnyOrder("date", "count");
   }
 
   // ---------------------------------------------------------------------------------------------

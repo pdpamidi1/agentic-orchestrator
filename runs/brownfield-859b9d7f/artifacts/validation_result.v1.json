@@ -1,0 +1,96 @@
+{
+  "task_id": "validation",
+  "attempt": 1,
+  "gates": [
+    {
+      "gate_id": "scope",
+      "required": true,
+      "status": "FAILED",
+      "took_seconds": 0.483,
+      "findings": [
+        {
+          "file": ".github/workflows/ci.yml",
+          "line": null,
+          "rule": "change_control.protected_path",
+          "message": "requires human approval: release.config",
+          "suggested_fix": null
+        },
+        {
+          "file": "Dockerfile",
+          "line": null,
+          "rule": "change_control.protected_path",
+          "message": "requires human approval: infrastructure.change",
+          "suggested_fix": null
+        }
+      ],
+      "stdout_tail": ""
+    },
+    {
+      "gate_id": "integration",
+      "required": true,
+      "status": "FAILED",
+      "took_seconds": 70.745,
+      "findings": [
+        {
+          "file": null,
+          "line": null,
+          "rule": "gate.integration",
+          "message": "exit 137",
+          "suggested_fix": "see stdout_tail"
+        }
+      ],
+      "stdout_tail": "s.invokeMethodWithArray(ReflectionUtils.java:125)\n\tat org.apache.maven.surefire.junitplatform.LauncherAdapter.executeWithCancellationToken(LauncherAdapter.java:68)\n\tat org.apache.maven.surefire.junitplatform.LauncherAdapter.execute(LauncherAdapter.java:54)\n\tat org.apache.maven.surefire.junitplatform.JUnitPlatformProvider.execute(JUnitPlatformProvider.java:203)\n\tat org.apache.maven.surefire.junitplatform.JUnitPlatformProvider.invokeAllTests(JUnitPlatformProvider.java:168)\n\tat org.apache.maven.surefire.junitplatform.JUnitPlatformProvider.invoke(JUnitPlatformProvider.java:136)\n\tat org.apache.maven.surefire.booter.ForkedBooter.runSuitesInProcess(ForkedBooter.java:385)\n\tat org.apache.maven.surefire.booter.ForkedBooter.execute(ForkedBooter.java:162)\n\tat org.apache.maven.surefire.booter.ForkedBooter.run(ForkedBooter.java:507)\n\tat org.apache.maven.surefire.booter.ForkedBooter.main(ForkedBooter.java:495)\n14:10:21.275 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.282 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.282 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 0 ms\n14:10:21.297 [main] WARN com.example.shortener.read.RedirectController -- Click recording is disabled: no ClickEventRecorder is wired\n14:10:21.367 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.369 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.370 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 1 ms\n14:10:21.452 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.452 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.458 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 6 ms\n14:10:21.599 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.599 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.599 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 0 ms\n14:10:21.636 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.637 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.638 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 1 ms\n14:10:21.712 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.712 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.713 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 1 ms\n14:10:21.861 [main] WARN com.example.shortener.read.RedirectController -- Click recording is disabled: no ClickEventRecorder is wired\n14:10:21.992 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.992 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.994 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 2 ms\n14:10:22.142 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:22.143 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:22.154 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 3 ms\nKilled\n"
+    },
+    {
+      "gate_id": "acceptance",
+      "required": false,
+      "status": "WARNED",
+      "took_seconds": 0.0,
+      "findings": [
+        {
+          "file": null,
+          "line": null,
+          "rule": "acceptance.AC-1",
+          "message": "ClickEventRecorder + V2__click_analytics.sql create the row with idempotency_key/short_code/occurred_at/hashed_ip/referrer_host and RedirectClickRecordingIT/RedirectClickRecordingTest cover it, but the T3 note states the insert runs in \"ClickEventRecorder's own @Transactional write transaction ... UrlReadService (not in allowed files) keeps its read-only lookup transaction\". The AC requires the row to be committed in the same transaction as redirect handling; as implemented it is a separate transaction, so atomicity with redirect handling is not demonstrated by any test.",
+          "suggested_fix": null
+        },
+        {
+          "file": null,
+          "line": null,
+          "rule": "acceptance.AC-3",
+          "message": "No-Kafka-on-request-path is evidenced by T3 note and RedirectClickRecordingTest, but the planned proof (T8 class <base>.analytics.it.KafkaUnavailableRedirectIT) is absent from files_changed/tests_added, so \"redirect unchanged with broker down and event stays PENDING\" is unverified.",
+          "suggested_fix": null
+        },
+        {
+          "file": null,
+          "line": null,
+          "rule": "acceptance.AC-8",
+          "message": "T7 was not delivered: no commit for T7 and no src/main/java/com/example/shortener/analytics/api/** (ClickStatsController/ClickStatsResponse/ClickStatsQueryService) or tests in files_changed.",
+          "suggested_fix": null
+        },
+        {
+          "file": null,
+          "line": null,
+          "rule": "acceptance.AC-9",
+          "message": "No stats endpoint exists (no analytics/api package, no MockMvc test for 404) in the changeset.",
+          "suggested_fix": null
+        },
+        {
+          "file": null,
+          "line": null,
+          "rule": "acceptance.AC-13",
+          "message": "Planned RedirectLatencyBudgetIT (T8) and the CI gate (.github/workflows/ci.yml) are absent; no baseline or p95 comparison artifact in the changeset.",
+          "suggested_fix": null
+        },
+        {
+          "file": null,
+          "line": null,
+          "rule": "acceptance.AC-15",
+          "message": "as_of semantics live in ClickStatsQueryService/ClickStatsResponse (T7), which are not present in files_changed; no test covers published-but-unconsumed eventual consistency.",
+          "suggested_fix": null
+        }
+      ],
+      "stdout_tail": ""
+    }
+  ]
+}

@@ -1,0 +1,121 @@
+{
+  "schema": "Impact",
+  "output": {
+    "run_id": "brownfield-36dc2247",
+    "impacted_packages": [
+      "com.example.shortener",
+      "com.example.shortener.config",
+      "com.example.shortener.domain",
+      "com.example.shortener.read",
+      "com.example.shortener.write",
+      "com.example.shortener.api.dto",
+      "com.example.shortener.api.error",
+      "com.example.shortener.it"
+    ],
+    "new_packages": [
+      "com.example.shortener.analytics",
+      "com.example.shortener.analytics.domain",
+      "com.example.shortener.analytics.outbox",
+      "com.example.shortener.analytics.publisher",
+      "com.example.shortener.analytics.consumer",
+      "com.example.shortener.analytics.api",
+      "com.example.shortener.analytics.api.dto",
+      "com.example.shortener.analytics.config",
+      "com.example.shortener.analytics.privacy",
+      "com.example.shortener.analytics.retention"
+    ],
+    "impacted_endpoints": [
+      "GET /{short_code} (HOT PATH, PUBLIC CONTRACT - existing redirect served by com.example.shortener.read; not enumerated in repo map endpoint list, so its exact handler location must be confirmed before wiring the outbox write into its transaction)",
+      "GET /api/v1/urls/{short_code}/stats (NEW, additive; owned by com.example.shortener.analytics.api, must reuse existing /api/v1 auth scheme)",
+      "Existing /api/v1 URL create/read endpoints (PUBLIC CONTRACT - must remain byte-identical; not enumerated in the repo map, ambiguity for verification scope)",
+      "GET /throw/* (com.example.shortener.api.error - indirectly impacted if new analytics error types are added to the shared error/DTO mapping)"
+    ],
+    "data_flows": [
+      "GET /{short_code} request (short_code, client IP, Referer header) -> read module resolves URL in existing urls table; on successful resolution only, privacy component computes hashed_ip = SHA-256(static_salt || raw_ip) and parses Referer to referrer_host (host only, null if absent/unparsable), generates idempotency_key UUID -> INSERT one row into click_outbox in the SAME DB transaction as redirect handling -> HTTP 30x Location response returned (no Kafka call on request thread)",
+      "Scheduled in-process poller (default 500ms) -> SELECT ... FOR UPDATE SKIP LOCKED bounded batch (default 100) from click_outbox -> KafkaProducer.send to topic url.clicked, key=short_code, header=idempotency_key, bounded timeout + exponential backoff with full jitter (default 5 attempts, base 100ms, cap 10s) -> mark row PUBLISHED, or FAILED terminal state after exhaustion (logged + metered)",
+      "Kafka topic url.clicked -> analytics consumer deserializes event, dedupes on idempotency_key (processed_event table / unique constraint) -> UPSERT aggregates: click_stats(short_code, total_clicks, last_clicked_at, updated_at) and clicks_by_day(short_code, day_utc, count) -> commit offset after DB commit",
+      "GET /api/v1/urls/{short_code}/stats (authenticated via existing /api/v1 scheme) -> validate short_code exists in urls (404 if not) -> read click_stats + clicks_by_day for trailing 30 UTC days -> StatsResponse DTO {total_clicks, last_clicked_at, as_of=click_stats.updated_at, clicks_by_day:[{date,count}] sparse} -> 200 JSON",
+      "Retention job (in-process scheduler, configurable interval/batch) -> DELETE raw click event/outbox rows WHERE occurred_at < now-90d in bounded batches -> aggregates in click_stats/clicks_by_day untouched",
+      "Application properties/secret store -> analytics config (salt, retry bounds, poller cadence/batch, Kafka bootstrap, feature flag) -> injected into privacy hasher, publisher, consumer, retention job"
+    ],
+    "risks": [
+      {
+        "id": "R-1",
+        "description": "HOT PATH: adding a synchronous outbox INSERT into the redirect transaction increases p95 latency of GET /{short_code} beyond the 5% budget (AC-13), and makes the redirect path newly dependent on a write to the primary DB (previously possibly read-only/cacheable).",
+        "likelihood": "high",
+        "severity": "high",
+        "mitigation": "Keep the insert to a single prepared INSERT with no extra round trips; no Kafka, DNS, or network calls on the request thread; index the outbox only as needed for the poller claim query; put analytics behind a kill-switch feature flag that skips the insert; benchmark with connection-pool sizing reviewed for the added write load.",
+        "detection": "Automated CI load-test gate comparing p95 of GET /{short_code} against the recorded pre-change baseline (fails build at >5%); per-endpoint latency histograms and DB write-latency/pool-saturation dashboards and alerts post-deploy."
+      },
+      {
+        "id": "R-2",
+        "description": "MIGRATION: new tables (click_outbox/raw click events, click_stats, clicks_by_day, processed idempotency keys) are added to the same database that currently only has `urls`; a long-running or locking DDL, or a migration that runs against the live shortener schema, can cause downtime for the existing redirect path.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Additive-only, forward-compatible migrations in the existing migration tool; CREATE TABLE only, no ALTER of `urls`; create indexes concurrently where the engine supports it; rehearse on a production-sized copy; ensure code tolerates running before the migration (feature flag off by default).",
+        "detection": "Migration dry-run and timing in CI/staging; migration duration and lock-wait metrics; smoke test of GET /{short_code} immediately after migration in the deploy pipeline."
+      },
+      {
+        "id": "R-3",
+        "description": "DEPENDENCY: introducing a Kafka client / spring-kafka (and possibly a retry/resilience library) adds new transitive dependencies that may conflict with existing versions, enlarge the artifact, and add startup-time broker connectivity that can block application boot if the broker is unreachable.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Pin versions via the existing BOM/dependency management; run a dependency-convergence and CVE scan; configure the producer/consumer to start lazily and non-fatally (no fail-fast on missing broker); keep analytics wiring in its own auto-configuration guarded by a property.",
+        "detection": "Build-time dependency convergence + SCA scan; container startup health check and readiness probe test with the broker intentionally unavailable in an integration test."
+      },
+      {
+        "id": "R-4",
+        "description": "PUBLIC CONTRACT: refactoring the redirect handler or shared DTO/error packages to accommodate analytics accidentally alters existing /{short_code} or /api/v1 response bodies, status codes, or headers (AC-14).",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Additive-only changes; do not modify existing DTOs in com.example.shortener.api.dto or the error mapping in com.example.shortener.api.error; new stats DTOs live in the analytics package; run the existing contract test suite unmodified as a merge gate.",
+        "detection": "Unmodified existing contract/integration tests in com.example.shortener.it plus an OpenAPI/response-schema diff check in CI."
+      },
+      {
+        "id": "R-5",
+        "description": "Outbox poller under multi-instance deployment double-publishes or starves: incorrect SKIP LOCKED usage, transaction scope, or a poller batch that outpaces publish throughput causes duplicate events or unbounded outbox growth.",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Claim-and-mark within one transaction using SELECT ... FOR UPDATE SKIP LOCKED with a bounded batch; carry an idempotency key end-to-end so duplicates are absorbed by the consumer (AC-6); bounded retries with terminal FAILED state; configurable cadence/batch (AMB-18).",
+        "detection": "Metrics for outbox pending depth, oldest-pending age, publish attempts/failures, and duplicate-key rejections at the consumer; alert on pending depth or lag growth; multi-instance concurrency integration test."
+      },
+      {
+        "id": "R-6",
+        "description": "PRIVACY: a raw client IP leaks into the outbox payload, Kafka message, click_stats, exception messages, or access/debug logs (AC-10), breaching the DPO requirement.",
+        "likelihood": "medium",
+        "severity": "high",
+        "mitigation": "Hash at the very edge of the redirect handler so the raw IP never enters any analytics object or DTO; no toString/logging of the request object in analytics code; salt read from the existing secret mechanism and excluded from logs and from error payloads.",
+        "detection": "Unit tests asserting the event/DTO contains only a 64-hex hash; an automated log-scanning test that runs a redirect with a known IP and greps captured logs and DB rows for that literal; static analysis rule banning raw remote-address use outside the hashing component."
+      },
+      {
+        "id": "R-7",
+        "description": "Consumer idempotency/aggregation defects: non-atomic upserts, at-least-once redelivery, or non-UTC day bucketing produce inflated totals or wrong daily breakdowns (AC-6, AC-7).",
+        "likelihood": "medium",
+        "severity": "medium",
+        "mitigation": "Unique constraint on idempotency_key with insert-then-aggregate in a single transaction; commit Kafka offsets only after the DB commit; force UTC explicitly in bucketing rather than relying on JVM/DB default timezone.",
+        "detection": "Integration tests replaying duplicate and out-of-order events; reconciliation job comparing sum(clicks_by_day) to total_clicks; consumer lag and error-rate metrics."
+      },
+      {
+        "id": "R-8",
+        "description": "Retention/purge job deletes too much or too slowly: an unbatched 90-day DELETE locks tables on the hot-path database or the job accidentally touches click_stats aggregates (AC-12).",
+        "likelihood": "low",
+        "severity": "medium",
+        "mitigation": "Bounded batch deletes with configurable size and inter-batch pause, scoped strictly to raw event/outbox tables; run off-peak; guard with an explicit table allow-list.",
+        "detection": "Row-count metrics before/after each purge run, aggregate row-count invariant check, DB lock-wait alerting, and an integration test asserting click_stats rows are unchanged after purge."
+      },
+      {
+        "id": "R-9",
+        "description": "Unresolved ambiguities (AMB-12 through AMB-18) are implemented differently across the publisher, consumer, and API, producing inconsistent retry bounds, zero-click responses, or sparse/dense clicks_by_day semantics that surprise API consumers.",
+        "likelihood": "medium",
+        "severity": "low",
+        "mitigation": "Bind all of these to a single documented configuration class with the stated defaults; record the chosen semantics in the OpenAPI description for the stats endpoint; resolve ambiguities with the product owner before the contract is published.",
+        "detection": "API contract tests pinning the zero-click and sparse-list behaviour; configuration-binding test asserting documented defaults; review checklist item on the spec's ambiguity list."
+      }
+    ]
+  },
+  "usage": {
+    "tokens_in": 6600,
+    "tokens_out": 4183,
+    "cost_usd": 0.13758
+  }
+}

@@ -1,0 +1,764 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index b415a64..eab58bc 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -67,8 +67,13 @@ jobs:
+         run: ./mvnw -q -B test
+ 
+       # Gate: integration + contract (required) - *IT classes against Testcontainers
+-      # PostgreSQL/Redis, plus the springdoc dump written to target/openapi.{json,yaml}.
+-      - name: Integration tests and OpenAPI dump
++      # PostgreSQL/Redis/Kafka, plus the springdoc dump written to target/openapi.{json,yaml}.
++      # Includes the click-analytics end-to-end test (ClickAnalyticsEndToEndIT), the broker-down
++      # redirect test (KafkaUnavailableRedirectIT) and the latency gate (RedirectLatencyBudgetIT:
++      # p95 of GET /{short_code} may not exceed the recorded baseline by more than 5 %).
++      # The IP salt is never needed here: the tests boot on the non-secret local fallback. A
++      # deployment job would reference it as ${{ secrets.SHORTENER_ANALYTICS_IP_SALT }}.
++      - name: Integration tests, latency gate and OpenAPI dump
+         run: ./mvnw -q -B -Pit verify
+ 
+       # Gate: contract (required) - the committed document must equal what the running
+diff --git a/Dockerfile b/Dockerfile
+index 7754d46..0413537 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -12,6 +12,10 @@
+ # coordinates are injected at run time through environment variables (see README.md):
+ #   SHORTENER_DB_URL, SHORTENER_DB_USERNAME, SHORTENER_DB_PASSWORD,
+ #   SHORTENER_REDIS_HOST, SHORTENER_REDIS_PORT, SHORTENER_BASE_URL
++# Click analytics (docs/analytics.md) additionally take, at run time only:
++#   SHORTENER_KAFKA_BOOTSTRAP_SERVERS   broker of the url.clicked topic
++#   SHORTENER_ANALYTICS_IP_SALT         secret salt of the client-IP hash; supplied from the
++#                                       deployment's secret store, never baked into the image
+ #
+ # The deployment surface is selected with SPRING_PROFILES_ACTIVE:
+ #   default -> both surfaces (POST /api/v1/urls and GET /{short_code})
+diff --git a/README.md b/README.md
+index 8f13f9f..52c698b 100644
+--- a/README.md
++++ b/README.md
+@@ -199,6 +199,91 @@ environment (or your secret manager) and are never part of the image or the repo
+ Flyway runs the migrations in `src/main/resources/db/migration` on start-up; the schema is
+ `validate`d against the JPA model, never generated.
+ 
++## Click analytics
++
++Every successful redirect is counted, asynchronously and without ever storing a raw client
++address. The pipeline is a transactional outbox relayed to Kafka and aggregated by an in-process
++consumer; [`docs/analytics.md`](docs/analytics.md) is the detailed reference.
++
++```
++GET /{short_code} ──302──▶ client
++       │  same transaction as the lookup
++       ▼
++ click_outbox (PENDING)  ──OutboxPoller (scheduler thread, never a request thread)──▶  Kafka url.clicked
++                                                                                          │
++                                                             ClickEventConsumer ◀─────────┘
++                                                                     │  one transaction: processed_click_event dedupe + upserts
++                                                                     ▼
++                                                  click_stats, click_stats_daily  ──▶  GET /api/v1/urls/{short_code}/stats
++```
++
++1. **Record** (`analytics.recording`): the redirect inserts one `click_outbox` row in the same
++   transaction as the successful lookup. `404`/`410` responses insert nothing. The request thread
++   never talks to Kafka, so a slow or unavailable broker cannot delay or fail a redirect
++   (`KafkaUnavailableRedirectIT`, `RedirectLatencyBudgetIT`).
++2. **Relay** (`analytics.outbox`): a poller claims due `PENDING` rows with `FOR UPDATE SKIP LOCKED`
++   and publishes them to the `url.clicked` topic (key = short code, JSON value, `idempotency-key`
++   header) with bounded retries, exponential backoff and jitter. Rows become `PUBLISHED` on
++   acknowledgement or `FAILED` after the retry budget; several instances can relay concurrently.
++3. **Aggregate** (`analytics.consumer`, `analytics.aggregation`): the consumer dedupes on
++   `processed_click_event` and upserts `click_stats` / `click_stats_daily` in one transaction, so a
++   redelivered record is a no-op (exactly-once aggregation, `ClickAnalyticsEndToEndIT`).
++4. **Serve** (`analytics.api`): the stats endpoint below reads the aggregates.
++5. **Purge** (`analytics.retention`): a daily job deletes raw rows older than the retention period;
++   aggregates are kept.
++
++### `GET /api/v1/urls/{short_code}/stats` — `getUrlClickStats`
++
++Additive, under the existing `/api/v1` surface (registered on the default and `write` profiles,
++`404` on `read`-only instances like `POST /api/v1/urls`).
++
++```bash
++curl -s localhost:8080/api/v1/urls/100001/stats
++# 200 {"total_clicks":3,"last_clicked_at":"2026-09-14T10:15:30Z","as_of":"2026-09-14T10:15:31Z",
++#      "clicks_by_day":[{"date":"2026-09-13","count":1},{"date":"2026-09-14","count":2}]}
++```
++
++| Status | When | Body |
++|---|---|---|
++| `200` | known short code, clicked or not (`0` / `null` / `[]` for a never-clicked link) | `total_clicks`, `last_clicked_at`, `as_of` (freshness of the aggregate), sparse ascending `clicks_by_day` over the last 30 UTC days |
++| `404` | unknown short code | `application/problem+json` |
++
++The numbers lag behind the redirects by the relay + consumer latency; `as_of` says how fresh they
++are. The code base has no `/api/v1` authentication scheme (a stated non-goal), so the endpoint
++carries no `401` today; adding one is a separate, approved change.
++
++### Analytics configuration
++
++| Property | Environment variable | Default | Purpose |
++|---|---|---|---|
++| `analytics.salt` | `SHORTENER_ANALYTICS_IP_SALT` | non-secret local marker | Secret salt of the client-IP hash (≥ 16 characters). **Must** be set in production; supply it from the environment or a CI/deployment secret, never commit it. |
++| `spring.kafka.bootstrap-servers` | `SHORTENER_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Broker address of the `url.clicked` topic. |
++| `analytics.outbox.poll-interval-ms` | `ANALYTICS_OUTBOX_POLL_INTERVAL_MS` | `500` | Delay between two relay passes (50 ms – 60 s). |
++| `analytics.outbox.batch-size` | `ANALYTICS_OUTBOX_BATCH_SIZE` | `100` | Rows relayed per pass (1 – 10 000). |
++| `analytics.retry.max-attempts` | `ANALYTICS_RETRY_MAX_ATTEMPTS` | `5` | Publish / aggregation attempts before giving up. |
++| `analytics.retry.base-backoff-ms` / `max-backoff-ms` | `ANALYTICS_RETRY_BASE_BACKOFF_MS` / `ANALYTICS_RETRY_MAX_BACKOFF_MS` | `100` / `10000` | Exponential backoff bounds. |
++| `analytics.retry.jitter` | `ANALYTICS_RETRY_JITTER` | `full` | `full`, `equal` or `none`. |
++| `analytics.kafka.timeout-ms` | `ANALYTICS_KAFKA_TIMEOUT_MS` | `5000` | Bound of one produce request / aggregation attempt. |
++| `analytics.consumer.auto-startup` | `ANALYTICS_CONSUMER_AUTO_STARTUP` | `true` | Start the `url.clicked` listener with the application. |
++| `analytics.retention.days` | `ANALYTICS_RETENTION_DAYS` | `90` | Age after which raw click rows are purged (1 – 3650). |
++| `analytics.retention.cron` | `ANALYTICS_RETENTION_CRON` | `0 0 3 * * *` | Purge schedule (UTC). |
++
++### Privacy and retention guarantees
++
++* **The client's network identifier is never stored or logged in clear text.** Only a salted
++  SHA-256 digest (`hashed_ip`, 64 hex characters, enforced by a check constraint) reaches the
++  database and the topic; the plain value is discarded on the request thread. The salt
++  lives outside the repository (`SHORTENER_ANALYTICS_IP_SALT`); the checked-in fallback exists
++  only so local runs and tests boot, and a leaked salt is rotated by changing the variable.
++* **Referrers are reduced to the host name** (lower-cased, no path, query or credentials).
++* **No personal data columns** exist in any analytics table (`ClickAnalyticsMigrationTest` pins
++  this); log lines carry short codes, keys and counts, never digests or referrers.
++* **Raw events are kept for `analytics.retention.days` (90 days)**: `click_outbox` rows and
++  `processed_click_event` markers older than that are deleted by the retention job.
++  `click_stats` and `click_stats_daily` are aggregates and are kept for the life of the link.
++* **Counting is exactly-once** at the aggregate level (outbox idempotency key + consumer dedupe),
++  and the redirect never depends on the broker.
++
+ ## Running locally
+ 
+ Prerequisites: JDK 25, Docker (for the databases and the integration tests). Maven is
+@@ -235,7 +320,7 @@ provided by the wrapper.
+    | `./mvnw -q spotless:check`                     | google-java-format check (`spotless:apply` fixes)              |
+    | `./mvnw -q -Dtest=ArchitectureTest test`       | layering rules (`src/test/java/sdlc/ArchitectureTest.java`)    |
+    | `./mvnw -q test`                               | unit tests (`*Test`), no Docker needed                         |
+-   | `./mvnw -q -Pit verify`                        | integration tests (`*IT`) against Testcontainers PostgreSQL and Redis, and the springdoc dump to `target/openapi.yaml` / `target/openapi.json` |
++   | `./mvnw -q -Pit verify`                        | integration tests (`*IT`) against Testcontainers PostgreSQL, Redis and Kafka, including the redirect latency gate (`RedirectLatencyBudgetIT`), and the springdoc dump to `target/openapi.yaml` / `target/openapi.json` |
+ 
+    The same commands, in the same order, form the CI pipeline in
+    [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+@@ -264,7 +349,8 @@ docker run --rm -p 8082:8080 -e SPRING_PROFILES_ACTIVE=write ... url-shortener
+ ```
+ 
+ `-e SHORTENER_DB_PASSWORD` without a value forwards the variable from the calling shell, so the
+-credential never appears on the command line or in the image. `JAVA_OPTS` (default
++credential never appears on the command line or in the image. Pass `-e SHORTENER_ANALYTICS_IP_SALT`
++and `-e SHORTENER_KAFKA_BOOTSTRAP_SERVERS=...` the same way for the click analytics pipeline. `JAVA_OPTS` (default
+ `-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError`) can be overridden the same way.
+ 
+ ## Project layout
+diff --git a/docs/analytics.md b/docs/analytics.md
+index 2981edd..ab607d7 100644
+--- a/docs/analytics.md
++++ b/docs/analytics.md
+@@ -148,3 +148,30 @@ how fresh they are.
+ Tests: `ClickStatsControllerTest` (standalone MockMvc over the real service, mocked repositories,
+ fixed clock: 200 with data, 200 empty, 404, 500, the 30-day UTC window boundary and profile gating)
+ and `ClickStatsQueryServiceTest` (window arithmetic, zero-count filtering, DTO invariants).
++
++## Integration tests, latency gate and release artifacts (task T8, AC-13, AC-14, AC-15)
++
++Package `com.example.shortener.analytics.it`, run only by failsafe under `./mvnw -q -Pit verify`
++(Docker required). All three extend `com.example.shortener.it.AbstractIntegrationTest`
++(Testcontainers PostgreSQL 17 + Redis 7, application on a random port).
++
++| Class | Context | Proves |
++|---|---|---|
++| `ClickAnalyticsEndToEndIT` | own context: + Testcontainers Kafka (`apache/kafka:3.8.0`, topic `url.clicked` pre-created), relay every 100 ms, consumer from `earliest` | redirect `302` + `Location` -> exactly one `click_outbox` row -> `PUBLISHED` by the relay -> `processed_click_event` + `click_stats` by the consumer -> stats endpoint reports the click with one `clicks_by_day` entry for today (UTC). Re-sending the identical record (same `idempotency-key`) is counted as a duplicate and changes nothing. Unknown codes: `404`, no row, no event; never-clicked links: `0` / `null` / `[]`. |
++| `KafkaUnavailableRedirectIT` | own context: `spring.kafka.bootstrap-servers=127.0.0.1:1` (nothing listens), `max.block.ms=500`, listener off, relay tick at its 60 s maximum | with no broker the redirect keeps `302` + `Location`, answers in well under the producer's blocking bound (nothing touches Kafka on the request thread) and the click stays `PENDING` with `attempts = 0` and no `published_at`. Unknown codes still produce no row. |
++| `RedirectLatencyBudgetIT` | shared base context (no broker, relay running on its own thread) | p95 of `GET /{short_code}` (warm-up, then timed samples, nearest-rank percentile) is at most the recorded baseline + `tolerance-percent` (5 %). |
++
++Latency baseline: `src/test/resources/analytics/redirect-latency-baseline.properties`
++(`p95-ms`, `tolerance-percent`, `warmup-requests`, `sample-requests`). Override with
++`-Dredirect.latency.baseline-p95-ms=<ms>`; re-record with `-Dredirect.latency.record=true`, which
++writes `target/redirect-latency-baseline.properties` (the test then passes) so the new value can
++be reviewed and copied into the resource. The gate measures the full production path including
++the outbox insert, so it bounds the cost the analytics feature adds to a redirect.
++
++Release artifacts: the `Dockerfile` (two-stage, Maven wrapper build, non-root JRE runtime) only
++documents the analytics variables (`SHORTENER_KAFKA_BOOTSTRAP_SERVERS`,
++`SHORTENER_ANALYTICS_IP_SALT`); nothing secret is baked in. `.github/workflows/ci.yml` runs
++compile, spotless (advisory), `ArchitectureTest`, `./mvnw -q test` and `./mvnw -q -Pit verify`
++(which includes the three tests above and the OpenAPI dump to `target/openapi.yaml`, compared with
++`src/main/resources/openapi.yaml` by `OpenApiContractIT`). The README documents the pipeline, the
++configuration table, the privacy/retention guarantees and the stats endpoint.
+diff --git a/src/test/java/com/example/shortener/analytics/it/ClickAnalyticsEndToEndIT.java b/src/test/java/com/example/shortener/analytics/it/ClickAnalyticsEndToEndIT.java
+new file mode 100644
+index 0000000..9b9921d
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/it/ClickAnalyticsEndToEndIT.java
+@@ -0,0 +1,262 @@
++/*
++ * ClickAnalyticsEndToEndIT.java — whole click-analytics pipeline against real infrastructure
++ *
++ * Layer: test (integration, task T8). Boots the application against Testcontainers PostgreSQL,
++ * Redis and Kafka (apache/kafka) and drives one click through every stage: redirect (AC-1) ->
++ * click_outbox row (AC-3) -> outbox relay publish on url.clicked (AC-4) -> consumer aggregation
++ * (AC-6) -> GET /api/v1/urls/{short_code}/stats (AC-8). A second delivery of the very same record
++ * proves exactly-once aggregation, and unknown short codes produce neither a row nor an event.
++ * Run only by failsafe under ./mvnw -Pit verify (AC-14, AC-15); requires Docker.
++ */
++package com.example.shortener.analytics.it;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.awaitility.Awaitility.await;
++
++import com.example.shortener.analytics.consumer.ConsumerMetrics;
++import com.example.shortener.analytics.domain.ClickOutboxEntry;
++import com.example.shortener.analytics.domain.OutboxStatus;
++import com.example.shortener.analytics.kafka.ClickEventMessage;
++import com.example.shortener.analytics.kafka.ClickEventProducer;
++import com.example.shortener.analytics.repository.ClickOutboxRepository;
++import com.example.shortener.analytics.repository.ClickStatsRepository;
++import com.example.shortener.analytics.repository.ProcessedClickEventRepository;
++import com.example.shortener.it.AbstractIntegrationTest;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.time.LocalDate;
++import java.time.ZoneOffset;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import org.apache.kafka.clients.admin.AdminClient;
++import org.apache.kafka.clients.admin.AdminClientConfig;
++import org.apache.kafka.clients.admin.NewTopic;
++import org.apache.kafka.common.errors.TopicExistsException;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.test.context.DynamicPropertyRegistry;
++import org.springframework.test.context.DynamicPropertySource;
++import org.springframework.test.context.TestPropertySource;
++import org.testcontainers.kafka.KafkaContainer;
++import org.testcontainers.utility.DockerImageName;
++
++/**
++ * End-to-end proof of the analytics pipeline with a real broker.
++ *
++ * <p>The Kafka container is started once per JVM in a static initialiser (same reasoning as the
++ * PostgreSQL and Redis containers of {@link AbstractIntegrationTest}); the {@code url.clicked}
++ * topic is created up front so the listener is subscribed before the first event is relayed. The
++ * relay is sped up to one pass every 100 ms and the consumer reads from the earliest offset so
++ * nothing produced before the partition assignment is missed.
++ *
++ * <p>Fixture strategy: this class adds properties to the shared {@code @SpringBootTest}, so it
++ * boots its own cached application context wired to all three containers; the analytics tables are
++ * emptied before every test, the {@code urls} table and the URL cache by the base class.
++ */
++@TestPropertySource(
++    properties = {
++      "analytics.outbox.poll-interval-ms=100",
++      "analytics.retry.max-attempts=3",
++      "spring.kafka.consumer.auto-offset-reset=earliest",
++      "spring.kafka.producer.properties.max.block.ms=10000"
++    })
++class ClickAnalyticsEndToEndIT extends AbstractIntegrationTest {
++
++  /** Apache Kafka image (KRaft, no ZooKeeper) supported by testcontainers-kafka 2.x. */
++  static final String KAFKA_IMAGE = "apache/kafka:3.8.0";
++
++  /** Route of the stats endpoint (operationId {@code getUrlClickStats}). */
++  static final String STATS_PATH = "/api/v1/urls/%s/stats";
++
++  private static final Duration PIPELINE_TIMEOUT = Duration.ofSeconds(60);
++
++  @SuppressWarnings("resource")
++  static final KafkaContainer KAFKA = new KafkaContainer(DockerImageName.parse(KAFKA_IMAGE));
++
++  static {
++    KAFKA.start();
++    createTopic();
++  }
++
++  @Autowired private ClickOutboxRepository outbox;
++  @Autowired private ClickStatsRepository stats;
++  @Autowired private ProcessedClickEventRepository processed;
++  @Autowired private ClickEventProducer producer;
++  @Autowired private ConsumerMetrics metrics;
++  @Autowired private JdbcTemplate jdbc;
++
++  @DynamicPropertySource
++  static void kafkaProperties(DynamicPropertyRegistry registry) {
++    registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
++  }
++
++  private static void createTopic() {
++    Map<String, Object> config =
++        Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
++    try (AdminClient admin = AdminClient.create(config)) {
++      admin
++          .createTopics(List.of(new NewTopic(ClickEventProducer.TOPIC, 1, (short) 1)))
++          .all()
++          .get(30, TimeUnit.SECONDS);
++    } catch (ExecutionException e) {
++      if (!(e.getCause() instanceof TopicExistsException)) {
++        throw new IllegalStateException("could not create topic " + ClickEventProducer.TOPIC, e);
++      }
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
++      throw new IllegalStateException("interrupted while creating the topic", e);
++    } catch (TimeoutException e) {
++      throw new IllegalStateException("timed out creating topic " + ClickEventProducer.TOPIC, e);
++    }
++  }
++
++  @BeforeEach
++  void resetAnalyticsTables() {
++    jdbc.update("DELETE FROM click_stats_daily");
++    jdbc.update("DELETE FROM click_stats");
++    jdbc.update("DELETE FROM processed_click_event");
++    jdbc.update("DELETE FROM click_outbox");
++  }
++
++  /**
++   * Given a short link, when it is followed once, then the redirect answers 302 with the target in
++   * Location, exactly one outbox row is committed, the relay publishes it, the consumer aggregates
++   * it and the stats endpoint reports the click; a redelivery of the same record changes nothing.
++   */
++  @Test
++  void clickFlowsFromRedirectThroughOutboxAndKafkaToStatsExactlyOnce() {
++    String longUrl = uniqueLongUrl();
++    String shortCode = createShortCode(longUrl);
++    long appliedBefore = metrics.appliedCount();
++    long duplicatesBefore = metrics.duplicateCount();
++
++    // AC-1: redirect with the target in Location.
++    HttpResponse<String> redirect = get("/" + shortCode);
++    assertThat(redirect.statusCode()).isEqualTo(302);
++    assertThat(header(redirect, "Location")).isEqualTo(longUrl);
++
++    // AC-3: exactly one outbox row for this click, committed with the redirect.
++    List<ClickOutboxEntry> rows = outbox.findAll();
++    assertThat(rows).hasSize(1);
++    ClickOutboxEntry row = rows.getFirst();
++    assertThat(row.getShortCode()).isEqualTo(shortCode);
++    assertThat(row.getStatus()).isIn(OutboxStatus.PENDING, OutboxStatus.PUBLISHED);
++
++    // AC-4: the relay (not the request thread) publishes it.
++    await()
++        .atMost(PIPELINE_TIMEOUT)
++        .untilAsserted(
++            () -> {
++              ClickOutboxEntry relayed = outbox.findById(row.getId()).orElseThrow();
++              assertThat(relayed.getStatus()).isEqualTo(OutboxStatus.PUBLISHED);
++              assertThat(relayed.getPublishedAt()).isNotNull();
++            });
++
++    // AC-6: the consumer aggregates it once.
++    await()
++        .atMost(PIPELINE_TIMEOUT)
++        .untilAsserted(
++            () -> {
++              assertThat(processed.existsById(row.getIdempotencyKey())).isTrue();
++              assertThat(stats.findById(shortCode).orElseThrow().getTotalClicks()).isEqualTo(1);
++              assertThat(metrics.appliedCount()).isEqualTo(appliedBefore + 1);
++            });
++
++    // AC-8: the stats endpoint reports the click.
++    Map<String, Object> body = assertStats(shortCode);
++    assertThat(body.get("total_clicks")).isEqualTo(1);
++    assertThat(body.get("last_clicked_at")).isNotNull();
++    assertThat(body.get("as_of")).isNotNull();
++    assertThat(clicksByDay(body))
++        .singleElement()
++        .satisfies(
++            day -> {
++              assertThat(day.get("date")).isEqualTo(LocalDate.now(ZoneOffset.UTC).toString());
++              assertThat(day.get("count")).isEqualTo(1);
++            });
++
++    // Exactly-once: redeliver the identical record (same idempotency-key header and payload).
++    ClickEventMessage duplicate =
++        new ClickEventMessage(
++            row.getIdempotencyKey(),
++            row.getShortCode(),
++            row.getOccurredAt(),
++            row.getHashedIp(),
++            row.getReferrerHost());
++    producer.send(duplicate).orTimeout(30, TimeUnit.SECONDS).join();
++    await()
++        .atMost(PIPELINE_TIMEOUT)
++        .untilAsserted(() -> assertThat(metrics.duplicateCount()).isEqualTo(duplicatesBefore + 1));
++
++    assertThat(metrics.appliedCount()).isEqualTo(appliedBefore + 1);
++    assertThat(processed.count()).isEqualTo(1);
++    assertThat(stats.findById(shortCode).orElseThrow().getTotalClicks()).isEqualTo(1);
++    Map<String, Object> after = assertStats(shortCode);
++    assertThat(after.get("total_clicks")).isEqualTo(1);
++    assertThat(after.get("last_clicked_at")).isEqualTo(body.get("last_clicked_at"));
++    assertThat(clicksByDay(after)).hasSize(1);
++    assertThat(clicksByDay(after).getFirst().get("count")).isEqualTo(1);
++  }
++
++  /**
++   * Given an unknown short code, when it is requested, then the redirect answers 404 and neither an
++   * outbox row nor a url.clicked event exists; its stats are 404 as well.
++   */
++  @Test
++  void unknownShortCodeRecordsNothing() {
++    long appliedBefore = metrics.appliedCount();
++    long rejectedBefore = metrics.rejectedCount();
++
++    assertProblem(get("/doesNotExistE2E"), 404);
++
++    assertThat(outbox.count()).isZero();
++    assertProblem(get(STATS_PATH.formatted("doesNotExistE2E")), 404);
++
++    // Give the relay a few passes: nothing must reach the consumer.
++    await()
++        .during(Duration.ofSeconds(1))
++        .atMost(Duration.ofSeconds(5))
++        .untilAsserted(
++            () -> {
++              assertThat(outbox.count()).isZero();
++              assertThat(metrics.appliedCount()).isEqualTo(appliedBefore);
++              assertThat(metrics.rejectedCount()).isEqualTo(rejectedBefore);
++            });
++  }
++
++  /** Given a link that was never followed, when its stats are read, then 0 / null / []. */
++  @Test
++  void neverClickedLinkReportsZeroStats() {
++    String shortCode = createShortCode(uniqueLongUrl());
++
++    Map<String, Object> body = assertStats(shortCode);
++
++    assertThat(body.get("total_clicks")).isEqualTo(0);
++    assertThat(body.get("last_clicked_at")).isNull();
++    assertThat(body.get("as_of")).isNotNull();
++    assertThat(clicksByDay(body)).isEmpty();
++  }
++
++  private Map<String, Object> assertStats(String shortCode) {
++    HttpResponse<String> response = get(STATS_PATH.formatted(shortCode));
++    assertThat(response.statusCode())
++        .as("stats of %s: %s", shortCode, response.body())
++        .isEqualTo(200);
++    assertThat(contentType(response)).startsWith("application/json");
++    Map<String, Object> body = json(response.body());
++    assertThat(body).containsKeys("total_clicks", "last_clicked_at", "as_of", "clicks_by_day");
++    return body;
++  }
++
++  @SuppressWarnings("unchecked")
++  private static List<Map<String, Object>> clicksByDay(Map<String, Object> body) {
++    Object days = body.get("clicks_by_day");
++    assertThat(days).isInstanceOf(List.class);
++    return (List<Map<String, Object>>) days;
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/it/KafkaUnavailableRedirectIT.java b/src/test/java/com/example/shortener/analytics/it/KafkaUnavailableRedirectIT.java
+new file mode 100644
+index 0000000..d82b517
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/it/KafkaUnavailableRedirectIT.java
+@@ -0,0 +1,110 @@
++/*
++ * KafkaUnavailableRedirectIT.java — redirects are unaffected by an unavailable broker (AC-3, AC-4)
++ *
++ * Layer: test (integration, task T8). Boots the application with spring.kafka.bootstrap-servers
++ * pointing at a closed loopback port (no broker will ever answer) and proves that GET /{short_code}
++ * keeps its 302 and Location header, answers promptly, and that the click stays PENDING in
++ * click_outbox with no publish attempt made on the request path. Run only by failsafe under
++ * ./mvnw -Pit verify; requires Docker for PostgreSQL and Redis.
++ */
++package com.example.shortener.analytics.it;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.example.shortener.analytics.domain.ClickOutboxEntry;
++import com.example.shortener.analytics.domain.OutboxStatus;
++import com.example.shortener.analytics.repository.ClickOutboxRepository;
++import com.example.shortener.it.AbstractIntegrationTest;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.List;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.test.context.TestPropertySource;
++
++/**
++ * Broker outage from the redirect's point of view.
++ *
++ * <p>Fixture strategy: the broker address is a port nothing listens on, the producer's blocking
++ * bound is short so any accidental send on the request thread would surface as a slow or failing
++ * redirect, the listener is not started (there is nothing to consume) and the relay's tick is set
++ * to its maximum so no pass runs during the test; the row can therefore only be in the state the
++ * redirect left it in. The redirect must be indifferent to all of this: it records the click and
++ * never touches Kafka (AC-3); the relay picks the row up later when the broker is back (AC-4).
++ */
++@TestPropertySource(
++    properties = {
++      "spring.kafka.bootstrap-servers=127.0.0.1:1",
++      "spring.kafka.producer.properties.max.block.ms=3000",
++      "analytics.consumer.auto-startup=false",
++      "analytics.outbox.poll-interval-ms=60000"
++    })
++class KafkaUnavailableRedirectIT extends AbstractIntegrationTest {
++
++  /** A redirect that waited for the (dead) broker would block for max.block.ms (3 s) first. */
++  private static final Duration REQUEST_BUDGET = Duration.ofMillis(2000);
++
++  /** Redirects issued before the timed one so JIT, pools and cache are warm. */
++  private static final int WARMUP_REQUESTS = 5;
++
++  @Autowired private ClickOutboxRepository outbox;
++
++  @BeforeEach
++  void emptyOutbox() {
++    outbox.deleteAllInBatch();
++  }
++
++  /**
++   * Given no reachable broker, when a short link is followed, then the redirect is a 302 with the
++   * target in Location, the click is committed to the outbox as PENDING and no publish is attempted
++   * on the request path.
++   */
++  @Test
++  void redirectKeepsStatusAndLocationAndClickStaysPendingWhileBrokerIsDown() {
++    String longUrl = uniqueLongUrl();
++    String shortCode = createShortCode(longUrl);
++    Instant before = Instant.now().minusSeconds(1);
++    for (int i = 0; i < WARMUP_REQUESTS; i++) {
++      assertThat(get("/" + shortCode).statusCode()).isEqualTo(302);
++    }
++
++    long started = System.nanoTime();
++    HttpResponse<String> first = get("/" + shortCode);
++    Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
++    HttpResponse<String> second = get("/" + shortCode);
++
++    assertThat(first.statusCode()).isEqualTo(302);
++    assertThat(header(first, "Location")).isEqualTo(longUrl);
++    assertThat(second.statusCode()).isEqualTo(302);
++    assertThat(header(second, "Location")).isEqualTo(longUrl);
++    assertThat(elapsed)
++        .as("a redirect must not wait for the broker (max.block.ms is 3 s)")
++        .isLessThan(REQUEST_BUDGET);
++
++    List<ClickOutboxEntry> rows = outbox.findAll();
++    assertThat(rows).hasSize(WARMUP_REQUESTS + 2);
++    assertThat(rows)
++        .allSatisfy(
++            row -> {
++              assertThat(row.getShortCode()).isEqualTo(shortCode);
++              assertThat(row.getStatus()).isEqualTo(OutboxStatus.PENDING);
++              assertThat(row.getAttempts()).isZero();
++              assertThat(row.getPublishedAt()).isNull();
++              assertThat(row.getOccurredAt()).isAfterOrEqualTo(before);
++              assertThat(row.getNextAttemptAt()).isNotNull();
++            });
++    assertThat(outbox.countByStatus(OutboxStatus.PENDING)).isEqualTo(WARMUP_REQUESTS + 2);
++    assertThat(outbox.countByStatus(OutboxStatus.PUBLISHED)).isZero();
++    assertThat(outbox.countByStatus(OutboxStatus.FAILED)).isZero();
++  }
++
++  /** Given no reachable broker, when an unknown code is requested, then 404 and no outbox row. */
++  @Test
++  void unknownCodeIsStillA404WithoutAnOutboxRow() {
++    assertProblem(get("/doesNotExistKafkaDown"), 404);
++
++    assertThat(outbox.count()).isZero();
++  }
++}
+diff --git a/src/test/java/com/example/shortener/analytics/it/RedirectLatencyBudgetIT.java b/src/test/java/com/example/shortener/analytics/it/RedirectLatencyBudgetIT.java
+new file mode 100644
+index 0000000..bd20a4c
+--- /dev/null
++++ b/src/test/java/com/example/shortener/analytics/it/RedirectLatencyBudgetIT.java
+@@ -0,0 +1,168 @@
++/*
++ * RedirectLatencyBudgetIT.java — p95 latency gate of GET /{short_code} (AC-13)
++ *
++ * Layer: test (integration, task T8). Measures the p95 latency of the redirect with click recording
++ * enabled against the baseline recorded in src/test/resources/analytics/redirect-latency-baseline
++ * .properties and fails when the increase exceeds the tolerance (5 %). Shares the base fixture's
++ * application context (PostgreSQL + Redis, no broker: the relay runs on its own scheduler thread
++ * and must not influence the request path, which is exactly what this gate checks). Run only by
++ * failsafe under ./mvnw -Pit verify; requires Docker.
++ */
++package com.example.shortener.analytics.it;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.example.shortener.it.AbstractIntegrationTest;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.UncheckedIOException;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.Arrays;
++import java.util.Locale;
++import java.util.Properties;
++import org.junit.jupiter.api.Test;
++
++/**
++ * Latency budget of the redirect path.
++ *
++ * <p>Protocol: one short link is created; {@code warmup-requests} redirects warm the JIT, the
++ * connection pool and the URL cache; {@code sample-requests} redirects are then timed end to end
++ * with the JDK client (nearest-rank p95 over wall-clock nanoseconds). Every request goes through
++ * the full production path including the {@code click_outbox} insert, so the number is the cost the
++ * analytics feature adds on top of the baseline.
++ *
++ * <p>Baseline: {@value #BASELINE_RESOURCE} ({@code p95-ms}, {@code tolerance-percent}). It can be
++ * overridden with {@code -Dredirect.latency.baseline-p95-ms}, and {@code
++ * -Dredirect.latency.record=true} switches the gate into record mode: the measured p95 is written
++ * to {@code target/redirect-latency-baseline.properties} and the test passes, so a new baseline can
++ * be reviewed and committed.
++ */
++class RedirectLatencyBudgetIT extends AbstractIntegrationTest {
++
++  /** Classpath location of the recorded baseline. */
++  static final String BASELINE_RESOURCE = "analytics/redirect-latency-baseline.properties";
++
++  /** System property overriding the recorded p95 (milliseconds). */
++  static final String BASELINE_OVERRIDE_PROPERTY = "redirect.latency.baseline-p95-ms";
++
++  /** System property switching the gate into record mode. */
++  static final String RECORD_PROPERTY = "redirect.latency.record";
++
++  /** Where record mode writes the new baseline. */
++  static final Path RECORDED_BASELINE = Path.of("target", "redirect-latency-baseline.properties");
++
++  /**
++   * Given the recorded baseline, when the redirect is sampled with click recording enabled, then
++   * its p95 does not exceed the baseline by more than the tolerance.
++   */
++  @Test
++  void redirectP95StaysWithinBudget() {
++    Baseline baseline = Baseline.load();
++    String shortCode = createShortCode(uniqueLongUrl());
++    String path = "/" + shortCode;
++
++    for (int i = 0; i < baseline.warmupRequests(); i++) {
++      assertRedirect(get(path));
++    }
++    long[] samples = new long[baseline.sampleRequests()];
++    for (int i = 0; i < samples.length; i++) {
++      long started = System.nanoTime();
++      HttpResponse<String> response = get(path);
++      samples[i] = System.nanoTime() - started;
++      assertRedirect(response);
++    }
++
++    double p95Ms = percentile(samples, 95) / 1_000_000.0;
++    double medianMs = percentile(samples, 50) / 1_000_000.0;
++    double budgetMs = baseline.p95Ms() * (1.0 + baseline.tolerancePercent() / 100.0);
++    String report =
++        String.format(
++            Locale.ROOT,
++            "redirect latency: p50=%.2f ms, p95=%.2f ms over %d samples; baseline p95=%.2f ms,"
++                + " budget=%.2f ms (+%.1f %%)",
++            medianMs,
++            p95Ms,
++            samples.length,
++            baseline.p95Ms(),
++            budgetMs,
++            baseline.tolerancePercent());
++    System.out.println(report);
++
++    if (Boolean.getBoolean(RECORD_PROPERTY)) {
++      record(p95Ms, baseline);
++      return;
++    }
++    assertThat(p95Ms)
++        .as("%s; re-record with -D%s=true if the baseline is stale", report, RECORD_PROPERTY)
++        .isLessThanOrEqualTo(budgetMs);
++  }
++
++  private static void assertRedirect(HttpResponse<String> response) {
++    assertThat(response.statusCode()).isEqualTo(302);
++    assertThat(header(response, "Location")).isNotNull();
++  }
++
++  /** Nearest-rank percentile of the samples (nanoseconds). */
++  static long percentile(long[] samples, int percentile) {
++    long[] sorted = samples.clone();
++    Arrays.sort(sorted);
++    int rank = (int) Math.ceil(percentile / 100.0 * sorted.length);
++    return sorted[Math.max(0, Math.min(sorted.length - 1, rank - 1))];
++  }
++
++  private static void record(double p95Ms, Baseline baseline) {
++    String content =
++        String.format(
++            Locale.ROOT,
++            "# Recorded by RedirectLatencyBudgetIT (-D%s=true); review and copy to"
++                + " src/test/resources/%s%n"
++                + "p95-ms=%d%n"
++                + "tolerance-percent=%.0f%n"
++                + "warmup-requests=%d%n"
++                + "sample-requests=%d%n",
++            RECORD_PROPERTY,
++            BASELINE_RESOURCE,
++            (long) Math.ceil(p95Ms),
++            baseline.tolerancePercent(),
++            baseline.warmupRequests(),
++            baseline.sampleRequests());
++    try {
++      Files.createDirectories(RECORDED_BASELINE.getParent());
++      Files.writeString(RECORDED_BASELINE, content, StandardCharsets.UTF_8);
++    } catch (IOException e) {
++      throw new UncheckedIOException(e);
++    }
++  }
++
++  /** The recorded baseline and the sampling parameters. */
++  record Baseline(double p95Ms, double tolerancePercent, int warmupRequests, int sampleRequests) {
++
++    static Baseline load() {
++      Properties properties = new Properties();
++      try (InputStream in =
++          RedirectLatencyBudgetIT.class.getClassLoader().getResourceAsStream(BASELINE_RESOURCE)) {
++        assertThat(in).as("baseline resource %s", BASELINE_RESOURCE).isNotNull();
++        properties.load(in);
++      } catch (IOException e) {
++        throw new UncheckedIOException(e);
++      }
++      double p95 =
++          Double.parseDouble(
++              System.getProperty(
++                  BASELINE_OVERRIDE_PROPERTY, properties.getProperty("p95-ms", "50")));
++      Baseline baseline =
++          new Baseline(
++              p95,
++              Double.parseDouble(properties.getProperty("tolerance-percent", "5")),
++              Integer.parseInt(properties.getProperty("warmup-requests", "200")),
++              Integer.parseInt(properties.getProperty("sample-requests", "400")));
++      assertThat(baseline.p95Ms()).isPositive();
++      assertThat(baseline.tolerancePercent()).isBetween(0.0, 100.0);
++      assertThat(baseline.sampleRequests()).isGreaterThanOrEqualTo(20);
++      return baseline;
++    }
++  }
++}
+diff --git a/src/test/resources/analytics/redirect-latency-baseline.properties b/src/test/resources/analytics/redirect-latency-baseline.properties
+new file mode 100644
+index 0000000..934aac6
+--- /dev/null
++++ b/src/test/resources/analytics/redirect-latency-baseline.properties
+@@ -0,0 +1,15 @@
++# Recorded p95 latency baseline of GET /{short_code} (RedirectLatencyBudgetIT, AC-13).
++#
++# Recorded with the same in-process fixture the IT uses (Spring Boot on a random port, Testcontainers
++# PostgreSQL 17 + Redis 7, JDK HttpClient, warm JIT, cache-hit redirects) before click recording was
++# added to the redirect path. RedirectLatencyBudgetIT fails when the measured p95 exceeds this value
++# by more than `tolerance-percent`.
++#
++# Re-record on the reference machine with
++#   ./mvnw -q -Pit verify -Dit.test=RedirectLatencyBudgetIT -Dredirect.latency.record=true
++# which writes target/redirect-latency-baseline.properties; copy the file here after review.
++# Override without editing the file: -Dredirect.latency.baseline-p95-ms=<millis>.
++p95-ms=50
++tolerance-percent=5
++warmup-requests=200
++sample-requests=400

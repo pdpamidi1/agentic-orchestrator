@@ -1,0 +1,645 @@
+{
+  "schema": "Design",
+  "output": {
+    "run_id": "brownfield-859b9d7f",
+    "spec_version": 2,
+    "api": {
+      "openapi_yaml": "openapi: 3.1.0\ninfo:\n  title: URL Shortener API\n  version: 2.0.0\n  description: |\n    Short-link creation, lookup and public redirection, extended in this release with\n    privacy-preserving click analytics.\n\n    Analytics are eventually consistent by design: every successful redirect commits one\n    url.clicked row to a transactional outbox in the same database transaction as the\n    redirect handling, an in-process poller publishes it to the Kafka topic `url.clicked`\n    keyed by short_code, and an analytics consumer aggregates it into click_stats.\n    Statistics responses therefore always carry an `as_of` timestamp describing when the\n    aggregate was last updated.\n\n    Privacy: client IP addresses are never persisted or logged; only a salted SHA-256 hex\n    digest is stored. Raw click rows are purged after 90 days; aggregates are retained.\n\n    Compatibility: this release is additive only. `redirectToTargetUrl`, `createShortUrl`\n    and `getShortUrl` keep their exact pre-existing request/response contracts.\nservers:\n  - url: /\n    description: Same-origin deployment\ntags:\n  - name: redirect\n    description: Public short-link resolution (unauthenticated)\n  - name: urls\n    description: Short URL management, protected by the existing /api/v1 auth scheme\n  - name: analytics\n    description: Aggregated click analytics (new, additive)\npaths:\n  /{short_code}:\n    get:\n      tags: [redirect]\n      operationId: redirectToTargetUrl\n      summary: Resolve a short code and redirect to its target URL\n      description: |\n        Pre-existing operation, contract unchanged. On a successful redirect exactly one row\n        is committed to the click_outbox table inside the same transaction as the redirect\n        handling (short_code, occurred_at UTC, hashed_ip, referrer_host, idempotency_key).\n        The request thread performs no Kafka or other network call, so a slow or unavailable\n        broker cannot affect the status code, the Location header or latency.\n      security: []\n      parameters:\n        - $ref: '#/components/parameters/ShortCodePath'\n      responses:\n        '302':\n          description: Found - client is redirected to the target URL; one click event is recorded\n          headers:\n            Location:\n              description: Absolute target URL\n              required: true\n              schema:\n                type: string\n                format: uri\n        '404':\n          description: Unknown or expired short code - no outbox row and no url.clicked event are created\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n  /api/v1/urls:\n    post:\n      tags: [urls]\n      operationId: createShortUrl\n      summary: Create a short URL\n      description: Pre-existing operation, contract unchanged by this release.\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema:\n              $ref: '#/components/schemas/CreateShortUrlRequest'\n      responses:\n        '201':\n          description: Short URL created\n          headers:\n            Location:\n              description: Canonical location of the created short URL resource\n              required: true\n              schema:\n                type: string\n                format: uri-reference\n          content:\n            application/json:\n              schema:\n                $ref: '#/components/schemas/ShortUrlResponse'\n        '400':\n          description: Malformed or invalid request body\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n        '401':\n          description: Missing or invalid credentials\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n        '409':\n          description: Requested custom short code is already taken\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n  /api/v1/urls/{short_code}:\n    get:\n      tags: [urls]\n      operationId: getShortUrl\n      summary: Fetch a single short URL resource\n      description: Pre-existing operation, contract unchanged by this release.\n      parameters:\n        - $ref: '#/components/parameters/ShortCodePath'\n      responses:\n        '200':\n          description: The short URL resource\n          content:\n            application/json:\n              schema:\n                $ref: '#/components/schemas/ShortUrlResponse'\n        '401':\n          description: Missing or invalid credentials\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n        '404':\n          description: Unknown short code\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n  /api/v1/urls/{short_code}/stats:\n    get:\n      tags: [analytics]\n      operationId: getUrlClickStats\n      summary: Aggregated click statistics for a short code\n      description: |\n        Returns eventually consistent click analytics for an existing short code: total\n        clicks, the last click timestamp, an `as_of` timestamp (click_stats.updated_at, or\n        the current instant when no aggregate row exists yet) and a sparse, ascending\n        `clicks_by_day` list covering the last 30 UTC days. Days without clicks are omitted.\n        A short code that exists but has no recorded clicks returns 200 with total_clicks=0,\n        last_clicked_at=null and an empty clicks_by_day list. Protected by the same auth\n        scheme as the other /api/v1 operations; that scheme is not changed by this release.\n      parameters:\n        - $ref: '#/components/parameters/ShortCodePath'\n      responses:\n        '200':\n          description: Aggregated statistics (eventually consistent, see as_of)\n          content:\n            application/json:\n              schema:\n                $ref: '#/components/schemas/ClickStatsResponse'\n        '401':\n          description: Missing or invalid credentials\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n        '404':\n          description: Unknown short code\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\ncomponents:\n  securitySchemes:\n    bearerAuth:\n      type: http\n      scheme: bearer\n      description: |\n        Placeholder for the authentication scheme the existing /api/v1 endpoints already\n        enforce. The executor must reuse the scheme configured in the workspace verbatim and\n        document it here; changing the scheme is a non-goal.\n  parameters:\n    ShortCodePath:\n      name: short_code\n      in: path\n      required: true\n      description: The short code identifying the link\n      schema:\n        type: string\n        minLength: 1\n        maxLength: 64\n        pattern: '^[A-Za-z0-9_-]{1,64}$'\n  schemas:\n    CreateShortUrlRequest:\n      type: object\n      required: [target_url]\n      properties:\n        target_url:\n          type: string\n          format: uri\n          description: Absolute URL the short code resolves to\n        custom_code:\n          type: [string, 'null']\n          pattern: '^[A-Za-z0-9_-]{1,64}$'\n          description: Optional caller-supplied short code\n        expires_at:\n          type: [string, 'null']\n          format: date-time\n          description: Optional UTC expiry instant\n    ShortUrlResponse:\n      type: object\n      required: [short_code, target_url, created_at]\n      properties:\n        short_code:\n          type: string\n        target_url:\n          type: string\n          format: uri\n        created_at:\n          type: string\n          format: date-time\n        expires_at:\n          type: [string, 'null']\n          format: date-time\n    ClickStatsResponse:\n      type: object\n      required: [short_code, total_clicks, last_clicked_at, as_of, clicks_by_day]\n      properties:\n        short_code:\n          type: string\n          description: The short code these statistics belong to\n        total_clicks:\n          type: integer\n          format: int64\n          minimum: 0\n          description: Total successful redirects aggregated so far\n        last_clicked_at:\n          type: [string, 'null']\n          format: date-time\n          description: UTC instant of the most recent aggregated click, null when there are none\n        as_of:\n          type: string\n          format: date-time\n          description: UTC instant the aggregate was last updated; reflects eventual consistency\n        clicks_by_day:\n          type: array\n          description: Sparse, ascending list of the last 30 UTC days that had at least one click\n          maxItems: 30\n          items:\n            $ref: '#/components/schemas/ClickStatsDayEntry'\n      examples:\n        - short_code: abc123\n          total_clicks: 42\n          last_clicked_at: '2024-05-17T09:14:02Z'\n          as_of: '2024-05-17T09:14:05Z'\n          clicks_by_day:\n            - date: '2024-05-16'\n              count: 12\n            - date: '2024-05-17'\n              count: 30\n    ClickStatsDayEntry:\n      type: object\n      required: [date, count]\n      properties:\n        date:\n          type: string\n          format: date\n          description: UTC day bucket\n        count:\n          type: integer\n          format: int64\n          minimum: 1\n          description: Number of clicks aggregated for that UTC day\n    ProblemDetail:\n      type: object\n      description: RFC 9457 problem details, produced by the global exception handler\n      required: [status, title]\n      properties:\n        type:\n          type: string\n          format: uri\n          default: about:blank\n        title:\n          type: string\n        status:\n          type: integer\n        detail:\n          type: string\n        instance:\n          type: string\nsecurity:\n  - bearerAuth: []\n",
+      "operations": [
+        {
+          "method": "GET",
+          "path": "/{short_code}",
+          "operation_id": "redirectToTargetUrl",
+          "responses": [
+            {
+              "status": 302,
+              "description": "Found - Location header carries the target URL; exactly one click_outbox row is committed in the same transaction, no Kafka call on the request thread"
+            },
+            {
+              "status": 404,
+              "description": "Unknown or expired short code - no outbox row and no url.clicked event created"
+            }
+          ],
+          "breaking": false
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/urls",
+          "operation_id": "createShortUrl",
+          "responses": [
+            {
+              "status": 201,
+              "description": "created - pre-existing behaviour, unchanged"
+            },
+            {
+              "status": 400,
+              "description": "invalid request body"
+            },
+            {
+              "status": 401,
+              "description": "missing or invalid credentials"
+            },
+            {
+              "status": 409,
+              "description": "custom short code already taken"
+            }
+          ],
+          "breaking": false
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/urls/{short_code}",
+          "operation_id": "getShortUrl",
+          "responses": [
+            {
+              "status": 200,
+              "description": "the short URL resource - pre-existing behaviour, unchanged"
+            },
+            {
+              "status": 401,
+              "description": "missing or invalid credentials"
+            },
+            {
+              "status": 404,
+              "description": "unknown short code"
+            }
+          ],
+          "breaking": false
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/urls/{short_code}/stats",
+          "operation_id": "getUrlClickStats",
+          "responses": [
+            {
+              "status": 200,
+              "description": "aggregated stats: total_clicks, last_clicked_at, as_of and a sparse ascending clicks_by_day over the last 30 UTC days; zero-click codes return 0/null/empty list"
+            },
+            {
+              "status": 401,
+              "description": "missing or invalid credentials under the existing /api/v1 auth scheme"
+            },
+            {
+              "status": 404,
+              "description": "unknown short code"
+            }
+          ],
+          "breaking": false
+        }
+      ]
+    },
+    "data": {
+      "tables": [
+        {
+          "name": "click_outbox",
+          "columns": [
+            {
+              "name": "id",
+              "type": "BIGINT GENERATED BY DEFAULT AS IDENTITY",
+              "nullable": false,
+              "notes": "surrogate primary key, also the claim/publish ordering key"
+            },
+            {
+              "name": "idempotency_key",
+              "type": "UUID",
+              "nullable": false,
+              "notes": "random UUID generated per redirect (AMB-17 default); carried end-to-end in the Kafka header and used for consumer dedupe"
+            },
+            {
+              "name": "short_code",
+              "type": "VARCHAR(64)",
+              "nullable": false,
+              "notes": "Kafka message key, preserves per-code ordering"
+            },
+            {
+              "name": "occurred_at",
+              "type": "TIMESTAMP(6) WITH TIME ZONE",
+              "nullable": false,
+              "notes": "UTC instant of the successful redirect; also the retention scan column"
+            },
+            {
+              "name": "hashed_ip",
+              "type": "CHAR(64)",
+              "nullable": true,
+              "notes": "lowercase hex SHA-256 over (static salt || client IP); raw IP is never stored anywhere. Null only when the client IP is unavailable"
+            },
+            {
+              "name": "referrer_host",
+              "type": "VARCHAR(255)",
+              "nullable": true,
+              "notes": "host component of the Referer header only; null when absent or unparsable"
+            },
+            {
+              "name": "status",
+              "type": "VARCHAR(16)",
+              "nullable": false,
+              "notes": "PENDING | PUBLISHED | FAILED, default PENDING"
+            },
+            {
+              "name": "attempts",
+              "type": "INTEGER",
+              "nullable": false,
+              "notes": "publish attempts consumed so far, default 0, bounded by analytics.retry.max-attempts"
+            },
+            {
+              "name": "next_attempt_at",
+              "type": "TIMESTAMP(6) WITH TIME ZONE",
+              "nullable": false,
+              "notes": "earliest instant the poller may claim the row again; set by exponential backoff + full jitter, default now()"
+            },
+            {
+              "name": "published_at",
+              "type": "TIMESTAMP(6) WITH TIME ZONE",
+              "nullable": true,
+              "notes": "set when status becomes PUBLISHED"
+            },
+            {
+              "name": "last_error",
+              "type": "VARCHAR(512)",
+              "nullable": true,
+              "notes": "truncated failure reason for the terminal FAILED state; must never contain a raw IP"
+            },
+            {
+              "name": "created_at",
+              "type": "TIMESTAMP(6) WITH TIME ZONE",
+              "nullable": false,
+              "notes": "row insert instant, default now()"
+            }
+          ],
+          "constraints": [
+            "CONSTRAINT pk_click_outbox PRIMARY KEY (id)",
+            "CONSTRAINT uq_click_outbox_idempotency_key UNIQUE (idempotency_key)",
+            "CONSTRAINT ck_click_outbox_status CHECK (status IN ('PENDING','PUBLISHED','FAILED'))",
+            "CONSTRAINT ck_click_outbox_attempts CHECK (attempts >= 0)",
+            "CONSTRAINT ck_click_outbox_hashed_ip CHECK (hashed_ip IS NULL OR hashed_ip ~ '^[0-9a-f]{64}$')",
+            "CREATE INDEX idx_click_outbox_claim ON click_outbox (status, next_attempt_at, id)",
+            "CREATE INDEX idx_click_outbox_occurred_at ON click_outbox (occurred_at)"
+          ]
+        },
+        {
+          "name": "click_stats",
+          "columns": [
+            {
+              "name": "short_code",
+              "type": "VARCHAR(64)",
+              "nullable": false,
+              "notes": "primary key; owned by the analytics module, no FK to the existing url table to keep the change additive and non-invasive"
+            },
+            {
+              "name": "total_clicks",
+              "type": "BIGINT",
+              "nullable": false,
+              "notes": "default 0, incremented exactly once per distinct idempotency key"
+            },
+            {
+              "name": "last_clicked_at",
+              "type": "TIMESTAMP(6) WITH TIME ZONE",
+              "nullable": true,
+              "notes": "greatest occurred_at seen so far (monotonic, safe for out-of-order delivery)"
+            },
+            {
+              "name": "updated_at",
+              "type": "TIMESTAMP(6) WITH TIME ZONE",
+              "nullable": false,
+              "notes": "aggregate freshness; surfaced as the as_of field of the stats response"
+            }
+          ],
+          "constraints": [
+            "CONSTRAINT pk_click_stats PRIMARY KEY (short_code)",
+            "CONSTRAINT ck_click_stats_total CHECK (total_clicks >= 0)"
+          ]
+        },
+        {
+          "name": "click_stats_daily",
+          "columns": [
+            {
+              "name": "short_code",
+              "type": "VARCHAR(64)",
+              "nullable": false,
+              "notes": "part of the composite primary key"
+            },
+            {
+              "name": "day",
+              "type": "DATE",
+              "nullable": false,
+              "notes": "UTC day bucket derived from occurred_at at UTC, never from the JVM default zone"
+            },
+            {
+              "name": "click_count",
+              "type": "BIGINT",
+              "nullable": false,
+              "notes": "default 0; serialised as the JSON field `count`"
+            },
+            {
+              "name": "updated_at",
+              "type": "TIMESTAMP(6) WITH TIME ZONE",
+              "nullable": false,
+              "notes": "last mutation of this bucket"
+            }
+          ],
+          "constraints": [
+            "CONSTRAINT pk_click_stats_daily PRIMARY KEY (short_code, day)",
+            "CONSTRAINT ck_click_stats_daily_count CHECK (click_count >= 0)",
+            "CONSTRAINT fk_click_stats_daily_short_code FOREIGN KEY (short_code) REFERENCES click_stats (short_code) ON DELETE CASCADE",
+            "CREATE INDEX idx_click_stats_daily_window ON click_stats_daily (short_code, day DESC)"
+          ]
+        },
+        {
+          "name": "processed_click_event",
+          "columns": [
+            {
+              "name": "idempotency_key",
+              "type": "UUID",
+              "nullable": false,
+              "notes": "primary key; insert-first dedupe guard so a duplicate delivery is a no-op before any aggregate write"
+            },
+            {
+              "name": "short_code",
+              "type": "VARCHAR(64)",
+              "nullable": false,
+              "notes": "kept for troubleshooting and per-code purge diagnostics"
+            },
+            {
+              "name": "processed_at",
+              "type": "TIMESTAMP(6) WITH TIME ZONE",
+              "nullable": false,
+              "notes": "default now(); retention scan column for the 90-day purge"
+            }
+          ],
+          "constraints": [
+            "CONSTRAINT pk_processed_click_event PRIMARY KEY (idempotency_key)",
+            "CREATE INDEX idx_processed_click_event_processed_at ON processed_click_event (processed_at)"
+          ]
+        }
+      ],
+      "migrations": [
+        "-- src/main/resources/db/migration/V<next>__click_analytics.sql (Flyway, forward-only, additive).\n-- The executor MUST renumber <next> to one above the highest existing script; no existing\n-- table is altered and no data is rewritten, so this is an expand-only step.\n\nCREATE TABLE click_outbox (\n    id              BIGINT GENERATED BY DEFAULT AS IDENTITY,\n    idempotency_key UUID        NOT NULL,\n    short_code      VARCHAR(64) NOT NULL,\n    occurred_at     TIMESTAMP(6) WITH TIME ZONE NOT NULL,\n    hashed_ip       CHAR(64),\n    referrer_host   VARCHAR(255),\n    status          VARCHAR(16) NOT NULL DEFAULT 'PENDING',\n    attempts        INTEGER     NOT NULL DEFAULT 0,\n    next_attempt_at TIMESTAMP(6) WITH TIME ZONE NOT NULL DEFAULT now(),\n    published_at    TIMESTAMP(6) WITH TIME ZONE,\n    last_error      VARCHAR(512),\n    created_at      TIMESTAMP(6) WITH TIME ZONE NOT NULL DEFAULT now(),\n    CONSTRAINT pk_click_outbox PRIMARY KEY (id),\n    CONSTRAINT uq_click_outbox_idempotency_key UNIQUE (idempotency_key),\n    CONSTRAINT ck_click_outbox_status CHECK (status IN ('PENDING','PUBLISHED','FAILED')),\n    CONSTRAINT ck_click_outbox_attempts CHECK (attempts >= 0)\n);\n\nCREATE INDEX idx_click_outbox_claim       ON click_outbox (status, next_attempt_at, id);\nCREATE INDEX idx_click_outbox_occurred_at ON click_outbox (occurred_at);\n\nCOMMENT ON COLUMN click_outbox.hashed_ip IS 'Salted SHA-256 hex digest of the client IP; raw IP addresses are never persisted.';\n\nCREATE TABLE click_stats (\n    short_code      VARCHAR(64) NOT NULL,\n    total_clicks    BIGINT      NOT NULL DEFAULT 0,\n    last_clicked_at TIMESTAMP(6) WITH TIME ZONE,\n    updated_at      TIMESTAMP(6) WITH TIME ZONE NOT NULL DEFAULT now(),\n    CONSTRAINT pk_click_stats PRIMARY KEY (short_code),\n    CONSTRAINT ck_click_stats_total CHECK (total_clicks >= 0)\n);\n\nCREATE TABLE click_stats_daily (\n    short_code  VARCHAR(64) NOT NULL,\n    day         DATE        NOT NULL,\n    click_count BIGINT      NOT NULL DEFAULT 0,\n    updated_at  TIMESTAMP(6) WITH TIME ZONE NOT NULL DEFAULT now(),\n    CONSTRAINT pk_click_stats_daily PRIMARY KEY (short_code, day),\n    CONSTRAINT ck_click_stats_daily_count CHECK (click_count >= 0),\n    CONSTRAINT fk_click_stats_daily_short_code FOREIGN KEY (short_code)\n        REFERENCES click_stats (short_code) ON DELETE CASCADE\n);\n\nCREATE INDEX idx_click_stats_daily_window ON click_stats_daily (short_code, day DESC);\n\nCREATE TABLE processed_click_event (\n    idempotency_key UUID        NOT NULL,\n    short_code      VARCHAR(64) NOT NULL,\n    processed_at    TIMESTAMP(6) WITH TIME ZONE NOT NULL DEFAULT now(),\n    CONSTRAINT pk_processed_click_event PRIMARY KEY (idempotency_key)\n);\n\nCREATE INDEX idx_processed_click_event_processed_at ON processed_click_event (processed_at);",
+        "-- Reference statements used by the runtime components (NOT a migration file; they live in\n-- repository code and are reproduced here so the executor implements them verbatim).\n\n-- 1) Outbox claim (OutboxPoller / ClickOutboxRepository), bounded and multi-instance safe:\nSELECT *\n  FROM click_outbox\n WHERE status = 'PENDING'\n   AND next_attempt_at <= now()\n ORDER BY id\n   FOR UPDATE SKIP LOCKED\n LIMIT :batchSize;\n\n-- 2) Aggregate upsert (ClickStatsAggregator), UTC day bucketing:\nINSERT INTO click_stats (short_code, total_clicks, last_clicked_at, updated_at)\nVALUES (:shortCode, 1, :occurredAt, now())\nON CONFLICT (short_code) DO UPDATE\n   SET total_clicks    = click_stats.total_clicks + 1,\n       last_clicked_at = GREATEST(COALESCE(click_stats.last_clicked_at, :occurredAt), :occurredAt),\n       updated_at      = now();\n\nINSERT INTO click_stats_daily (short_code, day, click_count, updated_at)\nVALUES (:shortCode, CAST((:occurredAt AT TIME ZONE 'UTC') AS DATE), 1, now())\nON CONFLICT (short_code, day) DO UPDATE\n   SET click_count = click_stats_daily.click_count + 1,\n       updated_at  = now();\n\n-- 3) Retention purge (ClickRetentionJob), bounded batches, aggregates untouched, PENDING kept:\nDELETE FROM click_outbox\n WHERE id IN (\n   SELECT id FROM click_outbox\n    WHERE occurred_at < :cutoff\n      AND status <> 'PENDING'\n    ORDER BY id\n    LIMIT :purgeBatchSize\n );\n\nDELETE FROM processed_click_event\n WHERE idempotency_key IN (\n   SELECT idempotency_key FROM processed_click_event\n    WHERE processed_at < :cutoff\n    ORDER BY processed_at\n    LIMIT :purgeBatchSize\n );",
+        "-- Contract-phase script, DEFERRED to a later release; do NOT create it in this run.\n-- Kept here so the expand/contract path is explicit and reviewable.\n-- src/main/resources/db/migration/V<later>__click_analytics_contract.sql\n--   DROP INDEX IF EXISTS idx_click_outbox_occurred_at;   -- once outbox rows are partitioned\n--   ALTER TABLE click_outbox DROP COLUMN IF EXISTS last_error; -- once failures live in metrics only\n-- Rollback of THIS release (T2 rollback_note) is likewise a forward migration:\n--   DROP TABLE IF EXISTS processed_click_event;\n--   DROP TABLE IF EXISTS click_stats_daily;\n--   DROP TABLE IF EXISTS click_stats;\n--   DROP TABLE IF EXISTS click_outbox;"
+      ],
+      "evolution_notes": "Expand/contract only. This release is a pure expand step: four new tables, zero ALTERs on existing shortener tables, so an old application binary and the new schema coexist and a bad deploy is rolled back by redeploying the previous artifact (the new tables simply stop receiving writes). Contract steps (dropping last_error, partitioning click_outbox by occurred_at day so retention becomes a partition drop) are deferred to a later release and sketched in the third migration body. Flyway scripts are forward-only and immutable; the executor must renumber V<next> above the highest existing script and never edit an applied one.\n\nEvent versioning: the Kafka value carries an explicit `schema_version` field (starts at 1) and messages also carry an `event-version` header alongside `idempotency-key`. Producers only ever add optional fields within a version; a breaking payload change means schema_version 2 published to the same topic with consumers accepting both for at least one release (tolerant reader: unknown fields ignored, missing optional fields defaulted). The topic name url.clicked is owned by infrastructure and is not versioned in this release.\n\nData lifecycle: raw rows (click_outbox, processed_click_event) are purged after analytics.retention.days (default 90) in bounded batches; PENDING outbox rows are excluded from the purge so an unavailable broker never causes silent data loss. click_stats and click_stats_daily are aggregates and are never deleted or expired. The 30-day API window is a query-time filter, not a retention rule.\n\nAmbiguity defaults materialised here: AMB-13 same relational database, analytics-owned tables; AMB-14/AMB-15 sparse clicks_by_day, zero-click code returns 200 with empty list; AMB-16 in-process scheduled purge; AMB-17 random per-redirect UUID idempotency key; AMB-18 configurable poller (500 ms / batch 100). Any answer that differs from these defaults invalidates this DataModel and requires a design revision."
+    },
+    "classes": {
+      "packages": [
+        {
+          "name": "com.example.shortener.analytics.config",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.config.AnalyticsProperties",
+              "responsibility": "Validated @ConfigurationProperties(prefix=\"analytics\") holding the IP salt (resolved from the existing secret mechanism, never a committed literal), outbox poll interval (500 ms) and batch size (100), retry max-attempts (5) / base backoff (100 ms) / max backoff (10 s) / full jitter, per-attempt Kafka timeout, retention days (90) and purge batch size.",
+              "depends_on": []
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.config.AnalyticsSchedulingConfig",
+              "responsibility": "Enables scheduling for the analytics module and exposes a dedicated bounded TaskScheduler/executor so no analytics job can ever run on a request thread.",
+              "depends_on": [
+                "com.example.shortener.analytics.config.AnalyticsProperties"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.config.AnalyticsKafkaConfig",
+              "responsibility": "Declares the KafkaTemplate, producer/consumer factories, JSON (de)serialisation for ClickEventMessage and the url.clicked topic name binding; the topic itself is provisioned by infrastructure and is never created here.",
+              "depends_on": [
+                "com.example.shortener.analytics.config.AnalyticsProperties",
+                "com.example.shortener.analytics.kafka.ClickEventMessage"
+              ]
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.kafka"
+          ]
+        },
+        {
+          "name": "com.example.shortener.analytics.api",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.api.ClickStatsController",
+              "responsibility": "Exposes GET /api/v1/urls/{short_code}/stats (operationId getUrlClickStats) under the existing /api/v1 auth scheme; maps the query result to ClickStatsResponse (200), delegates unknown codes to the global problem+json handler (404) and adds no other operation.",
+              "depends_on": [
+                "com.example.shortener.analytics.api.ClickStatsQueryService",
+                "com.example.shortener.analytics.api.ClickStatsResponse"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.api.ClickStatsQueryService",
+              "responsibility": "Verifies the short code exists via the existing URL lookup port, reads click_stats plus the last 30 UTC days of click_stats_daily, builds the sparse ascending clicks_by_day list and resolves as_of (updated_at, or now() when no aggregate row exists).",
+              "depends_on": [
+                "com.example.shortener.analytics.repository.ClickStatsRepository",
+                "com.example.shortener.analytics.repository.ClickStatsDailyRepository"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.api.ClickStatsResponse",
+              "responsibility": "Immutable snake_case response record: short_code, total_clicks, last_clicked_at (nullable), as_of, clicks_by_day.",
+              "depends_on": [
+                "com.example.shortener.analytics.api.ClickStatsDayEntry"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.api.ClickStatsDayEntry",
+              "responsibility": "Immutable record of one UTC day bucket: date (ISO date) and count (>=1).",
+              "depends_on": []
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.repository",
+            "com.example.shortener.analytics.domain",
+            "com.example.shortener.analytics.config"
+          ]
+        },
+        {
+          "name": "com.example.shortener.analytics.recording",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.recording.ClickEventRecorder",
+              "responsibility": "Called by the existing redirect handler only after a redirect is known to be successful; builds and inserts exactly one PENDING click_outbox row (random UUID idempotency key, UTC occurred_at, hashed_ip, referrer_host) in the caller's transaction, performs no network I/O, and swallows+logs its own failures so the redirect status and Location header are never affected.",
+              "depends_on": [
+                "com.example.shortener.analytics.repository.ClickOutboxRepository",
+                "com.example.shortener.analytics.recording.IpHasher",
+                "com.example.shortener.analytics.recording.ReferrerHostExtractor",
+                "com.example.shortener.analytics.domain.ClickOutboxEntry"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.recording.IpHasher",
+              "responsibility": "Computes the lowercase hex SHA-256 of (configured static salt || client IP) and guarantees the raw IP never leaves the method (no logging, no return, no toString).",
+              "depends_on": [
+                "com.example.shortener.analytics.config.AnalyticsProperties"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.recording.ReferrerHostExtractor",
+              "responsibility": "Parses the Referer header and returns only its host component, null when the header is absent, blank, unparsable as a URI or has no host; drops path, query and fragment.",
+              "depends_on": []
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.repository",
+            "com.example.shortener.analytics.domain",
+            "com.example.shortener.analytics.config"
+          ]
+        },
+        {
+          "name": "com.example.shortener.analytics.outbox",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.outbox.OutboxPoller",
+              "responsibility": "@Scheduled (fixed delay = analytics.outbox.poll-interval-ms) trigger running on the analytics scheduler; invokes OutboxPublishService for one bounded batch per tick and never runs on a request thread.",
+              "depends_on": [
+                "com.example.shortener.analytics.outbox.OutboxPublishService",
+                "com.example.shortener.analytics.config.AnalyticsProperties"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.outbox.OutboxPublishService",
+              "responsibility": "Claims at most batchSize PENDING rows with SELECT ... FOR UPDATE SKIP LOCKED, publishes each through ClickEventProducer inside RetryExecutor, marks rows PUBLISHED with published_at, or increments attempts and schedules next_attempt_at with backoff+jitter, moving the row to FAILED (logged and metered, never retried again) once attempts are exhausted.",
+              "depends_on": [
+                "com.example.shortener.analytics.repository.ClickOutboxRepository",
+                "com.example.shortener.analytics.kafka.ClickEventProducer",
+                "com.example.shortener.analytics.support.RetryExecutor",
+                "com.example.shortener.analytics.support.AnalyticsMetrics"
+              ]
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.repository",
+            "com.example.shortener.analytics.domain",
+            "com.example.shortener.analytics.kafka",
+            "com.example.shortener.analytics.support",
+            "com.example.shortener.analytics.config"
+          ]
+        },
+        {
+          "name": "com.example.shortener.analytics.kafka",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.kafka.ClickEventProducer",
+              "responsibility": "Sends one ClickEventMessage to topic url.clicked keyed by short_code with idempotency-key and event-version headers, bounded by the configured per-attempt timeout; exposes a synchronous, timeout-bounded send used only by the poller thread.",
+              "depends_on": [
+                "com.example.shortener.analytics.kafka.ClickEventMessage",
+                "com.example.shortener.analytics.config.AnalyticsProperties"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.kafka.ClickEventMessage",
+              "responsibility": "Versioned wire record for url.clicked: schema_version, short_code, occurred_at (UTC), hashed_ip, referrer_host, idempotency_key; contains no raw IP and no other PII.",
+              "depends_on": []
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.config"
+          ]
+        },
+        {
+          "name": "com.example.shortener.analytics.consumer",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.consumer.ClickEventConsumer",
+              "responsibility": "@KafkaListener on url.clicked: deserialises ClickEventMessage (tolerant reader), delegates to ClickStatsAggregator in a single transaction, applies the shared bounded retry policy and routes exhausted messages to a logged/metered terminal state instead of infinite redelivery.",
+              "depends_on": [
+                "com.example.shortener.analytics.aggregation.ClickStatsAggregator",
+                "com.example.shortener.analytics.support.RetryExecutor",
+                "com.example.shortener.analytics.support.AnalyticsMetrics",
+                "com.example.shortener.analytics.kafka.ClickEventMessage"
+              ]
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.aggregation",
+            "com.example.shortener.analytics.kafka",
+            "com.example.shortener.analytics.support",
+            "com.example.shortener.analytics.config"
+          ]
+        },
+        {
+          "name": "com.example.shortener.analytics.aggregation",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.aggregation.ClickStatsAggregator",
+              "responsibility": "Transactionally inserts the idempotency key into processed_click_event FIRST (duplicate -> no-op return), then upserts click_stats (total +1, monotonic last_clicked_at, updated_at) and click_stats_daily using a UTC-derived day bucket.",
+              "depends_on": [
+                "com.example.shortener.analytics.repository.ProcessedClickEventRepository",
+                "com.example.shortener.analytics.repository.ClickStatsRepository",
+                "com.example.shortener.analytics.repository.ClickStatsDailyRepository",
+                "com.example.shortener.analytics.domain.ClickStats",
+                "com.example.shortener.analytics.domain.ClickStatsDaily"
+              ]
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.repository",
+            "com.example.shortener.analytics.domain"
+          ]
+        },
+        {
+          "name": "com.example.shortener.analytics.retention",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.retention.ClickRetentionJob",
+              "responsibility": "@Scheduled in-process purge deleting non-PENDING click_outbox rows older than retention.days and processed_click_event rows older than the same cutoff in bounded batches; never touches click_stats or click_stats_daily and logs only counts.",
+              "depends_on": [
+                "com.example.shortener.analytics.repository.ClickOutboxRepository",
+                "com.example.shortener.analytics.repository.ProcessedClickEventRepository",
+                "com.example.shortener.analytics.config.AnalyticsProperties",
+                "com.example.shortener.analytics.support.AnalyticsMetrics"
+              ]
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.repository",
+            "com.example.shortener.analytics.config",
+            "com.example.shortener.analytics.support"
+          ]
+        },
+        {
+          "name": "com.example.shortener.analytics.support",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.support.RetryExecutor",
+              "responsibility": "Reusable bounded retry: max attempts, exponential backoff with full jitter capped at max backoff, per-attempt timeout, injectable clock/random source for deterministic tests, and a typed RetryExhaustedException carrying attempt count and last cause.",
+              "depends_on": [
+                "com.example.shortener.analytics.config.AnalyticsProperties"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.support.AnalyticsMetrics",
+              "responsibility": "Counters and timers for outbox published/failed, consumer processed/duplicate/failed, retention rows purged and outbox backlog gauge; emits no payload fields.",
+              "depends_on": []
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.config"
+          ]
+        },
+        {
+          "name": "com.example.shortener.analytics.domain",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.domain.ClickOutboxEntry",
+              "responsibility": "JPA entity mapping click_outbox, including status/attempts/next_attempt_at transitions expressed as domain methods (markPublished, scheduleRetry, markFailed).",
+              "depends_on": [
+                "com.example.shortener.analytics.domain.OutboxStatus"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.domain.OutboxStatus",
+              "responsibility": "Enum PENDING | PUBLISHED | FAILED mirroring the click_outbox check constraint.",
+              "depends_on": []
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.domain.ClickStats",
+              "responsibility": "JPA entity mapping click_stats (short_code PK, total_clicks, last_clicked_at, updated_at).",
+              "depends_on": []
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.domain.ClickStatsDaily",
+              "responsibility": "JPA entity mapping click_stats_daily with the composite (short_code, day) key and click_count.",
+              "depends_on": []
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.domain.ProcessedClickEvent",
+              "responsibility": "JPA entity mapping processed_click_event, the consumer-side dedupe ledger keyed by idempotency_key.",
+              "depends_on": []
+            }
+          ],
+          "may_depend_on": []
+        },
+        {
+          "name": "com.example.shortener.analytics.repository",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.analytics.repository.ClickOutboxRepository",
+              "responsibility": "Persists outbox rows and exposes claimPendingBatch(limit, now) using SELECT ... FOR UPDATE SKIP LOCKED plus the bounded retention delete; no business rules.",
+              "depends_on": [
+                "com.example.shortener.analytics.domain.ClickOutboxEntry"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.repository.ClickStatsRepository",
+              "responsibility": "Upsert and read access to click_stats (increment total, monotonic last_clicked_at, updated_at).",
+              "depends_on": [
+                "com.example.shortener.analytics.domain.ClickStats"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.repository.ClickStatsDailyRepository",
+              "responsibility": "Upsert of a UTC day bucket and windowed read of the last 30 days ordered by day ascending.",
+              "depends_on": [
+                "com.example.shortener.analytics.domain.ClickStatsDaily"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.analytics.repository.ProcessedClickEventRepository",
+              "responsibility": "Insert-if-absent of an idempotency key (returns whether the row was new) and the bounded retention delete by processed_at.",
+              "depends_on": [
+                "com.example.shortener.analytics.domain.ProcessedClickEvent"
+              ]
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.domain"
+          ]
+        },
+        {
+          "name": "com.example.shortener.redirect",
+          "classes": [
+            {
+              "fqcn": "com.example.shortener.redirect.RedirectController",
+              "responsibility": "Existing public redirect endpoint; unchanged status codes and Location header. Only change: after a successful resolution it calls the recording port on the same transaction and never awaits any broker.",
+              "depends_on": [
+                "com.example.shortener.redirect.RedirectService"
+              ]
+            },
+            {
+              "fqcn": "com.example.shortener.redirect.RedirectService",
+              "responsibility": "Existing resolution logic; on success (and only on success) invokes ClickEventRecorder inside the existing transaction, then returns the unchanged redirect outcome.",
+              "depends_on": [
+                "com.example.shortener.analytics.recording.ClickEventRecorder"
+              ]
+            }
+          ],
+          "may_depend_on": [
+            "com.example.shortener.analytics.recording"
+          ]
+        }
+      ],
+      "layering_rules": [
+        "Layer order is api -> (application services) -> repository -> domain; no class may depend on a layer above it.",
+        "com.example.shortener.analytics.domain must not depend on any other application package (no Spring web, no Kafka, no repository types).",
+        "com.example.shortener.analytics.repository may depend only on ..analytics.domain; it must not depend on api, outbox, consumer, kafka, recording or retention.",
+        "com.example.shortener.analytics.api must not depend on ..analytics.outbox, ..analytics.consumer, ..analytics.kafka or ..analytics.retention: the stats endpoint reads aggregates only.",
+        "com.example.shortener.analytics.recording must not depend on ..analytics.kafka, ..analytics.outbox or any Kafka/producer type; the redirect path performs zero network I/O.",
+        "No package outside com.example.shortener.analytics.kafka and ..analytics.consumer and ..analytics.config may import org.apache.kafka.. or org.springframework.kafka...",
+        "com.example.shortener.redirect may depend on com.example.shortener.analytics.recording only; it must not reach into analytics.repository, analytics.domain or analytics.api.",
+        "Nothing in com.example.shortener.analytics may depend on com.example.shortener.redirect (analytics is a downstream consumer, not an upstream dependency): no cycles between top-level packages.",
+        "Controllers (@RestController) exist only in ..api packages; @Entity classes exist only in ..domain packages; @Repository / Spring Data interfaces only in ..repository packages.",
+        "@Scheduled methods may exist only in ..analytics.outbox and ..analytics.retention and must run on the dedicated analytics scheduler, never on a request thread.",
+        "No class may log, return or store a raw client IP: java.net.InetAddress / remote-address values may be referenced only inside ..analytics.recording.IpHasher and the redirect controller that reads the request.",
+        "Error responses are produced only by the existing global exception handler as application/problem+json; controllers must not build ad-hoc error bodies."
+      ]
+    },
+    "decisions": [
+      "ADR-1: Record clicks via a transactional outbox written in the redirect transaction and drained by an in-process poller; rejected publishing to Kafka directly from the request thread, which couples redirect latency and availability to the broker (violates AC-3 and the 5% p95 budget).",
+      "ADR-2: Claim outbox batches with SELECT ... FOR UPDATE SKIP LOCKED bounded by batchSize; rejected a leader-election/single-publisher instance, which adds coordination infrastructure and a single point of failure for a workload that is already row-partitionable.",
+      "ADR-3: Use a random per-redirect UUID as the idempotency key stored on the outbox row and carried in a Kafka header (AMB-17 default); rejected a deterministic hash of (short_code, occurred_at, hashed_ip, referrer_host), which collapses two genuine clicks that share the same millisecond, IP hash and referrer.",
+      "ADR-4: Deduplicate in the consumer by inserting into processed_click_event before any aggregate write (insert-first guard); rejected checking-then-writing or relying on Kafka exactly-once semantics, both of which double-count under concurrent redelivery (AC-6).",
+      "ADR-5: Keep click_stats and click_stats_daily in the same relational database as the shortener, owned by the analytics module (AMB-13 default); rejected a dedicated analytics datastore, which is new protected infrastructure and out of scope for this release.",
+      "ADR-6: Store per-day aggregates in a click_stats_daily table keyed (short_code, day); rejected a JSON/JSONB clicks_by_day column on click_stats, which makes concurrent per-day increments a read-modify-write hot spot and blocks indexed window queries.",
+      "ADR-7: Return clicks_by_day as a sparse ascending list over the last 30 UTC days and 200/0/null/empty for a zero-click code (AMB-14 and AMB-15 defaults); rejected dense zero-filled days (bigger payload, server-side calendar synthesis) and rejected 404 for zero clicks (conflates 'no data' with 'no such link').",
+      "ADR-8: Expose freshness through an explicit as_of field taken from click_stats.updated_at; rejected presenting stats as strongly consistent by reading the outbox at query time, which would put analytics work on the read path and still not be exact.",
+      "ADR-9: Implement one shared RetryExecutor with bounded attempts, exponential backoff, full jitter, per-attempt timeout and an injectable random source (defaults 5 / 100 ms / 10 s, configurable per AMB-12 and AMB-18); rejected Kafka's built-in infinite producer retries and a dead-letter topic, which either retry forever or require infrastructure-owned topic provisioning.",
+      "ADR-10: Terminal failures move the outbox row to FAILED with a truncated last_error plus a metric; rejected deleting failed rows or leaving them PENDING, which respectively loses evidence and creates an unbounded retry loop (AC-5).",
+      "ADR-11: Hash client IPs with SHA-256 over a single static salt supplied by the existing secret mechanism and never commit the salt; rejected storing truncated or encrypted IPs, which remain reversible/re-identifiable personal data (AC-10).",
+      "ADR-12: Purge raw click rows with an in-process scheduled job in bounded batches, excluding PENDING outbox rows (AMB-16 default); rejected a DB partition-drop job, which needs protected DDL/infrastructure ownership now and is deferred to the contract phase.",
+      "ADR-13: Version the url.clicked payload with an explicit schema_version field plus an event-version header and tolerant-reader consumers; rejected an unversioned payload or a schema registry, the first blocking safe evolution and the second adding infrastructure outside this release's scope.",
+      "ADR-14: Ship the stats endpoint as a purely additive operation under the existing /api/v1 path prefix and existing auth scheme, with the committed src/main/resources/openapi.yaml as the single source of truth verified against the springdoc dump from -Pit verify; rejected a new /api/v2 prefix or changing the redirect response shape, which breaks existing consumers (AC-14).",
+      "ADR-15: Errors are emitted as application/problem+json by the existing global exception handler; rejected per-controller ad-hoc error bodies, which drift from the committed contract and fail the contract gate.",
+      "ADR-16: Existing operations (redirectToTargetUrl, createShortUrl, getShortUrl) are documented here as-is and must be reconciled byte-for-byte with what the running application exposes before the contract gate runs; rejected rewriting them to a 'cleaner' shape, which would be a breaking change requiring an api.contract.breaking_change approval."
+    ]
+  },
+  "usage": {
+    "tokens_in": 16944,
+    "tokens_out": 20672,
+    "cost_usd": 0.60152
+  }
+}

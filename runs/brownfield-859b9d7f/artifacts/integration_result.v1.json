@@ -1,0 +1,22 @@
+{
+  "task_id": "integration_tests",
+  "attempt": 1,
+  "gates": [
+    {
+      "gate_id": "integration",
+      "required": true,
+      "status": "FAILED",
+      "took_seconds": 70.745,
+      "findings": [
+        {
+          "file": null,
+          "line": null,
+          "rule": "gate.integration",
+          "message": "exit 137",
+          "suggested_fix": "see stdout_tail"
+        }
+      ],
+      "stdout_tail": "s.invokeMethodWithArray(ReflectionUtils.java:125)\n\tat org.apache.maven.surefire.junitplatform.LauncherAdapter.executeWithCancellationToken(LauncherAdapter.java:68)\n\tat org.apache.maven.surefire.junitplatform.LauncherAdapter.execute(LauncherAdapter.java:54)\n\tat org.apache.maven.surefire.junitplatform.JUnitPlatformProvider.execute(JUnitPlatformProvider.java:203)\n\tat org.apache.maven.surefire.junitplatform.JUnitPlatformProvider.invokeAllTests(JUnitPlatformProvider.java:168)\n\tat org.apache.maven.surefire.junitplatform.JUnitPlatformProvider.invoke(JUnitPlatformProvider.java:136)\n\tat org.apache.maven.surefire.booter.ForkedBooter.runSuitesInProcess(ForkedBooter.java:385)\n\tat org.apache.maven.surefire.booter.ForkedBooter.execute(ForkedBooter.java:162)\n\tat org.apache.maven.surefire.booter.ForkedBooter.run(ForkedBooter.java:507)\n\tat org.apache.maven.surefire.booter.ForkedBooter.main(ForkedBooter.java:495)\n14:10:21.275 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.282 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.282 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 0 ms\n14:10:21.297 [main] WARN com.example.shortener.read.RedirectController -- Click recording is disabled: no ClickEventRecorder is wired\n14:10:21.367 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.369 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.370 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 1 ms\n14:10:21.452 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.452 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.458 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 6 ms\n14:10:21.599 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.599 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.599 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 0 ms\n14:10:21.636 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.637 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.638 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 1 ms\n14:10:21.712 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.712 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.713 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 1 ms\n14:10:21.861 [main] WARN com.example.shortener.read.RedirectController -- Click recording is disabled: no ClickEventRecorder is wired\n14:10:21.992 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:21.992 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:21.994 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 2 ms\n14:10:22.142 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n14:10:22.143 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n14:10:22.154 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 3 ms\nKilled\n"
+    }
+  ]
+}

@@ -89,6 +89,19 @@
       <artifactId>spring-boot-starter-data-redis</artifactId>
     </dependency>
 
+    <!--
+      Click analytics (T1). The starter brings org.springframework.kafka:spring-kafka plus Boot's
+      Kafka auto-configuration (KafkaTemplate, spring.kafka.*). No broker connection is opened at
+      start-up: producers connect on first send and there is no listener until a later task adds one.
+      Retry/backoff for the outbox relay uses the framework's built-in org.springframework.core.retry
+      (RetryTemplate / RetryPolicy with exponential backoff and jitter, Spring Framework 7), so no
+      additional resilience library is required; the knobs live in AnalyticsProperties.retry.
+    -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-kafka</artifactId>
+    </dependency>
+
     <!-- Test -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
@@ -114,6 +127,17 @@
       <groupId>com.redis</groupId>
       <artifactId>testcontainers-redis</artifactId>
       <version>${testcontainers-redis.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- Kafka test support (T1): embedded broker for unit-level tests, container for *IT.java. -->
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-kafka</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>
