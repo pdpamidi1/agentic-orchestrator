@@ -57,7 +57,7 @@ sdlc metrics <run_id>
 sdlc graph | pbcopy                         # mermaid of the DAG
 ```
 Live: `cp .env.example .env`, set `ANTHROPIC_API_KEY`, then `sdlc run --scenario greenfield --record`.
-Brownfield offline: add `SDLC_WORKSPACE=tests/fixtures/brownfield_ws` and `sdlc run --scenario brownfield`; the impact
+Brownfield offline: `sdlc run --scenario brownfield --workspace tests/fixtures/brownfield_ws`; the impact
 node runs on the repo map, the migration and dependency tasks each pause for approval, and the compliance scan
 catches a raw-IP field on attempt 1.
 Ambiguous offline: `sdlc run --scenario ambiguous` pauses with 6 questions; `sdlc answer <run_id> '{"AMB-1": "..."}'`

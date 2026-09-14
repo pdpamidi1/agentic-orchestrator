@@ -41,13 +41,14 @@ def run(
     scenario: str = typer.Option(..., help="greenfield | brownfield | ambiguous"),
     replay: bool = typer.Option(False, help="cached LLM responses + recorded patches; no API key"),
     record: bool = typer.Option(False, help="live run that also writes the replay cache"),
+    workspace: str = typer.Option(None, help="brownfield: existing project copied into the sandbox"),
 ) -> None:
     """Start a run (``POST /runs``) and print its id, status, node statuses and pending questions.
 
     ``--replay`` and ``--record`` are mutually exclusive in effect: the server rejects ``--record`` when
     the resolved mode is replay (nothing to record).
     """
-    _post("/runs", {"scenario": scenario, "replay": replay, "record": record})
+    _post("/runs", {"scenario": scenario, "replay": replay, "record": record, "workspace": workspace})
 
 
 @app.command()

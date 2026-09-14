@@ -181,6 +181,7 @@ class OrchestratorService:
         replay: bool = False,
         record: bool = False,
         extra: dict[str, str] | None = None,
+        workspace: Path | None = None,
     ) -> LiveRun:
         """Create and execute a new run until it completes, halts or pauses on a checkpoint.
 
@@ -205,7 +206,9 @@ class OrchestratorService:
         text = requirement_text or (self.s.specs_dir / f"{scenario}.md").read_text(encoding="utf-8")
         sandbox = self.s.runs_dir / run_id / "sandbox"
         sandbox.mkdir(parents=True, exist_ok=True)
-        seeded = await asyncio.to_thread(_seed, self.s.workspace, sandbox)
+        # brownfield only when the caller names a workspace: Settings.workspace is the delivery default and
+        # must never turn a greenfield run into a seeded one just because a project was delivered earlier
+        seeded = await asyncio.to_thread(_seed, workspace, sandbox) if workspace is not None else False
         ctx = RunContext(
             run_id=run_id,
             scenario=scenario,

@@ -40,6 +40,7 @@ class StartRun(BaseModel):
     requirement_text: str | None = None
     replay: bool = False
     record: bool = False
+    workspace: str | None = None  # brownfield: directory copied into the sandbox as the baseline
 
 
 class Answers(BaseModel):
@@ -65,7 +66,13 @@ async def start_run(body: StartRun, bg: BackgroundTasks) -> dict[str, Any]:
     pending clarification questions. A ``--record`` request in replay mode raises ``RuntimeError`` in the
     service, which FastAPI surfaces as a 500.
     """
-    live = await svc.start(body.scenario, body.requirement_text, replay=body.replay, record=body.record)
+    live = await svc.start(
+        body.scenario,
+        body.requirement_text,
+        replay=body.replay,
+        record=body.record,
+        workspace=Path(body.workspace) if body.workspace else None,
+    )
     return {
         "run_id": live.state.run_id,
         "status": live.state.status,

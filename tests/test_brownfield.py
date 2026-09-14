@@ -20,7 +20,7 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "brownfield_ws"
 async def test_brownfield_offline_loop_then_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     svc = OrchestratorService(settings(tmp_path, target_stack="python", workspace=FIXTURE))
-    live = await svc.start("brownfield", record=True)
+    live = await svc.start("brownfield", record=True, workspace=FIXTURE)
     run_id = live.state.run_id
     st = live.state
 
@@ -87,7 +87,7 @@ async def test_brownfield_offline_loop_then_replay(tmp_path: Path, monkeypatch: 
 
     # the recorded run replays to completion with no key, approvals auto-granted
     rep = OrchestratorService(settings(tmp_path, llm="auto", target_stack="python", workspace=FIXTURE))
-    replayed = await rep.start("brownfield", replay=True)
+    replayed = await rep.start("brownfield", replay=True, workspace=FIXTURE)
     assert replayed.state.status == RunStatus.COMPLETED, (replayed.state.halt_reason, replayed.state.nodes)
     rm2 = compute(replayed.state.run_id, rep.trace.events(replayed.state.run_id))
     assert (rm2.retry_count, rm2.rollback_count, rm2.llm_cost_usd, rm2.human_checkpoints) == (1, 1, 0.0, 0)
