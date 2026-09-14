@@ -23,7 +23,7 @@ async def test_fake_executor_writes_module_test_and_release_files(ctx: RunContex
     plan, design = Plan.model_validate(CANNED["Plan"]), Design.model_validate(CANNED["Design"])
     git = GitSandbox(ctx.sandbox)
     await git.ensure_repo()
-    ex = FakeExecutor()
+    ex = FakeExecutor(plant_scope_violation=False)
 
     r1 = await ex.execute(ctx, plan.tasks[0], design, None)
     assert isinstance(r1, Done) and r1.commit_sha
@@ -42,6 +42,22 @@ async def test_fake_executor_writes_module_test_and_release_files(ctx: RunContex
     assert (ctx.sandbox / "openapi.yaml").read_text() == design.api.openapi_yaml  # contract from the Design
     _, log = await git._git("log", "--oneline")
     assert len(log.splitlines()) == 4  # initial + one commit per task
+
+
+async def test_fake_executor_plants_a_forbidden_write_on_the_first_attempt_only(ctx: RunContext) -> None:
+    plan, design = Plan.model_validate(CANNED["Plan"]), Design.model_validate(CANNED["Design"])
+    git = GitSandbox(ctx.sandbox)
+    await git.ensure_repo()
+    r1 = await FakeExecutor().execute(ctx, plan.tasks[0], design, None)
+    assert isinstance(r1, Done) and ".env" in r1.files_changed
+    await git.revert(r1.commit_sha)  # what the handler does after the policy engine says VIOLATION
+    assert not (ctx.sandbox / ".env").exists() and not (ctx.sandbox / "src").exists()
+    r2 = await FakeExecutor().execute(ctx, plan.tasks[0], design, {"attempt": 1, "reason": "violated"})
+    assert (
+        isinstance(r2, Done) and ".env" not in r2.files_changed and "src/shortener/t1.py" in r2.files_changed
+    )
+    calls = [e for e in ctx.trace.events("r1") if e.kind == Kind.EXECUTOR_CALL]
+    assert [(e.attempt, e.payload["planted_violation"]) for e in calls] == [(1, True), (2, False)]
 
 
 async def test_sandbox_excludes_tool_output_from_the_diff(tmp_path: Path) -> None:
@@ -71,6 +87,24 @@ async def test_greenfield_runs_to_approval_release_offline(
     )
     assert set(live.ctx.get("changeset").commits) == {"T1", "T2", "T3"}  # paused on the HIGH release task
 
+    # the planted failure: attempt 1 wrote .env -> VIOLATION -> revert -> attempt 2 clean
+    events = svc.trace.events(run_id)
+    violation = next(e for e in events if e.kind == Kind.POLICY_DECISION and e.status == "VIOLATION")
+    assert violation.task_id == "T1"
+    assert {f["rule"] for f in violation.payload["findings"]} >= {"change_control.forbidden_path"}
+    assert {f["file"] for f in violation.payload["findings"] if f["file"]} == {".env"}
+    reverted = [e for e in events if e.kind == Kind.ROLLED_BACK]
+    assert len(reverted) == 1 and reverted[0].task_id == "T1"
+    impl_attempts = [
+        e.attempt for e in events if e.kind == Kind.ATTEMPT_STARTED and e.node_id == "implementation"
+    ]
+    assert impl_attempts == [1, 2]
+    failed = next(e for e in events if e.kind == Kind.ATTEMPT_FAILED and e.node_id == "implementation")
+    assert failed.attempt == 1
+    assert not (live.ctx.sandbox / ".env").exists()
+    _, log = await GitSandbox(live.ctx.sandbox)._git("log", "--oneline")
+    assert any(line.split(" ", 1)[1].startswith("Revert") for line in log.splitlines())
+
     live = await svc.approve(run_id, "implementation", "pdp")
     st = live.state
     assert st.status == RunStatus.AWAITING_APPROVAL, (st.status, st.halt_reason)
@@ -95,7 +129,7 @@ async def test_greenfield_runs_to_approval_release_offline(
 
     events = svc.trace.events(run_id)
     decisions = [e for e in events if e.kind == Kind.POLICY_DECISION]
-    assert {e.status for e in decisions} == {"OK", "APPROVED"}
+    assert {e.status for e in decisions} == {"VIOLATION", "OK", "APPROVED"}
     t4 = next(e for e in decisions if e.task_id == "T4" and e.status == "OK")
     assert t4.payload["approved_actions"] == ["infrastructure.change", "release.config"]
     gates = {(e.actor, e.status) for e in events if e.kind == Kind.GATE_RESULT}
@@ -107,4 +141,6 @@ async def test_greenfield_runs_to_approval_release_offline(
     } <= gates
     assert all(s != "FAILED" for _, s in gates)
     m = compute(run_id, events)
-    assert m.replans == 0 and m.human_checkpoints == 3 and m.rollback_count == 0
+    assert m.replans == 0 and m.human_checkpoints == 3
+    assert m.retry_count == 1 and m.rollback_count == 1 and m.task_success_rate == 1.0
+    assert m.mttr_seconds is not None and m.mttr_seconds >= 0

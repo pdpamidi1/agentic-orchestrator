@@ -19,7 +19,8 @@ make run                                    # API on :8080
 sdlc run --scenario greenfield --replay     # no API key; uses runs/cache
 SDLC_LLM=fake SDLC_TARGET_STACK=python make run   # offline loop: canned agents + fake executor; then:
 sdlc run --scenario greenfield              #   pauses at approval_design like a live run
-sdlc approve <run_id> approval_design       #   runs tasks, pauses on the HIGH release task
+sdlc approve <run_id> approval_design       #   attempt 1 writes .env -> VIOLATION + revert; attempt 2 clean;
+                                            #   then pauses on the HIGH release task
 sdlc approve <run_id> implementation        #   gates -> validation -> release_readiness -> approval_release
 sdlc approve <run_id> approval_design
 sdlc metrics <run_id>

@@ -7,6 +7,10 @@ When the task's allowed_files name release artifacts (README, openapi.yaml, Dock
 writes those too; the OpenAPI document is taken from the Design so the contract stays spec-driven.
 The output is just enough for the python gates in policy.yaml to pass: compileall, ruff/mypy, the
 architecture test, `pytest tests/unit --cov`, `pytest tests/integration`, and the release checklist.
+
+Planted failure (TASKS T5): on the node's first attempt the first task also writes `.env`, a forbidden path,
+so every fake run demonstrates POLICY_DECISION=VIOLATION -> revert -> a clean second attempt. The policy
+engine, not the executor, is what catches it.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from ..sandbox.git import GitSandbox
 from .base import Done, ExecResult
 
 RELEASE_FILES = ("README.md", "openapi.yaml", "Dockerfile", ".github/workflows/ci.yml")
+PLANTED_FILE = ".env"  # policy.change_control.forbidden_paths: never writable, under any approval
 
 
 def _allowed(path: str, patterns: list[str]) -> bool:
@@ -36,6 +41,9 @@ def _ident(s: str) -> str:
 
 
 class FakeExecutor:
+    def __init__(self, plant_scope_violation: bool = True) -> None:
+        self.plant_scope_violation = plant_scope_violation
+
     def render(self, task: TaskSpec, design: Design, existing: set[str]) -> dict[str, str]:
         """Files to write for this task (path -> content). Scaffolding is written once per sandbox."""
         pkg = _ident((design.classes.packages[0].name if design.classes.packages else "app").split(".")[0])
@@ -111,11 +119,27 @@ class FakeExecutor:
         base = await git.base_ref()
         existing = await asyncio.to_thread(_tree, ctx.sandbox)
         files = self.render(task, design, existing)
+        attempt = (feedback or {}).get("attempt", 0) + 1
+        planted = (
+            self.plant_scope_violation and attempt == 1 and not any(f.startswith("src/") for f in existing)
+        )
+        if (
+            planted
+        ):  # first task of the node's first attempt: out-of-scope write for the policy engine to catch
+            files[PLANTED_FILE] = (
+                "# planted by the fake executor: agents must never write env files\nAPP_ENV=local\n"
+            )
         for rel, content in files.items():
             await asyncio.to_thread(_write, ctx.sandbox / rel, content)
         changed = await git.changed_files(base)
         sha = await git.commit_task(task.id, task.title, ctx.run_id)
-        ctx.emit(Kind.EXECUTOR_CALL, task_id=task.id, actor="fake-executor", payload={"files": changed})
+        ctx.emit(
+            Kind.EXECUTOR_CALL,
+            task_id=task.id,
+            attempt=attempt,
+            actor="fake-executor",
+            payload={"files": changed, "planted_violation": planted},
+        )
         return Done(
             files_changed=changed,
             tests_added=[f for f in changed if f.startswith("tests/")],

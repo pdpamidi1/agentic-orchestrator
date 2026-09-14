@@ -101,6 +101,13 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor) -> dict[str, Any]:
                     )
                     if not verdict.ok:
                         await git.revert(r.commit_sha)
+                        ctx.emit(
+                            Kind.ROLLED_BACK,
+                            node_id=node.id,
+                            task_id=t.id,
+                            actor="orchestrator",
+                            payload={"commit": r.commit_sha, "reason": "change control violation"},
+                        )
                         return Retry(
                             f"task {t.id} violated change control",
                             {"task": t.id, "findings": [f.model_dump() for f in verdict.findings]},

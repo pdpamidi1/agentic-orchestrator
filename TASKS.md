@@ -13,7 +13,7 @@ Status legend: [ ] todo · [~] in progress · [x] done
 - [x] **T4 Gates**: implement `openapi_diff` (python: import app and call `app.openapi()`; java: parse committed
       `openapi.yaml` vs springdoc dump produced by the integration gate) and the `architecture` gate for python via
       import-linter contract generated from `Design.classes.layering_rules`. Tests with fixture repos under `tests/fixtures/`.
-- [ ] **T5 Planted failure**: in the fake executor, make attempt 1 of `implementation` violate `scope` (write `.env`),
+- [x] **T5 Planted failure**: in the fake executor, make attempt 1 of `implementation` violate `scope` (write `.env`),
       assert the run shows `POLICY_DECISION=VIOLATION`, a revert, and attempt 2 passing. This is the demo's best minute.
 - [ ] **T6 Live agents**: run `sdlc run --scenario greenfield --record` with a real key; fix prompts until every schema
       validates within `max_repairs`. Commit `runs/cache/llm/*.json`.
