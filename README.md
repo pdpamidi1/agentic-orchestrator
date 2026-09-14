@@ -36,6 +36,8 @@ Offline golden run: start the API with `SDLC_LLM=fake SDLC_TARGET_STACK=python`,
 twice; the run is now in `runs/cache/` and `sdlc run --scenario greenfield --replay` completes it with no key.
 
 ## Running the delivered url-shortener
+The first delivered project lives in [`workspace/url-shortener`](workspace/url-shortener) (run `greenfield-a37c3044`,
+Java 25 / Spring Boot 4 / Maven, see its README for endpoints and profiles).
 `sdlc deliver <run_id>` copies a COMPLETED run into `workspace/url-shortener` (a standalone Spring Boot / Maven
 project: `./mvnw test`, `./mvnw -Pit verify`). To run it against real Postgres and Redis and look at the data:
 ```bash

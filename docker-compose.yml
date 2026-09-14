@@ -29,13 +29,14 @@ services:
       shortener-postgres: { condition: service_healthy }
       shortener-redis: { condition: service_healthy }
     ports: ["8081:8080"]
-    environment:                                # Spring Boot relaxed binding overrides application*.yml
-      SPRING_DATASOURCE_URL: jdbc:postgresql://shortener-postgres:5432/shortener
-      SPRING_DATASOURCE_USERNAME: shortener
-      SPRING_DATASOURCE_PASSWORD: shortener
-      SPRING_DATA_REDIS_HOST: shortener-redis
-      SPRING_DATA_REDIS_PORT: "6379"
-      APP_BASE_URL: http://localhost:8081       # short_url host returned by POST /api/v1/urls
+    environment:                                # the variables the delivered app documents (application.yml)
+      SHORTENER_DB_URL: jdbc:postgresql://shortener-postgres:5432/shortener
+      SHORTENER_DB_USERNAME: shortener
+      SHORTENER_DB_PASSWORD: shortener
+      SHORTENER_REDIS_HOST: shortener-redis
+      SHORTENER_REDIS_PORT: "6379"
+      SHORTENER_BASE_URL: http://localhost:8081  # short_url host returned by POST /api/v1/urls
+      # SPRING_PROFILES_ACTIVE: read | write      # default = both surfaces
       SPRING_KAFKA_BOOTSTRAP_SERVERS: shortener-kafka:9092   # used only when the project has the Kafka starter
   # Kafka for the brownfield click-analytics scenario (url.clicked topic); greenfield needs none (ADR-012).
   # Start it on demand: docker compose --profile shortener --profile shortener-kafka up -d
