@@ -200,3 +200,16 @@ def test_conventions_render_paths_gates_and_provisioned_files() -> None:
     assert (
         "pytest -q tests/unit" in python and "tests/test_architecture.py" in python and "mvnw" not in python
     )
+
+
+async def test_truncated_reply_retries_with_a_larger_token_budget() -> None:
+    truncated = ValueError(
+        "1 validation error for Docs\n  Invalid JSON: EOF while parsing a string at line 1 column 39971 "
+        '[type=json_invalid, input_value=\'{"readme_md":"# URL Shor...\']'
+    )
+    spec = Spec.model_validate(CANNED["Spec"])
+    ac, calls = fake_anthropic([truncated, truncated, ok_response(spec)])
+    out, _ = await ac.structured("sys", "prompt", Spec, max_repairs=2)
+    assert out == spec
+    assert [c["max_tokens"] for c in calls] == [16000, 32000, 48000]
+    assert all(len(c["messages"]) == 1 for c in calls)  # truncation adds no repair message

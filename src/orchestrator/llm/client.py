@@ -100,7 +100,8 @@ class AnthropicClient:
         "claude-fable-5-1": (10.0, 50.0),
         "claude-fable-5": (10.0, 50.0),
     }
-    MAX_TOKENS = 16000
+    MAX_TOKENS = 16000  # first attempt; a truncated reply doubles it up to MAX_TOKENS_CAP
+    MAX_TOKENS_CAP = 48000
 
     def __init__(self, model: str, api_key: str | None = None, workspace_id: str | None = None) -> None:
         import anthropic
@@ -121,17 +122,21 @@ class AnthropicClient:
         messages: list[MessageParam] = [{"role": "user", "content": prompt}]
         usage = Usage()
         last_error = ""
+        max_tokens = self.MAX_TOKENS
         for _ in range(max_repairs + 1):
             try:
                 resp = await self.client.messages.parse(
                     model=self.model,
-                    max_tokens=self.MAX_TOKENS,
+                    max_tokens=max_tokens,
                     system=system,
                     messages=messages,
                     output_format=schema,
                 )
             except ValueError as e:  # pydantic ValidationError / bad JSON: repair with the errors as feedback
                 last_error = str(e)
+                if _truncated(last_error) and max_tokens < self.MAX_TOKENS_CAP:
+                    max_tokens = min(max_tokens * 2, self.MAX_TOKENS_CAP)  # not the model's fault: more room
+                    continue
                 messages.append(
                     {
                         "role": "user",
@@ -182,3 +187,8 @@ class RecordingClient:
             encoding="utf-8",
         )
         return out, usage
+
+
+def _truncated(error: str) -> bool:
+    """A reply cut off at max_tokens surfaces as unterminated JSON, not as a schema error."""
+    return "EOF while parsing" in error or "json_invalid" in error
