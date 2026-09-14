@@ -9,3 +9,6 @@ runs/sdlc.db
 workspace/
 .venv/
 *.egg-info/
+.env.*
+.env *
+!.env.example

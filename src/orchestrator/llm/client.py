@@ -98,14 +98,18 @@ class AnthropicClient:
         "claude-sonnet-4-6": (3.0, 15.0),
         "claude-haiku-4-5": (1.0, 5.0),
         "claude-fable-5-1": (10.0, 50.0),
+        "claude-fable-5": (10.0, 50.0),
     }
     MAX_TOKENS = 16000
 
-    def __init__(self, model: str, api_key: str | None = None) -> None:
+    def __init__(self, model: str, api_key: str | None = None, workspace_id: str | None = None) -> None:
         import anthropic
 
         self.model = model
-        self.client = anthropic.AsyncAnthropic(api_key=api_key)
+        self.workspace_id = workspace_id
+        # keys not scoped to a workspace must name one on every request (anthropic-workspace-id)
+        headers = {"anthropic-workspace-id": workspace_id} if workspace_id else None
+        self.client = anthropic.AsyncAnthropic(api_key=api_key, default_headers=headers)
 
     def _cost(self, tokens_in: int, tokens_out: int) -> float:
         pin, pout = self.PRICES.get(self.model, (5.0, 25.0))

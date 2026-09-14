@@ -96,7 +96,7 @@ class OrchestratorService:
             api_key = self._api_key()
             if not api_key:
                 raise RuntimeError("SDLC_LLM=anthropic requires ANTHROPIC_API_KEY (or use SDLC_LLM=fake)")
-            llm = AnthropicClient(self.s.model, api_key)
+            llm = AnthropicClient(self.s.model, api_key, self.s.anthropic_workspace_id)
             executor = ClaudeCodeCliExecutor()
         else:
             raise ValueError(f"unknown llm mode {mode!r}")
