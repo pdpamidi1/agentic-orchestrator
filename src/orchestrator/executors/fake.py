@@ -11,6 +11,17 @@ architecture test, `pytest tests/unit --cov`, `pytest tests/integration`, and th
 Planted failure (TASKS T5): on the node's first attempt the first task also writes `.env`, a forbidden path,
 so every fake run demonstrates POLICY_DECISION=VIOLATION -> revert -> a clean second attempt. The policy
 engine, not the executor, is what catches it.
+
+Where it sits: selected by `service.py` when `SDLC_LLM=fake`, with the plant chosen per scenario from
+`llm/fake.py#PLANTED` ("scope" greenfield, "pii" brownfield, "test" ambiguous). Under `--record` it is
+wrapped by `RecordingExecutor`, which is how the offline golden run's patches are produced.
+
+Invariants: no network, no LLM, deterministic content for a given (TaskSpec, Design, existing tree);
+never writes outside `task.allowed_files` except for the planted `.env`; scaffolding files (package
+`__init__`, conftest, app, README...) are written once per sandbox and never overwritten.
+
+Trace events: one `EXECUTOR_CALL` per task attempt (actor `fake-executor`, files written, whether a
+failure was planted). Files written: the generated sources/tests inside the sandbox plus one git commit.
 """
 
 from __future__ import annotations
@@ -27,30 +38,66 @@ from ..models.trace import Kind
 from ..sandbox.git import GitSandbox
 from .base import Done, ExecResult
 
+# Release artifacts a task may own by name (the greenfield plan's T4). They are written with `once` when
+# allowed and skipped by the concrete-path loop so the Design-derived openapi.yaml is never stubbed over.
 RELEASE_FILES = ("README.md", "openapi.yaml", "Dockerfile", ".github/workflows/ci.yml")
 PLANTED_FILE = ".env"  # policy.change_control.forbidden_paths: never writable, under any approval
 
 
 def _allowed(path: str, patterns: list[str]) -> bool:
+    """True when `path` matches one of the task's `allowed_files` globs.
+
+    `fnmatch` has no `**` semantics, so each pattern is also tried with its `**/` prefix stripped
+    (`src/**` matches `src/pkg/mod.py` through the plain `*`, and `**/x.py` matches `x.py`).
+    """
     return any(fnmatch.fnmatch(path, p) or fnmatch.fnmatch(path, p.replace("**/", "")) for p in patterns)
 
 
 def _ident(s: str) -> str:
+    """Turn an arbitrary string (task id, package name, operationId) into a valid python identifier.
+
+    Non-word characters become underscores; a leading non-letter gets a `t_` prefix so `T1` -> `t1` and
+    `2fa` -> `t_2fa`.
+    """
     ident = re.sub(r"\W", "_", s.lower())
     return ident if ident[:1].isalpha() else f"t_{ident}"
 
 
 class FakeExecutor:
+    """Deterministic stand-in for a coding agent: writes stubs that satisfy the python gates and commits.
+
+    One instance per run; `plant` decides which failure the first attempt demonstrates. `render()` is a
+    pure function of its inputs and is unit-tested on its own; `execute()` adds the plant, writes files,
+    commits and emits the trace event.
+    """
+
     def __init__(self, plant: str | None = "scope") -> None:
+        """Choose the planted failure: "scope" (writes .env), "pii" (raw IP field), "test" (failing unit
+        test) or None for a clean run."""
         self.plant = plant  # "scope" writes .env; "pii" persists a raw IP field; None plants nothing
 
     def render(self, task: TaskSpec, design: Design, existing: set[str]) -> dict[str, str]:
-        """Files to write for this task (path -> content). Scaffolding is written once per sandbox."""
+        """Files to write for this task (path -> content). Scaffolding is written once per sandbox.
+
+        `existing` is the set of files already in the sandbox (relative paths); anything routed through
+        the local `once()` helper is skipped when present or when the task's `allowed_files` do not cover
+        it. What is produced, in order:
+        - `src/<pkg>/<task>.py` + `tests/unit/test_<task>.py` when the task may touch that module path;
+          with them, one-time scaffolding: the package `__init__`, `tests/conftest.py` (puts `src` on
+          sys.path), one `__init__` per Design package (the layering rules name them), a FastAPI `app.py`
+          mirroring the Design contract plus a test pinning its paths, and an integration smoke test;
+        - a stub for every concrete (glob-free, non-release) path the task owns, e.g. a migration file or
+          `pyproject.toml`; an existing file gets the stub appended (`_APPEND` marker) rather than replaced;
+        - the release artifacts (README from `design.decisions`, openapi.yaml verbatim from the Design,
+          Dockerfile, CI workflow), each only if allowed and absent.
+        `<pkg>` is the first segment of the first Design package (or `app`).
+        """
         pkg = _ident((design.classes.packages[0].name if design.classes.packages else "app").split(".")[0])
         mod = _ident(task.id)
         out: dict[str, str] = {}
 
         def once(path: str, content: str) -> None:
+            """Queue `path` only if it is absent from the sandbox and inside the task's allowed files."""
             if path not in existing and _allowed(path, task.allowed_files):
                 out[path] = content
 
@@ -81,6 +128,7 @@ class FakeExecutor:
                     f'"""{p.name}: {p.classes[0].responsibility if p.classes else ""}"""\n',
                 )
             if design.api.operations:
+                # the contract gate compares app.openapi() with the committed openapi.yaml / Design.api
                 paths = sorted({o.path for o in design.api.operations})
                 once(f"src/{pkg}/app.py", _render_app(design, pkg))
                 once(
@@ -119,6 +167,18 @@ class FakeExecutor:
     async def execute(
         self, ctx: RunContext, task: TaskSpec, design: Design, feedback: dict[str, Any] | None
     ) -> ExecResult:
+        """Write the rendered files (plus the planted failure on attempt 1), commit, and report `Done`.
+
+        `feedback["attempt"]` is the node-level count of earlier attempts, so the plant fires for tasks run
+        during the node's first attempt; a scope/pii violation then fails that attempt, which is why only
+        the first task carries it in practice. Plants: "scope" adds `.env` (forbidden path -> policy
+        VIOLATION -> revert); "test" adds a unit test that always fails (validation -> diagnose -> replan,
+        it survives because it is never a policy violation); "pii" appends a `raw_ip_address` line to the
+        first rendered file so the compliance scan trips.
+
+        Side effects: files written in the sandbox (append semantics for `_APPEND`-marked stubs), one git
+        commit, one `EXECUTOR_CALL` event. Never returns `BlockedTask` or `Errored`.
+        """
         git = GitSandbox(ctx.sandbox)
         base = await git.head()
         existing = await asyncio.to_thread(_tree, ctx.sandbox)
@@ -159,11 +219,18 @@ class FakeExecutor:
         )
 
 
+# Prefix marking a stub that must be appended to an existing file instead of replacing it; `_write` strips
+# nothing, so the marker also stays visible in the file as a comment.
 _APPEND = "\n# --- appended by the fake executor ---\n"
 
 
 def _stub(path: str, task: TaskSpec, design: Design) -> str:
-    """Content for a concrete path a task owns, by extension."""
+    """Content for a concrete path a task owns, by extension.
+
+    `.py` -> an alembic-shaped module with `upgrade`/`downgrade` naming the task's tables; `.toml` -> a
+    comment line standing in for a dependency declaration; `.sql` -> one `CREATE TABLE IF NOT EXISTS` per
+    table in `data_model_slice`; anything else -> a one-line comment with the task id and title.
+    """
     if path.endswith(".py"):
         tables = ", ".join(task.data_model_slice) or "n/a"
         return (
@@ -184,7 +251,12 @@ def _stub(path: str, task: TaskSpec, design: Design) -> str:
 
 
 def _render_app(design: Design, pkg: str) -> str:
-    """A FastAPI app whose OpenAPI document is exactly the Design contract (operation ids, paths, codes)."""
+    """A FastAPI app whose OpenAPI document is exactly the Design contract (operation ids, paths, codes).
+
+    One route per `design.api.operations` entry: the lowest response code is the route's `status_code`, the
+    others go into `responses=` so they appear in `app.openapi()`; every handler just returns that status.
+    This is what the `contract` gate dumps via `sandbox/openapi_dump.py` and diffs against the Design.
+    """
     lines = [
         '"""FastAPI app exposing the Design API contract (fake executor)."""',
         "",
@@ -211,10 +283,18 @@ def _render_app(design: Design, pkg: str) -> str:
 
 
 def _tree(root: Path) -> set[str]:
+    """All regular files under `root` as relative POSIX-ish strings, ignoring the `.git` directory.
+
+    Runs in a worker thread; used to decide which scaffolding already exists.
+    """
     return {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and ".git" not in p.parts}
 
 
 def _write(path: Path, content: str, append: bool = False) -> None:
+    """Write `content` to `path`, creating parents; with `append` and an existing file, concatenate instead.
+
+    Runs in a worker thread so the event loop is not blocked by sandbox I/O.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     if append and path.exists():
         content = path.read_text(encoding="utf-8") + content

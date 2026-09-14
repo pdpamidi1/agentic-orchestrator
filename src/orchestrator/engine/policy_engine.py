@@ -1,6 +1,20 @@
 """
 Change-control and security policy, enforced at the write boundary and in the `scope`/`security` gates.
 Every decision is returned as a structured verdict so the caller can emit a POLICY_DECISION trace event.
+
+Where it sits: an ``engine`` leaf over the parsed ``policy.yaml`` (``models/policy.py``). Two callers:
+- ``engine/handlers.py`` (executor node): right after each task commits, ``check_scope`` on the task's files
+  plus ``scan`` on their contents; a violation reverts the commit (``ROLLED_BACK``) and feeds the findings
+  back to the next attempt.
+- ``engine/gates.py`` (``scope`` and ``security`` gates): the same checks over the whole run diff against
+  the ``sdlc/base`` tag, with per-task size limits switched off.
+``sandbox/process.py`` asks ``command_allowed`` before spawning anything in the sandbox.
+
+Invariants
+- This module never mutates state and never emits events itself: it returns ``Finding``s / verdicts and the
+  caller records the ``POLICY_DECISION``. That keeps the rule and the audit record in one place each.
+- Policy is law: nothing here reads approvals directly; the caller passes the set of approved high-impact
+  action names, and a protected path is acceptable only when its required action is in that set.
 """
 
 from __future__ import annotations
@@ -14,10 +28,18 @@ from ..models.validation import Finding
 
 
 def matches(path: str, patterns: list[str]) -> bool:
+    """Public alias of ``_match``: does ``path`` match any of the glob ``patterns``? (used by handlers)."""
     return _match(path, patterns)
 
 
 def _match(path: str, patterns: list[str]) -> bool:
+    """Glob match with policy semantics.
+
+    ``fnmatch`` has no ``**``: it treats it like ``*``, which does not cross ``/``-free prefixes the way
+    users expect, so each pattern is also tried with a leading ``**/`` stripped (``**/db/migration/**``
+    then matches ``db/migration/V1.sql`` at the root). Backslashes are normalised so Windows-style paths
+    from a tool still match.
+    """
     # fnmatch treats ** like *; good enough for path allowlists, and we normalise separators
     p = path.replace("\\", "/")
     return any(fnmatch.fnmatch(p, pat) or fnmatch.fnmatch(p, pat.replace("**/", "")) for pat in patterns)
@@ -25,6 +47,12 @@ def _match(path: str, patterns: list[str]) -> bool:
 
 @dataclass(frozen=True)
 class PathVerdict:
+    """Classification of one path under ``policy.change_control``.
+
+    Precedence is forbidden > protected > allowed > outside (see ``PolicyEngine.classify``), so a path that
+    matches both a protected and an allowed glob is protected.
+    """
+
     path: str
     classification: str  # allowed | protected | forbidden | outside
     required_action: str | None  # high-impact action needed for protected paths
@@ -32,12 +60,21 @@ class PathVerdict:
 
 @dataclass
 class ScopeVerdict:
+    """Result of ``PolicyEngine.check_scope`` over a set of changed files.
+
+    ``ok`` is False as soon as any finding is recorded. ``approvals_needed`` lists the high-impact action
+    names that would have made the protected-path findings pass; the caller can surface them to a human.
+    """
+
     ok: bool
-    verdicts: list[PathVerdict] = field(default_factory=list)
-    findings: list[Finding] = field(default_factory=list)
-    approvals_needed: set[str] = field(default_factory=set)
+    verdicts: list[PathVerdict] = field(default_factory=list)  # one per changed file, in input order
+    findings: list[Finding] = field(default_factory=list)  # what the caller records / feeds back
+    approvals_needed: set[str] = field(default_factory=set)  # action names missing from approved_actions
 
 
+# Maps a substring of a protected path to the high-impact action (policy.autonomy.high_impact_actions) that
+# writing it requires. First hit in insertion order wins; anything protected but unmatched defaults to
+# "infrastructure.change". Mirrors the bracketed annotations in policy.yaml#change_control.protected_paths.
 PROTECTED_ACTION_HINTS = {
     "migration": "schema.migration",
     "alembic": "schema.migration",
@@ -52,12 +89,26 @@ PROTECTED_ACTION_HINTS = {
 
 
 class PolicyEngine:
+    """Stateless evaluator of ``policy.yaml`` for one target stack.
+
+    Cheap to construct (two attribute assignments), so callers build one per check instead of sharing.
+    ``stack`` selects the banned-code patterns (``security.banned_code_patterns[stack]``); the change-control
+    paths and secret patterns are stack-independent.
+    """
+
     def __init__(self, policy: Policy, stack: str) -> None:
+        """Bind the parsed policy and the target stack (``"java"`` | ``"python"``)."""
         self.p = policy
         self.stack = stack
 
     # ---------------------------------------------------------------- change control
     def classify(self, path: str) -> PathVerdict:
+        """Classify one repository path as forbidden, protected, allowed or outside.
+
+        Forbidden wins over everything (a ``.env`` under ``src/`` is still forbidden); protected paths get
+        the required action from ``PROTECTED_ACTION_HINTS`` (default ``infrastructure.change``); a path that
+        matches no list at all is ``outside`` and is rejected by ``check_scope``.
+        """
         cc = self.p.change_control
         if _match(path, cc.forbidden_paths):
             return PathVerdict(path, "forbidden", None)
@@ -78,6 +129,25 @@ class PolicyEngine:
         lines_changed: int = 0,
         limits: bool = True,
     ) -> ScopeVerdict:
+        """Judge a set of changed files against change control, task scope and size limits.
+
+        Args:
+            changed_files: repository-relative paths the agent changed (committed or not).
+            task_allowed: the ``TaskSpec.allowed_files`` globs in force (all tasks' globs at gate time);
+                an empty list disables the per-task rule.
+            approved_actions: high-impact action names a human approved (or that an approved HIGH task
+                mapped onto); a protected path passes only when its required action is here.
+            lines_changed: total changed lines, compared with ``max_lines_changed_per_task`` when ``limits``.
+            limits: enforce the per-task file/line ceilings. The write boundary passes True (one task's
+                files); the run-level ``scope`` gate passes False because the whole run is naturally larger.
+
+        Returns:
+            A ``ScopeVerdict``; rules emitted: ``change_control.forbidden_path``,
+            ``change_control.outside_allowed_paths``, ``change_control.protected_path``,
+            ``task.allowed_files``, ``change_control.max_files``, ``change_control.max_lines``,
+            ``change_control.require_tests`` (a production change under ``require_tests_for`` with no test
+            file in the same set).
+        """
         v = ScopeVerdict(ok=True)
         cc = self.p.change_control
         for f in changed_files:
@@ -112,6 +182,8 @@ class PolicyEngine:
                         message=f"requires human approval: {pv.required_action}",
                     )
                 )
+            # task scope is checked independently of the policy classification: an allowed path is still a
+            # violation when this task was not planned to touch it (the planner owns allowed_files)
             if task_allowed and not _match(f, task_allowed):
                 v.ok = False
                 v.findings.append(
@@ -138,6 +210,8 @@ class PolicyEngine:
                     message=f"{lines_changed} lines > {cc.max_lines_changed_per_task}",
                 )
             )
+        # "a test file" is recognised by path convention ("/test" covers src/test/java, "tests/" the python
+        # layout); the rule fires only when production code changed and no test file did
         prod = [
             f
             for f in changed_files
@@ -155,7 +229,17 @@ class PolicyEngine:
 
     # ---------------------------------------------------------------- security scan
     def scan(self, files: dict[str, str]) -> list[Finding]:
-        """files: path -> content of changed files."""
+        """files: path -> content of changed files.
+
+        Three passes, all regex based and line oriented where a line number is meaningful:
+        - ``security.secret`` for every ``policy.security.secret_patterns`` hit (line-numbered);
+        - ``security.banned_pattern`` for the stack's ``banned_code_patterns`` (line-numbered);
+        - ``compliance.pii`` when a ``compliance.pii.forbidden_in_persistence`` term appears anywhere in a
+          file, case-insensitively and with ``_`` matching ``_``, a space or nothing (``raw_ip_address``
+          also catches ``rawIpAddress``-style spellings only partially; ``raw ip address`` fully).
+
+        Returns every finding (no early exit) so the next attempt sees the complete list.
+        """
         out: list[Finding] = []
         secrets = [re.compile(p) for p in self.p.security.secret_patterns]
         banned = [re.compile(p) for p in self.p.security.banned_code_patterns.get(self.stack, [])]
@@ -198,6 +282,13 @@ class PolicyEngine:
 
     # ---------------------------------------------------------------- sandbox commands
     def command_allowed(self, cmd: str) -> bool:
+        """May ``cmd`` run inside the sandbox (``policy.sandbox``)?
+
+        Any ``forbidden_commands`` substring anywhere in the command line vetoes it (so ``x && rm -rf`` is
+        caught). Otherwise the command must start with an ``allowed_commands`` entry, or its first word must
+        equal the entry's first word (``"docker compose"`` allows ``docker ...``). An empty command is not
+        allowed.
+        """
         sb = self.p.sandbox
         if any(bad in cmd for bad in sb.forbidden_commands):
             return False

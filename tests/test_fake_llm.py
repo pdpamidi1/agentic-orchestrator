@@ -23,6 +23,8 @@ def settings(tmp_path: Path, **kw: object) -> Settings:
         "anthropic_api_key": None,
         "runs_dir": tmp_path / "runs",
         "cache_dir": tmp_path / "runs" / "cache",
+        "workspace": tmp_path
+        / "no-workspace",  # greenfield: the repo's workspace/url-shortener must not seed
         "policy_path": REPO / "policy.yaml",
         "workflow_path": REPO / "workflow.yaml",
         "specs_dir": REPO / "specs" / "scenarios",

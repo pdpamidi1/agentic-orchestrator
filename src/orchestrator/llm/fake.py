@@ -5,6 +5,23 @@ Selected with `SDLC_LLM=fake`. It exists so the whole loop (agents -> gates -> a
 exercised offline and deterministically, before any prompt has been recorded. The canned artifacts describe
 the greenfield URL-shortener scenario and satisfy every agent schema in `agents/catalog.py`; a test pins that.
 Overrides let a scenario or a test replace any artifact by schema name (e.g. a Spec with ambiguities).
+
+Where it sits: `service.py#_mode` builds `FakeClient(scenario=...)` when `SDLC_LLM=fake` and pairs it with
+`executors/fake.FakeExecutor(plant=PLANTED[scenario])`; under `--record` the pair is wrapped by the
+recording client/executor, which is how the offline golden run (`--replay` with no key) is produced.
+
+Invariants:
+- Live checkpoint semantics: nothing here auto-approves; the canned artifacts merely drive the graph to
+  the same pauses a live run would hit (HIGH tasks, six ambiguities in the `ambiguous` scenario).
+- Every canned artifact validates against its schema in `agents/catalog.py`/`models/`; the agents whose
+  `post()` stamps lineage (requirements, planner, architecture) overwrite `run_id: "fake"` and the
+  version fields exactly as for a live reply.
+- Deterministic and free: `Usage()` is always zero; `FakeClient.calls` records the schema names requested
+  in order so tests can assert which agents ran.
+
+Data layout: `CANNED` is the greenfield baseline (one entry per schema name); `BROWNFIELD_*` and
+`AMBIGUOUS_SPEC` derive from it; `SCENARIOS` maps a scenario name to its overrides; `PLANTED` maps a
+scenario name to the failure the fake executor plants. No files are written, no trace events emitted.
 """
 
 from __future__ import annotations
@@ -16,7 +33,11 @@ from pydantic import BaseModel
 
 from .client import Usage
 
+# Greenfield baseline, keyed by output schema name. `run_id: "fake"` and version fields are placeholders
+# that each agent's `post()` overwrites with the real run id and lineage.
 CANNED: dict[str, dict[str, Any]] = {
+    # Spec: three stories, four acceptance criteria (AC1-AC4), no ambiguities -> the `clarify` input node
+    # does not pause and the greenfield run proceeds straight to planning.
     "Spec": {
         "run_id": "fake",
         "summary": "URL shortener: create short links, redirect with caching, expire links.",
@@ -70,6 +91,10 @@ CANNED: dict[str, dict[str, Any]] = {
         "ambiguities": [],
         "assumptions": ["base62 codes from a counter; Redis optional with DB sequence fallback"],
     },
+    # Plan: T1 (schema) -> T2 ∥ T3 (the two endpoints) -> T4. T4 is impact_level HIGH and owns only the
+    # release artifacts (README, openapi.yaml, Dockerfile, CI), two of them protected paths, so the
+    # implementation node pauses once for a `task.high_impact` approval and the fake executor's
+    # release-file branch is exercised. allowed_files `src/**`/`tests/**` receive the fake module + test.
     "Plan": {
         "run_id": "fake",
         "spec_version": 1,
@@ -114,6 +139,9 @@ CANNED: dict[str, dict[str, Any]] = {
         ],
         "rationale": "schema first, the two endpoints in parallel, then release artifacts under approval",
     },
+    # Design: the API contract (openapi_yaml + typed operations with response codes) is what the fake
+    # executor turns into `app.py`/`openapi.yaml` and what the `contract` gate diffs; the three packages
+    # and the layering rule become the generated import-linter architecture test.
     "Design": {
         "run_id": "fake",
         "spec_version": 1,
@@ -200,11 +228,15 @@ CANNED: dict[str, dict[str, Any]] = {
         },
         "decisions": ["base62 counter over random codes (collision-free, sortable); rejected: UUID prefix"],
     },
+    # Impact: greenfield has nothing to impact, only new packages (the impact node runs only under
+    # `when: workspace.has_code` in workflow.yaml, but the schema is served whenever it is asked for).
     "Impact": {
         "run_id": "fake",
         "impacted_packages": [],
         "new_packages": ["shortener.api", "shortener.service", "shortener.repo"],
     },
+    # SecurityFindings: one medium finding and no pre-announced high-impact actions, so the security
+    # review passes without adding approvals to the run.
     "SecurityFindings": {
         "findings": [
             {
@@ -218,6 +250,7 @@ CANNED: dict[str, dict[str, Any]] = {
         "required_controls": ["URL validation", "rate limit on create"],
         "high_impact_actions_expected": [],
     },
+    # RiskRegister: a single medium risk; exercises the risk node in parallel with security review.
     "RiskRegister": {
         "risks": [
             {
@@ -232,6 +265,7 @@ CANNED: dict[str, dict[str, Any]] = {
         "trade_offs": ["counter codes are guessable; acceptable without auth (non-goal)"],
         "failure_scenarios": ["cache returns a stale long_url after expiry -> TTL bounded by expires_at"],
     },
+    # Review: every criterion PASS and APPROVE, so the advisory code review never blocks validation.
     "Review": {
         "criteria": [
             {"id": "AC1", "verdict": "PASS", "evidence": "fake"},
@@ -242,11 +276,14 @@ CANNED: dict[str, dict[str, Any]] = {
         "concerns": [],
         "recommendation": "APPROVE",
     },
+    # Diagnosis: decision "retry" -> a failed validation re-runs implementation with this feedback
+    # (the `ambiguous` scenario overrides it with "replan").
     "Diagnosis": {
         "root_cause": "fake diagnosis: gate failed on the previous attempt",
         "decision": "retry",
         "feedback": [{"target": "implementation", "instruction": "address the blocking findings"}],
     },
+    # Docs: minimal Markdown for each document the documenter must return; enough for release readiness.
     "Docs": {
         "readme_md": "# shortener\n\nFake docs.\n",
         "changelog_md": "## 0.1.0\n- initial\n",
@@ -256,6 +293,8 @@ CANNED: dict[str, dict[str, Any]] = {
 }
 
 
+# Brownfield scenario: click analytics added to an existing shortener workspace (`SDLC_WORKSPACE`).
+# Spec: AC3 (only a salted hash of the IP may be persisted) is what the planted "pii" failure violates.
 BROWNFIELD_SPEC: dict[str, Any] = {
     "run_id": "fake",
     "summary": "Click analytics for the existing URL shortener: publish click events, aggregate stats.",
@@ -298,6 +337,9 @@ BROWNFIELD_SPEC: dict[str, Any] = {
     "ambiguities": [],
     "assumptions": ["Kafka topic url.clicked; 90-day retention on click_events"],
 }
+# Plan: B1 (migration under `alembic/**`) and B2 (`pyproject.toml` dependency) are both HIGH and touch
+# protected paths, so implementation pauses twice for approval before B3 -> B4 run. Their allowed_files
+# are concrete paths, which drives the fake executor's `_stub` branch (append to an existing pyproject).
 BROWNFIELD_PLAN: dict[str, Any] = {
     "run_id": "fake",
     "spec_version": 1,
@@ -343,6 +385,8 @@ BROWNFIELD_PLAN: dict[str, Any] = {
     ],
     "rationale": "schema and dependency first (both need approval), then publisher, then the read model",
 }
+# Design: the greenfield Design plus the `getStats` operation and the two analytics tables, so the
+# contract gate sees an additive (non-breaking) change and the migration list is non-empty.
 BROWNFIELD_DESIGN: dict[str, Any] = {
     **CANNED["Design"],
     "api": {
@@ -386,6 +430,8 @@ BROWNFIELD_DESIGN: dict[str, Any] = {
         "evolution_notes": "additive only; click_events retained 90 days",
     },
 }
+# Impact: what the impact node (brownfield-only) reports from the repo_map: touched and new packages,
+# endpoints, the Kafka data flow and a hot-path latency risk.
 BROWNFIELD_IMPACT: dict[str, Any] = {
     "run_id": "fake",
     "impacted_packages": ["shortener.api", "shortener.repo"],
@@ -406,9 +452,13 @@ BROWNFIELD_IMPACT: dict[str, Any] = {
 
 
 def _amb(i: int, question: str, options: list[str]) -> dict[str, Any]:
+    """Build one `Ambiguity` dict (`AMB-<i>`); the first option doubles as the default if unanswered."""
     return {"id": f"AMB-{i}", "question": question, "options": options, "default_if_unanswered": options[0]}
 
 
+# Ambiguous scenario: the greenfield Spec with a vague summary and six open questions, so the `clarify`
+# input node pauses (`AWAITING_INPUT`) until `sdlc answer` supplies answers; the requirements agent then
+# folds them into assumptions and produces spec v2.
 AMBIGUOUS_SPEC: dict[str, Any] = {
     **CANNED["Spec"],
     "summary": "Make the URL shortener more reliable and production-ready (vague: needs clarification).",
@@ -448,11 +498,20 @@ PLANTED: dict[str, str] = {"greenfield": "scope", "brownfield": "pii", "ambiguou
 
 class FakeClient:
     """Canned structured output keyed by schema name, with per-scenario overrides.
-    Unknown schema -> ValueError (an agent Retry)."""
+    Unknown schema -> ValueError (an agent Retry).
+
+    Lifecycle: one instance per run. `canned` is a shallow copy of `CANNED` with `SCENARIOS[scenario]`
+    applied first and explicit `overrides` last (an override wins over the scenario). `calls` grows by one
+    schema name per `structured()` call and is only read by tests.
+    """
 
     def __init__(
         self, overrides: Mapping[str, Mapping[str, Any]] | None = None, scenario: str | None = None
     ) -> None:
+        """Assemble the artifact table: greenfield baseline, then scenario overrides, then `overrides`.
+
+        An unknown `scenario` (or None) applies no scenario overrides.
+        """
         self.canned: dict[str, dict[str, Any]] = {k: dict(v) for k, v in CANNED.items()}
         for name, data in {**SCENARIOS.get(scenario or "", {}), **(overrides or {})}.items():
             self.canned[name] = dict(data)
@@ -461,6 +520,12 @@ class FakeClient:
     async def structured[T: BaseModel](
         self, system: str, prompt: str, schema: type[T], *, max_repairs: int = 2
     ) -> tuple[T, Usage]:
+        """Return the canned artifact for `schema.__name__` validated into `schema`, with zero `Usage`.
+
+        `system`, `prompt` and `max_repairs` are ignored (the reply does not depend on the prompt).
+        Raises `ValueError` when no artifact is canned for the schema; pydantic's `ValidationError` (also a
+        `ValueError`) if an override does not fit the schema. Both become an agent `Retry`.
+        """
         self.calls.append(schema.__name__)
         data = self.canned.get(schema.__name__)
         if data is None:

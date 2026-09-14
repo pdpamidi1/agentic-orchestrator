@@ -86,3 +86,26 @@ layering rules → ArchUnit/import-linter, acceptance criteria → test names.
 - In-memory live-run registry: `approve`/`answer` need the same API process until T12 (resume from store).
 - Acceptance review is advisory by design; humans own quality.
 - `when:` conditions are named predicates, not an expression language — deliberate, to keep the graph auditable.
+
+## What the first live run taught us (design changes made in response)
+
+The greenfield url-shortener was implemented live by Claude Code under the java gates in September 2026. Each
+failure below was a real engine or design gap; the fix is in the code with a test, and the trace of the run that
+exposed it is in `runs/`.
+
+| Symptom in the live run | Root cause | Change |
+|---|---|---|
+| Design came back with empty response maps, zero findings, zero risks | Structured outputs cannot express free-form `dict` fields; the SDK transforms them into `{}` | Every agent output field is typed; a test transforms each schema and asserts nothing degrades |
+| Plan put the OpenAPI document outside allowed paths and could not have produced `./mvnw` | Planner and architect never saw governance or gate commands | `engine/conventions.py` renders policy into the planner/architect prompts; the orchestrator provisions the Maven wrapper and the architecture test as baseline |
+| T1 reported BLOCKED: the generated `ArchitectureTest.java` did not compile | Escapes in the Java template | javac-compiled template test |
+| T2's commit contained T3's half-written file; revert conflicted | Tasks of one parallel group ran concurrently in one working tree | Group members run sequentially and each result is judged before the next starts; conflict-safe revert |
+| Node timed out mid-task; the killed task's agent kept editing | Node timeout and retries were per node, not per task; no process kill on cancel | Executor node budget scales with the plan; per-task attempts with a safe-stop; orphaned agent processes are killed |
+| T7 correctly refused to fix beans outside its scope | No path from a legitimate scope request to a human | `task.scope_change` approval: blocked tasks that name files pause; approval grants exactly those files |
+| Spend limit exhausted a task in six seconds; the halted run could not continue | Halted runs were terminal | `Runner.approve` resumes a HALTED run (RUN_RESUMED) and resets the task's allowance |
+| Replay never found a recorded patch | Relative cache path resolved inside the sandbox | Absolute path for `git apply`; recording promotes only policy-accepted patches and stores granted scope beside them |
+| Scope gate failed on the orchestrator's own files | Run base tag set before the baseline commits | Base moves past provisioning; provisioned paths filtered from the scope diff |
+| Documenter reply truncated at the client's token ceiling | 16k `max_tokens` too small for README+ADRs+runbook | Size budget in the prompt; client retries a truncated reply with a larger budget |
+
+Net effect: after these changes the eight tasks, all gates (compile, spotless, architecture, unit, Testcontainers
+integration, contract, release) and delivery completed without manual intervention beyond the approvals, and the
+recorded patches rebuild the project in seconds with `--replay`.

@@ -1,3 +1,11 @@
+"""``RunState``: the engine's persisted view of one run (``runs/<id>/state.json``).
+
+Written by ``store/file_store.py`` after every batch, pause and halt (``engine/runner.py``); read back by
+the API (``GET /runs/{id}``) and, once resume-from-store lands, by a fresh process. Unlike artifacts this
+model is deliberately mutable, but only the engine mutates it; the service replaces its reference to the
+returned object after each runner call.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -9,6 +17,14 @@ from .common import utcnow
 
 
 class RunStatus(StrEnum):
+    """Lifecycle of a whole run.
+
+    ``RUNNING`` while the runner loops; ``AWAITING_APPROVAL``/``AWAITING_INPUT`` when a node paused on a
+    human checkpoint (only ``approve``/``answer`` move on); ``HALTED`` after a safe-stop (``halt_reason``
+    set; ``approve`` can resume it); ``COMPLETED`` when every node is PASSED/SKIPPED; ``FAILED`` when no
+    node is ready and the graph is not done (a dependency FAILED with no fallback).
+    """
+
     RUNNING = "RUNNING"
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
     AWAITING_INPUT = "AWAITING_INPUT"
@@ -18,6 +34,14 @@ class RunStatus(StrEnum):
 
 
 class NodeStatus(StrEnum):
+    """Lifecycle of one graph node.
+
+    Transitions: ``PENDING -> RUNNING -> {PASSED | FAILED | ROLLED_BACK | SKIPPED | AWAITING_*}``;
+    ``AWAITING_* -> PENDING`` on approve/answer; any finished node ``-> INVALIDATED`` when an artifact it
+    consumed gets a new version; ``INVALIDATED`` is runnable again like ``PENDING`` (see ``RUNNABLE``).
+    ``SKIPPED`` is used for fallback nodes whose primary passed and for ``when:`` conditions that are false.
+    """
+
     PENDING = "PENDING"
     RUNNING = "RUNNING"
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
@@ -29,11 +53,20 @@ class NodeStatus(StrEnum):
     SKIPPED = "SKIPPED"
 
 
+# statuses that satisfy a dependency (graph readiness) / statuses the runner may schedule again
 TERMINAL_OK = {NodeStatus.PASSED, NodeStatus.SKIPPED}
 RUNNABLE = {NodeStatus.PENDING, NodeStatus.INVALIDATED}
 
 
 class Budget(BaseModel):
+    """Running totals the runner compares against ``policy.budgets`` before every batch.
+
+    ``tokens_used``/``cost_usd`` accumulate the usage each node's ``Success`` outcome reports (agent and
+    executor calls); ``replans`` counts
+    ``diagnose -> replan`` routes (bounded by ``max_replans_per_run``); ``started_at`` anchors the wall-clock
+    limit. These are control-loop inputs, not metrics: reporting still derives from trace events.
+    """
+
     tokens_used: int = 0
     cost_usd: float = 0.0
     replans: int = 0
@@ -41,7 +74,15 @@ class Budget(BaseModel):
 
 
 class RunState(BaseModel):
-    """Persisted after EVERY transition -> resumable, replayable, inspectable. Mutable by the engine only."""
+    """Persisted after EVERY transition -> resumable, replayable, inspectable. Mutable by the engine only.
+
+    ``nodes`` holds a status for every node in ``workflow.yaml`` (``Graph.initial_statuses``).
+    ``plan_version`` is bumped on each replan; ``spec_version`` and ``artifact_versions`` are carried for
+    the schema but not updated by the prototype engine: the authoritative versions live in
+    ``RunContext`` and in the lineage snapshots on trace events. ``pending_questions`` mirrors the open
+    ``Ambiguity`` questions while ``AWAITING_INPUT``; ``halt_reason`` is the safe-stop trigger while HALTED.
+    ``extra="forbid"`` makes a stale ``state.json`` with unknown keys fail loudly on load.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -58,5 +99,6 @@ class RunState(BaseModel):
     updated_at: datetime = Field(default_factory=utcnow)
 
     def mark(self, node_id: str, status: NodeStatus) -> None:
+        """Set a node's status and touch ``updated_at``; the only sanctioned way to change ``nodes``."""
         self.nodes[node_id] = status
         self.updated_at = utcnow()

@@ -11,6 +11,36 @@ retries, rollback, safe-stop, audit trace, derived metrics and persisted state.
 - The graph: [`workflow.yaml`](workflow.yaml) · Governance: [`policy.yaml`](policy.yaml)
 - Team practice for AI-assisted work: [`CLAUDE.md`](CLAUDE.md), [`.claude/commands/`](.claude/commands), [`TASKS.md`](TASKS.md)
 
+## Setting up on a new machine
+
+```bash
+# prerequisites: git, Python 3.12+, Docker Engine; for java target projects also JDK 25 (Maven comes via ./mvnw);
+# for live runs an Anthropic API key and the Claude Code CLI (`claude`) on PATH
+git clone https://github.com/<your-org>/agentic-orchestrator.git && cd agentic-orchestrator
+python3 -m venv .venv && . .venv/bin/activate
+make install                                 # pip install -e ".[dev]"
+make test && make lint                       # ~2.5 min: engine, gates, fake end-to-end runs
+
+# offline demo (no key): canned agents + fake executor, python target stack
+SDLC_LLM=fake SDLC_TARGET_STACK=python make run &        # API on :8080
+sdlc run --scenario greenfield                           # pauses at approval_design
+sdlc approve <run_id> approval_design                    # planted .env violation -> revert -> retry; pauses on the HIGH task
+sdlc approve <run_id> implementation                     # gates -> validation -> release_readiness -> approval_release
+sdlc approve <run_id> approval_release && sdlc metrics <run_id>
+
+# replay the recorded java run (no key): agents and task patches come from runs/cache
+sdlc run --scenario greenfield --replay
+
+# live: cp .env.example .env, set ANTHROPIC_API_KEY (and, only if the key is not workspace-scoped,
+# ANTHROPIC_WORKSPACE_ID=wrkspc_...), then
+make run &
+sdlc run --scenario greenfield --record                  # answers via `sdlc answer`, approvals via `sdlc approve`
+sdlc deliver <run_id>                                    # after approval_release: copies the project to workspace/url-shortener
+```
+
+The delivered url-shortener runs with `make shortener-up` (see below) and has its own
+[quick start](workspace/url-shortener/README.md) and [design document](workspace/url-shortener/docs/DESIGN.md).
+
 ## Quick start
 ```bash
 make install

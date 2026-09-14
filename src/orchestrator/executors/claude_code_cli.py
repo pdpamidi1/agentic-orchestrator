@@ -2,6 +2,25 @@
 Primary executor: Claude Code in headless mode inside the sandbox. Tool permissions come from
 policy.claude_code; the prompt is spec-driven (TaskSpec + contract slice + class structure + last
 attempt's feedback), never the raw requirement.
+
+Where it sits: chosen by `service.py` for live runs (`SDLC_LLM=anthropic` or an API key present) and
+usually wrapped by `RecordingExecutor` under `--record`. One `execute()` call = one task attempt = one
+`claude -p ...` subprocess run with `cwd` set to the sandbox.
+
+Invariants:
+- The prompt (`PROMPT`) is rendered from typed artifacts only (`TaskSpec`, `Design.api.operations`,
+  the gate contract from `policy.yaml`); the requirement text never reaches the executor.
+- Tool permissions are policy, not prompt: `--allowedTools`, `--disallowedTools`, `--permission-mode`
+  and `--max-turns` are passed straight from `policy.claude_code`.
+- The child inherits a scrubbed environment (PATH, HOME, ANTHROPIC_API_KEY, JAVA_HOME only).
+- On success the executor leaves exactly one commit per task on the run branch; on BLOCKED it resets the
+  working tree; on error it leaves the tree as the agent left it (the next attempt continues on it).
+
+Trace events: `EXECUTOR_CALL` with `status="OK"` (tokens, cost, turns) or `status="ERROR"` (exit code,
+Claude Code `subtype` such as `error_max_turns`, turns).
+
+Files written: `runs/<id>/executor/<task>.attempt<n>.json` (raw stdout/stderr/exit code of every attempt,
+kept for post-mortems) and the task commit in the sandbox.
 """
 
 from __future__ import annotations
@@ -20,6 +39,8 @@ from ..models.trace import Kind
 from ..sandbox.git import GitSandbox
 from .base import BlockedTask, Done, Errored, ExecResult
 
+# The task prompt. Placeholders are filled by `ClaudeCodeCliExecutor.build_prompt`; the doubled braces
+# at the end are a literal JSON example (the agent's final status line) that `str.format` must not touch.
 PROMPT = """# Task {id} — {title}
 Implement exactly this task inside the current repository. Stack: {stack}.
 
@@ -57,7 +78,14 @@ Finish by printing ONE line: {{"status":"DONE|BLOCKED","filesChanged":[...],"tes
 
 
 class ClaudeCodeCliExecutor:
+    """Runs one Claude Code headless session per task attempt and turns its JSON output into an `ExecResult`.
+
+    Stateless apart from the binary name: everything else (policy, sandbox path, run id, stack) comes from
+    the `RunContext` on each call, so one instance serves every task of every run.
+    """
+
     def __init__(self, binary: str = "claude") -> None:
+        """Remember which executable to launch (default `claude`, resolved through PATH)."""
         self.binary = binary
 
     def build_prompt(
@@ -68,6 +96,14 @@ class ClaudeCodeCliExecutor:
         stack: str,
         policy: Policy | None = None,
     ) -> str:
+        """Render `PROMPT` for one task attempt.
+
+        Only the operations named in `task.contract_slice` are copied from `design.api.operations`, so the
+        agent sees its slice of the API, not the whole contract. `policy` supplies the gate contract lines
+        and the turn budget; when it is None (unit tests) both read "(none)"/"n/a". `feedback` is embedded
+        as pretty-printed JSON so the previous attempt's findings are visible verbatim. Pure function: no
+        I/O, no side effects.
+        """
         ops = [o for o in design.api.operations if o.operation_id in task.contract_slice]
         return PROMPT.format(
             id=task.id,
@@ -92,6 +128,25 @@ class ClaudeCodeCliExecutor:
     async def execute(
         self, ctx: RunContext, task: TaskSpec, design: Design, feedback: dict[str, Any] | None
     ) -> ExecResult:
+        """Run Claude Code on one task attempt and commit whatever it changed.
+
+        Steps: render the prompt, read the system prompt file named by `policy.claude_code`, launch
+        `claude -p ... --output-format json` in the sandbox with a scrubbed env, wait up to
+        `policy.budgets.node_timeout_seconds`, persist the raw result, then interpret it.
+
+        Returns:
+        - `Errored(transient=True)` on timeout (the child is killed first so no orphan keeps editing the
+          sandbox), or on a non-zero exit (max_turns exhausted, API error...; detail taken from the JSON
+          `subtype`/`result` on stdout, falling back to the tail of stdout/stderr);
+        - `Errored(transient=False)` when the binary is not installed;
+        - `BlockedTask` when the agent's final status line says BLOCKED; the working tree is reset first;
+        - `Done` otherwise, after `git add -A` + one commit on the run branch, with the files changed since
+          the pre-run HEAD and the agent's reported `testsAdded`/`notes`.
+
+        Side effects: one subprocess, `runs/<id>/executor/<task>.attempt<n>.json`, an `EXECUTOR_CALL` trace
+        event (OK or ERROR), and on success a git commit. A `CancelledError` while waiting also kills the
+        child and is re-raised so the runner's safe-stop propagates.
+        """
         cc = ctx.policy.claude_code
         prompt = self.build_prompt(task, design, feedback, ctx.target_stack, ctx.policy)
         system_prompt = await asyncio.to_thread(Path(cc.system_prompt_file).read_text, encoding="utf-8")
@@ -112,9 +167,10 @@ class ClaudeCodeCliExecutor:
             "--append-system-prompt",
             system_prompt,
         ]
+        # scrubbed environment: only what the CLI and the build tools need, no orchestrator secrets
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "ANTHROPIC_API_KEY", "JAVA_HOME")}
         git = GitSandbox(ctx.sandbox)
-        base = await git.head()
+        base = await git.head()  # everything the agent changes is measured against this commit
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -135,6 +191,7 @@ class ClaudeCodeCliExecutor:
             return Errored("claude code timeout", transient=True)
         except FileNotFoundError:
             return Errored("claude binary not found; use --replay or install Claude Code", transient=False)
+        # `feedback["attempt"]` is the number of earlier attempts (set by the runner), so this is 1-based
         attempt = (feedback or {}).get("attempt", 0) + 1
         raw_out, raw_err = out.decode(errors="replace"), err.decode(errors="replace")
         # keep every attempt's raw result for post-mortems: runs/<id>/executor/<task>.attempt<n>.json
@@ -169,6 +226,7 @@ class ClaudeCodeCliExecutor:
                     "turns": failed.get("num_turns"),
                 },
             )
+            # transient by default: the next attempt continues on the tree the agent left behind
             return Errored(f"claude exit {proc.returncode}: {str(detail)[:300]}")
 
         result = json.loads(raw_out or "{}")
@@ -186,7 +244,7 @@ class ClaudeCodeCliExecutor:
             payload={"turns": result.get("num_turns")},
         )
 
-        # the agent's own status line, if present
+        # the agent's own status line, if present: the last line of its final message that looks like JSON
         text = result.get("result", "")
         status_line = next(
             (line for line in reversed(text.splitlines()) if line.strip().startswith("{")), "{}"
@@ -196,9 +254,11 @@ class ClaudeCodeCliExecutor:
         except json.JSONDecodeError:
             reported = {}
         if reported.get("status") == "BLOCKED":
+            # nothing is committed: the handler decides whether the reason is a scope request or a failure
             await git.reset_working_tree()
             return BlockedTask(reported.get("notes", "blocked by agent"))
 
+        # a missing or malformed status line still counts as DONE: the tree diff, not the agent, is the truth
         changed = await git.changed_files(base)
         sha = await git.commit_task(task.id, task.title, ctx.run_id)
         return Done(
@@ -213,5 +273,6 @@ class ClaudeCodeCliExecutor:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write `data` as indented JSON to `path`, creating parent directories (runs in a worker thread)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
