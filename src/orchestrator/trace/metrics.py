@@ -68,7 +68,9 @@ def compute(run_id: str, events: list[TraceEvent]) -> RunMetrics:
         llm_cost_usd=round(sum(e.cost_usd for e in ev), 4),
         tokens=sum(e.tokens_in + e.tokens_out for e in ev),
         human_checkpoints=sum(1 for e in ev if e.kind == Kind.APPROVAL_REQUESTED),
-        replans=sum(1 for e in ev if e.kind == Kind.REPLAN_TRIGGERED),
+        # diagnose-driven re-plans only (what budgets.max_replans_per_run bounds); every re-produced
+        # artifact also emits REPLAN_TRIGGERED for lineage, so the bare event would inflate this per cycle
+        replans=sum(1 for e in ev if e.kind == Kind.REPLAN_TRIGGERED and e.payload.get("route") == "replan"),
         halted=bool(halted),
         halt_reason=(halted[-1].payload.get("trigger") if halted else None),
     )

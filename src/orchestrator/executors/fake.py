@@ -129,6 +129,11 @@ class FakeExecutor:
             files[PLANTED_FILE] = (
                 "# planted by the fake executor: agents must never write env files\nAPP_ENV=local\n"
             )
+        elif planted and self.plant == "test":  # a unit test that fails: validation -> diagnose -> re-plan
+            files["tests/unit/test_planted_failure.py"] = (
+                "def test_planted_acceptance_gap() -> None:\n"
+                '    assert False, "planted: acceptance criterion not met by any task"\n'
+            )
         elif planted and self.plant == "pii" and files:  # persist a raw IP in a file the task may write
             target = sorted(files)[0]
             files[target] += "\n# planted: analytics row keeps the visitor address\nraw_ip_address = None\n"

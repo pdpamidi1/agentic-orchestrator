@@ -14,6 +14,8 @@
 #   invalidated_by artifact names whose change forces this node (and downstream) to re-run
 #   parallel_group nodes in the same group are run concurrently and joined by their dependents
 #   fallback       node id to run if this node exhausts retries (instead of halting)
+#   rolls_up       gate nodes (must be dependencies with `produces`) whose recorded results are folded into this
+#                  gate node's verdict; a rolled-up gate node records its result and continues instead of failing
 #   rollback       strategy the composition root's RollbackHook applies when retries are exhausted and no fallback
 #   high_impact    action name from policy.autonomy.high_impact_actions (adds an approval entry gate)
 # ---------------------------------------------------------------------------
@@ -94,6 +96,7 @@ nodes:
     gates: [scope, compile, style, security, architecture, unit]
     depends_on: [implementation]
     parallel_group: post_impl
+    produces: [unit_result]                        # recorded for validation's roll-up, pass or fail
     invalidated_by: [changeset]
 
   code_review:
@@ -110,13 +113,16 @@ nodes:
     gates: [integration, contract]
     depends_on: [implementation]
     parallel_group: post_impl
+    produces: [integration_result]
     invalidated_by: [changeset]
 
   validation:
     kind: gate
-    gates: [acceptance]                            # rolls up the three above + acceptance criteria check
+    gates: [acceptance]                            # + the rolled-up unit/integration results = the verdict
     depends_on: [unit_tests, code_review, integration_tests]
+    rolls_up: [unit_tests, integration_tests]
     produces: [validation_result]
+    retries: { max_attempts: 1 }                   # re-running the same gates cannot change the verdict
     fallback: diagnose                             # FAIL path
 
   diagnose:

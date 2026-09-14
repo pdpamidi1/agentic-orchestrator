@@ -15,19 +15,20 @@ from typing import Any
 from ..agents.catalog import AGENTS
 from ..executors.base import BlockedTask, Changeset, CodeExecutor, Done, Errored
 from ..llm.client import LLMClient
-from ..models import Plan, TaskSpec
+from ..models import Plan, TaskSpec, ValidationResult
 from ..models.trace import Kind
 from ..sandbox.git import GitSandbox
 from .arch_contract import write_architecture_contract
 from .context import RunContext
 from .gates import run_gates
-from .graph import NodeDef
+from .graph import Graph, NodeDef
 from .outcomes import Blocked, NeedsApproval, Outcome, Retry, Route, Success
 from .policy_engine import PolicyEngine
 
 
-def build_handlers(llm: LLMClient, executor: CodeExecutor) -> dict[str, Any]:
+def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict[str, Any]:
     agents = {name: cls(llm) for name, cls in AGENTS.items()}
+    rolled_up = {r for n in graph.nodes.values() for r in n.rolls_up}  # gate nodes another gate node folds in
 
     async def agent_handler(node: NodeDef, ctx: RunContext) -> Outcome:
         out = await agents[node.agent](node, ctx)  # type: ignore[index]
@@ -139,12 +140,22 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor) -> dict[str, Any]:
 
     async def gate_handler(node: NodeDef, ctx: RunContext) -> Outcome:
         attempt = (ctx.feedback.get(node.id) or {}).get("attempt", 0) + 1
-        vr = await run_gates(list(node.gates), ctx, task_id=node.id, attempt=attempt)
+        own = await run_gates(list(node.gates), ctx, task_id=node.id, attempt=attempt)
+        rolled = [
+            g
+            for dep in node.rolls_up
+            for name in graph.nodes[dep].produces
+            if isinstance(r := ctx.get(name), ValidationResult)
+            for g in r.gates
+        ]
+        vr = ValidationResult(task_id=node.id, attempt=attempt, gates=rolled + own.gates)
         for name in node.produces:
-            # stored once, pass or fail: the diagnoser reads a failed validation_result.
+            # stored once, pass or fail: the roll-up and the diagnoser read failed results.
             # (`run_report` holds the release gate's result until TASKS T11 renders the real report.)
             ctx.put(name, vr, node.id)
-        if vr.passed:
+        if (
+            vr.passed or node.id in rolled_up
+        ):  # a rolled-up gate node records its verdict; the roll-up decides
             return Success()
         return Retry(
             f"{node.id}: {len(vr.blocking_findings)} blocking findings",

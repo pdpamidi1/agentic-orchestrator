@@ -33,7 +33,8 @@ SELECT r.run_id, r.scenario,
                          -(SELECT min(ts) FROM sdlc.trace_event e WHERE e.run_id=r.run_id AND e.kind='RUN_STARTED'))) AS e2e_latency_seconds,
        (SELECT coalesce(sum(cost_usd),0) FROM sdlc.trace_event e WHERE e.run_id=r.run_id)         AS llm_cost_usd,
        (SELECT count(*) FROM sdlc.trace_event e WHERE e.run_id=r.run_id AND e.kind='APPROVAL_REQUESTED') AS human_checkpoints,
-       (SELECT count(*) FROM sdlc.trace_event e WHERE e.run_id=r.run_id AND e.kind='REPLAN_TRIGGERED')   AS replans
+       (SELECT count(*) FROM sdlc.trace_event e WHERE e.run_id=r.run_id AND e.kind='REPLAN_TRIGGERED'
+                                                    AND e.payload->>'route'='replan')                 AS replans
 FROM sdlc.run r LEFT JOIN sdlc.v_node_outcomes o USING (run_id)
 GROUP BY r.run_id, r.scenario;
 

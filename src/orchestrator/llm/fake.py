@@ -403,6 +403,24 @@ BROWNFIELD_IMPACT: dict[str, Any] = {
         }
     ],
 }
+
+
+def _amb(i: int, question: str, options: list[str]) -> dict[str, Any]:
+    return {"id": f"AMB-{i}", "question": question, "options": options, "default_if_unanswered": options[0]}
+
+
+AMBIGUOUS_SPEC: dict[str, Any] = {
+    **CANNED["Spec"],
+    "summary": "Make the URL shortener more reliable and production-ready (vague: needs clarification).",
+    "ambiguities": [
+        _amb(1, "What does 'reliable' mean here?", ["99.9% availability", "no data loss", "both"]),
+        _amb(2, "Which failure of Redis must be tolerated?", ["read path only", "read and write", "none"]),
+        _amb(3, "Is a rate limit part of production-ready?", ["yes, 100 req/min per IP", "no"]),
+        _amb(4, "Should redirects be cached at the edge?", ["Cache-Control: private", "public, 60s"]),
+        _amb(5, "Which observability is required?", ["metrics + structured logs", "metrics only", "none"]),
+        _amb(6, "Is a Dockerfile in scope?", ["yes", "no, deployment is out of scope"]),
+    ],
+}
 # per-scenario overrides on top of the greenfield canned set
 SCENARIOS: dict[str, dict[str, dict[str, Any]]] = {
     "brownfield": {
@@ -411,9 +429,21 @@ SCENARIOS: dict[str, dict[str, dict[str, Any]]] = {
         "Design": BROWNFIELD_DESIGN,
         "Impact": BROWNFIELD_IMPACT,
     },
+    "ambiguous": {
+        "Spec": AMBIGUOUS_SPEC,
+        # every diagnosis says "re-plan": the run must stop at policy.budgets.max_replans_per_run
+        "Diagnosis": {
+            "root_cause": "fake diagnosis: the plan cannot satisfy the acceptance test that keeps failing",
+            "decision": "replan",
+            "feedback": [
+                {"target": "planner", "instruction": "split the failing criterion into its own task"}
+            ],
+        },
+    },
 }
-# which failure the fake executor plants on its first attempt: scope (.env) or pii (raw IP persisted)
-PLANTED: dict[str, str] = {"greenfield": "scope", "brownfield": "pii"}
+# which failure the fake executor plants on its first attempt:
+# scope (.env), pii (raw IP persisted) or test (a failing unit test that survives every re-plan)
+PLANTED: dict[str, str] = {"greenfield": "scope", "brownfield": "pii", "ambiguous": "test"}
 
 
 class FakeClient:

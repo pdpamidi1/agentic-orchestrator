@@ -40,6 +40,15 @@ def test_cycle_is_rejected() -> None:
         Graph([NodeDef("x", "agent", depends_on=("y",)), NodeDef("y", "agent", depends_on=("x",))], "x")
 
 
+def test_rolls_up_must_name_gate_dependencies_with_produces() -> None:
+    g = Graph.load(REPO_WORKFLOW)
+    assert g.nodes["validation"].rolls_up == ("unit_tests", "integration_tests")
+    with pytest.raises(ValueError, match="rolls up"):
+        Graph([NodeDef("u", "gate", produces=("r",)), NodeDef("v", "gate", rolls_up=("u",))], "u")
+    with pytest.raises(ValueError, match="rolls up"):
+        Graph([NodeDef("u", "agent"), NodeDef("v", "gate", depends_on=("u",), rolls_up=("u",))], "u")
+
+
 def test_approval_requires_action() -> None:
     with pytest.raises(ValueError, match="high_impact"):
         Graph([NodeDef("ap", "approval")], "ap")

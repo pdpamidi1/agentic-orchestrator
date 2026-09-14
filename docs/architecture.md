@@ -27,6 +27,12 @@ requirement -> clarify(input) -> planning -> architecture -> { security_review �
   -> implementation(tasks: deps + parallel groups; HIGH tasks pause*) -> { unit_tests ∥ code_review ∥ integration_tests }
   -> validation --pass--> documentation -> release_readiness -> approval_release*
               --fail--> diagnose -> retry (re-run implementation) | replan (re-run planning, bounded) | halt (safe-stop)
+unit_tests and integration_tests record their results (`unit_result`, `integration_result`) and PASS; `validation`
+`rolls_up` both plus the advisory acceptance review into the verdict (`validation_result`) and is the only node that
+fails into `diagnose`. An invalidated approval node needs a fresh approval; a new plan voids task-level approvals
+(`POLICY_DECISION=APPROVAL_REVOKED`), so a re-planned design is never released on a stale approval.
+ambiguous: `SDLC_LLM=fake` pauses on 6 questions, `sdlc answer` yields spec v2, a planted failing test drives
+diagnose -> replan until `max_replans_per_run` trips `replan.limit_reached`.
 brownfield adds: planning -> impact -> {architecture, risk_analysis}; two HIGH tasks (migration, dependency) each pause
 implementation for approval, and the compliance scan catches a persisted raw IP on attempt 1 (fake: `SDLC_LLM=fake`)
 ```
@@ -44,7 +50,8 @@ implementation for approval, and the compliance scan catches a persisted raw IP 
   into the next attempt; `fallback` edge (validation → diagnose); git revert per task commit; `RUN_HALTED` with a trigger
   on budget, policy violation, repeated gate failure, human reject, replan limit, unrecoverable diagnosis.
 - **Re-planning**: an artifact re-produced with a new version (spec v2 after answers) invalidates its consumers and
-  everything downstream; `diagnose → replan` re-runs the producers too, bounded by `max_replans_per_run`.
+  everything downstream; `diagnose → replan` re-runs the producers too, bounded by `max_replans_per_run`. Invalidation
+  revokes the approvals of invalidated checkpoints and, on a plan change, all task-level approvals.
 - **Observability/metrics**: task success rate, retry count, rollback count, MTTR (first ATTEMPT_FAILED → NODE_PASSED),
   e2e latency (RUN_STARTED → RUN_COMPLETED/HALTED), LLM cost/tokens, human checkpoints, replans, halt reason.
 

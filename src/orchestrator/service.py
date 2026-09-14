@@ -103,7 +103,7 @@ class OrchestratorService:
         if record:  # record once (live or fake), replay forever
             llm = RecordingClient(llm, self.s.cache_dir / "llm")
             executor = RecordingExecutor(executor, self.s.cache_dir / "changesets")
-        return Runner(self.graph, build_handlers(llm, executor), self.store, GitRollback())
+        return Runner(self.graph, build_handlers(llm, executor, self.graph), self.store, GitRollback())
 
     async def start(
         self,

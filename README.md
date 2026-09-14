@@ -30,6 +30,8 @@ Live: `cp .env.example .env`, set `ANTHROPIC_API_KEY`, then `sdlc run --scenario
 Brownfield offline: add `SDLC_WORKSPACE=tests/fixtures/brownfield_ws` and `sdlc run --scenario brownfield`; the impact
 node runs on the repo map, the migration and dependency tasks each pause for approval, and the compliance scan
 catches a raw-IP field on attempt 1.
+Ambiguous offline: `sdlc run --scenario ambiguous` pauses with 6 questions; `sdlc answer <run_id> '{"AMB-1": "..."}'`
+produces spec v2; a planted failing test then drives diagnose -> re-plan (plan v2, v3) until `replan.limit_reached`.
 Offline golden run: start the API with `SDLC_LLM=fake SDLC_TARGET_STACK=python`, run with `--record` and approve
 twice; the run is now in `runs/cache/` and `sdlc run --scenario greenfield --replay` completes it with no key.
 

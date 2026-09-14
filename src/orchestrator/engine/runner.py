@@ -145,6 +145,22 @@ class Runner:
                     actor="orchestrator",
                     payload={"because": sorted(changed), "origin": origin},
                 )
+        # never bypass a human checkpoint: an invalidated approval node needs a fresh approval, and a new
+        # plan voids task-level approvals (and the high-impact actions they were mapped onto)
+        revoked = {a for a in ctx.approvals if a in hit}
+        if "plan" in changed:
+            revoked |= {
+                a for a in ctx.approvals if a not in self.graph.nodes
+            }  # task:<id> tokens + action names
+        if revoked:
+            ctx.approvals -= revoked
+            ctx.emit(
+                Kind.POLICY_DECISION,
+                node_id=origin,
+                actor="policy",
+                status="APPROVAL_REVOKED",
+                payload={"revoked": sorted(revoked), "because": sorted(changed)},
+            )
         return hit
 
     # ------------------------------------------------------------------ execution of one node

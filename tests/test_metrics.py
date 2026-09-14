@@ -29,7 +29,10 @@ def test_metrics_from_trace() -> None:
         ev(Kind.ATTEMPT_STARTED, "x", 1, 51),
         ev(Kind.ROLLED_BACK, "x", 3, 60),
         ev(Kind.APPROVAL_REQUESTED, "plan", 0, 5),
-        ev(Kind.REPLAN_TRIGGERED, "diagnose", 0, 30),
+        ev(Kind.REPLAN_TRIGGERED, "diagnose", 0, 30, payload={"route": "replan"}),
+        ev(
+            Kind.REPLAN_TRIGGERED, "clarify", 0, 31, payload={"changed": ["spec"]}
+        ),  # lineage only, not a re-plan
         ev(Kind.RUN_HALTED, None, 0, 100, payload={"trigger": "gate.repeated_failure"}),
     ]
     m = compute("r", events)

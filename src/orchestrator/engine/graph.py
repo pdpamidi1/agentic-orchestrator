@@ -25,6 +25,7 @@ class NodeDef:
     when: str | None = None
     agent: str | None = None
     gates: tuple[str, ...] = ()
+    rolls_up: tuple[str, ...] = ()  # gate nodes whose recorded results count toward this gate node's verdict
     advisory: bool = False
     retries: dict[str, Any] = field(default_factory=dict)
     on_result: dict[str, Any] = field(default_factory=dict)
@@ -59,6 +60,7 @@ class Graph:
                     when=body.pop("when", None),
                     agent=body.pop("agent", None),
                     gates=tuple(body.pop("gates", [])),
+                    rolls_up=tuple(body.pop("rolls_up", [])),
                     advisory=bool(body.pop("advisory", False)),
                     retries=body.pop("retries", {}) or {},
                     on_result=body.pop("on_result", {}) or {},
@@ -80,6 +82,11 @@ class Graph:
                 raise ValueError(f"node {n.id} has unknown fallback {n.fallback}")
             if n.kind == "approval" and not n.high_impact:
                 raise ValueError(f"approval node {n.id} must name a high_impact action")
+            for r in n.rolls_up:
+                if r not in self.nodes or self.nodes[r].kind != "gate" or not self.nodes[r].produces:
+                    raise ValueError(f"node {n.id} rolls up {r}, which must be a gate node with produces")
+                if r not in n.depends_on:
+                    raise ValueError(f"node {n.id} rolls up {r} but does not depend on it")
         visiting: set[str] = set()
         done: set[str] = set()
 

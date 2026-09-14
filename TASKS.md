@@ -24,7 +24,7 @@ Status legend: [ ] todo · [~] in progress · [x] done
 - [x] **T8 Brownfield** (offline record + replay proven; live recording waits for T6's key): `repo_map` producer (walk `src/`, package graph, endpoints, tables) put into context at intake;
       `impact` node runs; two high-impact task approvals fire (`schema.migration`, `dependency.major_version`);
       compliance gate blocks a raw-IP field on attempt 1. Record + replay.
-- [ ] **T9 Ambiguous**: spec with >= 5 ambiguities; `sdlc answer` produces spec v2; assert `NODE_INVALIDATED` set equals
+- [x] **T9 Ambiguous** (policy.yaml allows 2 re-plans, so the third re-plan trips the limit): spec with >= 5 ambiguities; `sdlc answer` produces spec v2; assert `NODE_INVALIDATED` set equals
       the expected downstream; `plan.previous_version == 1`; one deliberate second re-plan hits `replan.limit_reached`.
 - [ ] **T10 Postgres store + trace sink**: `store/pg_store.py` and `trace/pg_sink.py` (SQLAlchemy async), migrations in
       `sql/`, `sql/views.sql` metrics must equal `trace/metrics.py` on the same run (test both).
