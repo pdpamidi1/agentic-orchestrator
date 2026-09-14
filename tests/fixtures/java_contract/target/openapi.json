@@ -1,0 +1,5 @@
+{"openapi": "3.0.1", "paths": {
+  "/api/v1/urls": {"post": {"operationId": "createShortUrl", "responses": {"201": {}, "400": {}, "409": {}}}},
+  "/{shortCode}": {"get": {"operationId": "redirect", "responses": {"302": {}, "404": {}}}},
+  "/actuator/health": {"get": {"operationId": "health", "responses": {"200": {}}}}
+}}

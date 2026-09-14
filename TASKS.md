@@ -10,7 +10,7 @@ Status legend: [ ] todo · [~] in progress · [x] done
       `SDLC_LLM=fake` setting. `sdlc run --scenario greenfield` must reach `approval_design` with no network.
 - [x] **T3 Sandbox executor for the fake loop**: `executors/fake.py` writes a trivial file + test into the sandbox and commits.
       Prove: implementation -> gates -> validation -> release_ready -> approval_release end to end with `SDLC_LLM=fake`.
-- [ ] **T4 Gates**: implement `openapi_diff` (python: import app and call `app.openapi()`; java: parse committed
+- [x] **T4 Gates**: implement `openapi_diff` (python: import app and call `app.openapi()`; java: parse committed
       `openapi.yaml` vs springdoc dump produced by the integration gate) and the `architecture` gate for python via
       import-linter contract generated from `Design.classes.layering_rules`. Tests with fixture repos under `tests/fixtures/`.
 - [ ] **T5 Planted failure**: in the fake executor, make attempt 1 of `implementation` violate `scope` (write `.env`),

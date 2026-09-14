@@ -118,7 +118,21 @@ CANNED: dict[str, dict[str, Any]] = {
         "run_id": "fake",
         "spec_version": 1,
         "api": {
-            "openapi_yaml": "openapi: 3.1.0\ninfo: {title: shortener, version: '1.0'}\npaths: {}\n",
+            "openapi_yaml": (
+                "openapi: 3.1.0\n"
+                "info: {title: shortener, version: '1.0'}\n"
+                "paths:\n"
+                "  /api/v1/urls:\n"
+                "    post:\n"
+                "      operationId: createShortUrl\n"
+                "      responses: {'201': {description: ShortUrl}, '400': {description: Problem},"
+                " '409': {description: Problem}}\n"
+                "  /{short_code}:\n"
+                "    get:\n"
+                "      operationId: redirect\n"
+                "      responses: {'302': {description: redirect}, '404': {description: Problem},"
+                " '410': {description: Problem}}\n"
+            ),
             "operations": [
                 {
                     "method": "POST",

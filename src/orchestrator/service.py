@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 
 from .config import Settings
 from .engine.context import RunContext
@@ -32,13 +31,8 @@ class GitRollback:
             return
         git = GitSandbox(ctx.sandbox)
         for task_id, sha in reversed(list(cs.commits.items())):
-            await git.export_patch(
-                f"{sha}~1",
-                Path(ctx.policy.observability.get("runs_dir", "runs"))
-                / ctx.run_id
-                / "rejected"
-                / f"{task_id}.patch",
-            )
+            # runs/<id>/rejected/<task>.patch, next to the sandbox (never a cwd-relative path)
+            await git.export_patch(f"{sha}~1", ctx.sandbox.parent / "rejected" / f"{task_id}.patch")
             await git.revert(sha)
 
 

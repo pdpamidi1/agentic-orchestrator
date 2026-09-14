@@ -1,0 +1,11 @@
+openapi: 3.1.0
+info: {title: demo, version: "1.0"}
+paths:
+  /api/v1/urls:
+    post:
+      operationId: createShortUrl
+      responses: {"201": {description: created}, "400": {description: problem}}
+  /{code}:
+    get:
+      operationId: redirect
+      responses: {"302": {description: redirect}, "404": {description: problem}}

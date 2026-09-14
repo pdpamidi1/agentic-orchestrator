@@ -67,13 +67,21 @@ class FakeExecutor:
                 "import sys\nfrom pathlib import Path\n\n"
                 'sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))\n',
             )
-            once(
-                "tests/test_architecture.py",
-                '"""Layering rules from Design.classes; enforced by the architecture gate (TASKS T4)."""\n\n'
-                f"RULES = {design.classes.layering_rules!r}\n\n\n"
-                "def test_layering_rules_are_declared() -> None:\n"
-                "    assert isinstance(RULES, list)\n",
-            )
+            for p in design.classes.packages:  # the layering rules refer to these packages
+                once(
+                    f"src/{p.name.replace('.', '/')}/__init__.py",
+                    f'"""{p.name}: {p.classes[0].responsibility if p.classes else ""}"""\n',
+                )
+            if design.api.operations:
+                paths = sorted({o.path for o in design.api.operations})
+                once(f"src/{pkg}/app.py", _render_app(design, pkg))
+                once(
+                    "tests/unit/test_app.py",
+                    "from __future__ import annotations\n\n"
+                    f"from {pkg}.app import app\n\n\n"
+                    "def test_contract_paths_exposed() -> None:\n"
+                    f"    assert sorted(app.openapi()['paths']) == {paths!r}\n",
+                )
             once(
                 "tests/integration/test_smoke.py",
                 f"import {pkg}\n\n\ndef test_package_imports() -> None:\n    assert {pkg}.__doc__\n",
@@ -114,6 +122,32 @@ class FakeExecutor:
             commit_sha=sha,
             notes="fake executor: trivial module + test",
         )
+
+
+def _render_app(design: Design, pkg: str) -> str:
+    """A FastAPI app whose OpenAPI document is exactly the Design contract (operation ids, paths, codes)."""
+    lines = [
+        '"""FastAPI app exposing the Design API contract (fake executor)."""',
+        "",
+        "from __future__ import annotations",
+        "",
+        "from fastapi import FastAPI, Response",
+        "",
+        f"app = FastAPI(title={pkg!r})",
+    ]
+    for op in design.api.operations:
+        codes = sorted(op.responses) or [200]
+        success = codes[0]
+        others = ", ".join(f"{c}: {{'description': {op.responses[c]!r}}}" for c in codes if c != success)
+        lines += [
+            "",
+            "",
+            f"@app.{op.method.lower()}({op.path!r}, operation_id={op.operation_id!r}, status_code={success}, "
+            f"responses={{{others}}})",
+            f"def {_ident(op.operation_id)}() -> Response:",
+            f"    return Response(status_code={success})",
+        ]
+    return "\n".join(lines) + "\n"
 
 
 def _tree(root: Path) -> set[str]:

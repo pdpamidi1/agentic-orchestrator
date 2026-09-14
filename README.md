@@ -41,7 +41,8 @@ sql/views.sql    Postgres schema + metric views (must match trace/metrics.py)
 Engine is tested without any LLM: readiness/join/fallback edges, retries with structured feedback, fallback → diagnose →
 retry/replan routes, replan limit safe-stop, budget safe-stop, input pause + spec v2 invalidation, approval pause/resume.
 Policy engine is tested on path classification, scope, secret/banned/PII scans, command allowlist. Metrics are pinned by
-a fixture trace. Gates get fixture repos (TASKS T4). Golden replay runs in CI (T15).
+a fixture trace. The contract and architecture gates run against fixture repos under `tests/fixtures/`. Golden replay
+runs in CI (T15).
 
 ## Limitations
 See `docs/architecture.md` — sandbox is process+policy (not a container), node-level invalidation, in-memory live-run

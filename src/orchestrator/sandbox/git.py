@@ -25,6 +25,7 @@ class GitSandbox:
         ".mypy_cache/",
         ".ruff_cache/",
         ".coverage",
+        ".import_linter_cache/",
         "target/",
     )
 

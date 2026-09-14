@@ -17,6 +17,7 @@ from ..llm.client import LLMClient
 from ..models import Plan, TaskSpec
 from ..models.trace import Kind
 from ..sandbox.git import GitSandbox
+from .arch_contract import write_architecture_contract
 from .context import RunContext
 from .gates import run_gates
 from .graph import NodeDef
@@ -41,6 +42,7 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor) -> dict[str, Any]:
         await git.ensure_repo()
         branch = f"{ctx.policy.sandbox.branch_prefix}{ctx.run_id}"
         await git.start_run_branch(branch)
+        await write_architecture_contract(ctx, git, node.id)  # the gate's test is never agent-authored
         cs: Changeset = ctx.get("changeset") or Changeset(branch=branch)
         feedback = ctx.feedback.get(node.id)
         pe = PolicyEngine(ctx.policy, ctx.target_stack)
