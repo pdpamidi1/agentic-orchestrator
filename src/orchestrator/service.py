@@ -98,6 +98,10 @@ class OrchestratorService:
     ) -> LiveRun:
         run_id = f"{scenario}-{uuid.uuid4().hex[:8]}"
         mode = self._mode(replay)
+        if record and mode != "anthropic":
+            raise RuntimeError(
+                f"--record needs live agents (ANTHROPIC_API_KEY); resolved llm mode is {mode!r}"
+            )
         text = requirement_text or (self.s.specs_dir / f"{scenario}.md").read_text(encoding="utf-8")
         sandbox = self.s.runs_dir / run_id / "sandbox"
         sandbox.mkdir(parents=True, exist_ok=True)

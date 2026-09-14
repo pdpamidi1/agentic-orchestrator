@@ -15,7 +15,7 @@ Status legend: [ ] todo · [~] in progress · [x] done
       import-linter contract generated from `Design.classes.layering_rules`. Tests with fixture repos under `tests/fixtures/`.
 - [x] **T5 Planted failure**: in the fake executor, make attempt 1 of `implementation` violate `scope` (write `.env`),
       assert the run shows `POLICY_DECISION=VIOLATION`, a revert, and attempt 2 passing. This is the demo's best minute.
-- [ ] **T6 Live agents**: run `sdlc run --scenario greenfield --record` with a real key; fix prompts until every schema
+- [~] **T6 Live agents** (prep committed; recording blocked: no ANTHROPIC_API_KEY on this machine): run `sdlc run --scenario greenfield --record` with a real key; fix prompts until every schema
       validates within `max_repairs`. Commit `runs/cache/llm/*.json`.
 - [ ] **T7 Claude Code executor**: run `implementation` live via `executors/claude_code_cli.py`; record patches to
       `runs/cache/changesets/greenfield/`. Verify `--replay` reproduces the run without a key.

@@ -13,7 +13,7 @@
 | Gates | Ordered validation: scope → compile → style → security → architecture → unit → integration → contract → acceptance(advisory) → release. `contract` diffs the committed OpenAPI document (else `Design.api`) against what the code exposes (python: `app.openapi()` dumped inside the sandbox; java: the springdoc dump under `target/`); removed operations/status codes are breaking and need `api.contract.breaking_change`, undocumented ones must be committed. `architecture` (python) runs `tests/test_architecture.py`, which the orchestrator generates and commits from `Design.classes.layering_rules` as import-linter layer contracts before the executor runs | `engine/gates.py`, `engine/arch_contract.py`, `policy.yaml#gates` |
 | Agents | Requirements, planner, architecture, impact, security, risk, reviewer, diagnoser, documenter — prompt + schema | `agents/`, `prompts/` |
 | Executors | Claude Code CLI (primary), replay (recorded patches), fake (`SDLC_LLM=fake`: trivial module + unit test per task, release artifacts from the Design when the task allows them; python stack only). The fake executor plants a failure: attempt 1 also writes `.env`, a forbidden path, so every fake run shows `POLICY_DECISION=VIOLATION` -> task commit reverted (`ROLLED_BACK`) -> attempt 2 clean, caught by the policy engine, not the executor | `executors/` |
-| LLM client | One `structured()` call shape, four backings: `anthropic` (tool-forced JSON + repair loop), `replay` (cached responses, replay semantics), `fake` (canned artifacts per schema, live semantics, no network), `recording` (anthropic + cache write). Chosen by `--replay`, then `SDLC_LLM`, then key presence | `llm/`, `service.py#_mode` |
+| LLM client | One `structured()` call shape, four backings: `anthropic` (structured outputs via `messages.parse`: the API constrains the reply to the Pydantic JSON schema, a repair loop feeds validation errors back), `replay` (cached responses, replay semantics), `fake` (canned artifacts per schema, live semantics, no network), `recording` (anthropic + cache write). Chosen by `--replay`, then `SDLC_LLM`, then key presence | `llm/`, `service.py#_mode` |
 | Context | Versioned artifacts + lineage, feedback, answers, approvals | `engine/context.py` |
 | State | `RunState` persisted on every transition | `models/state.py`, `store/` |
 | Trace | Append-only events (jsonl, memory; Postgres/Kafka in TASKS) | `trace/` |
@@ -67,7 +67,7 @@ layering rules → ArchUnit/import-linter, acceptance criteria → test names.
 | File store first, Postgres second | Postgres first | Day-1 demo with zero infra; the interface is identical |
 
 ## Risks, trade-offs, limitations
-- LLM non-determinism: mitigated by schema-forced output + repair loop + replay; not eliminated.
+- LLM non-determinism: mitigated by schema-constrained output + repair loop + replay; not eliminated.
 - Sandbox is process + path policy, not a container; a Docker executor is the first stretch item. Tool output the gates
   produce (`__pycache__`, `.coverage`, caches) is excluded via `.git/info/exclude` so it never reads as an agent change.
 - The offline loop (`SDLC_LLM=fake`) proves the graph, handlers, gates and approvals end to end, but only for the
