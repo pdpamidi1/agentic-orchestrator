@@ -114,7 +114,7 @@ async def test_missing_binary_is_not_transient(tmp_path: Path) -> None:
 
 
 def test_gate_contract_for_java_lists_the_maven_gates_and_the_springdoc_dump() -> None:
-    from orchestrator.executors.claude_code_cli import gate_contract
+    from orchestrator.engine.conventions import gate_contract
 
     lines = gate_contract(POLICY, "java")
     text = "\n".join(lines)

@@ -24,6 +24,7 @@ from .gates import run_gates
 from .graph import Graph, NodeDef
 from .outcomes import Blocked, NeedsApproval, Outcome, Retry, Route, Success
 from .policy_engine import PolicyEngine
+from .provision import provision_sandbox
 
 
 def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict[str, Any]:
@@ -45,6 +46,7 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
         await git.ensure_repo()
         branch = f"{ctx.policy.sandbox.branch_prefix}{ctx.run_id}"
         await git.start_run_branch(branch)
+        await provision_sandbox(ctx, git, node.id)  # baseline the agent may not write (java: mvnw)
         await write_architecture_contract(ctx, git, node.id)  # the gate's test is never agent-authored
         cs: Changeset = ctx.get("changeset") or Changeset(branch=branch)
         feedback = ctx.feedback.get(node.id)

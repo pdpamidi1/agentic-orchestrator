@@ -7,6 +7,9 @@ as ADR one-liners with the rejected alternative. Defaults unless the spec says o
 via path prefix, global exception handler with problem+json, async/reactive where I/O bound, Kafka for events with an
 outbox table, Testcontainers for integration tests, Docker + Kubernetes manifests out of scope for agents (infra is protected).
 
+## Repository conventions (policy; where the OpenAPI document lives, which gates run)
+{conventions}
+
 ## Spec
 {spec}
 

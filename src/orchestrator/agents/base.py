@@ -8,6 +8,7 @@ from typing import Any, ClassVar
 from pydantic import BaseModel
 
 from ..engine.context import RunContext
+from ..engine.conventions import render_conventions
 from ..engine.graph import NodeDef
 from ..engine.outcomes import Outcome, Retry, Success
 from ..llm.client import LLMClient
@@ -36,6 +37,7 @@ class Agent[T: BaseModel]:
         parts["answers"] = _dump(ctx.answers)
         parts["run_id"] = ctx.run_id
         parts["target_stack"] = ctx.target_stack
+        parts["conventions"] = render_conventions(ctx.policy, ctx.target_stack)
         return template.format(**parts)
 
     async def __call__(self, node: NodeDef, ctx: RunContext) -> Outcome:

@@ -21,6 +21,7 @@ from ..models.validation import Finding, GateOutcome, GateStatus, ValidationResu
 from ..sandbox.git import GitSandbox
 from ..sandbox.process import CommandNotAllowed, run_command
 from .context import RunContext
+from .conventions import COMMITTED_OPENAPI, SPRINGDOC_DUMPS
 from .policy_engine import PolicyEngine
 
 InternalGate = Callable[[RunContext, GitSandbox], Awaitable[list[Finding]]]
@@ -50,8 +51,7 @@ async def secret_and_pattern_scan(ctx: RunContext, git: GitSandbox) -> list[Find
 # ---------------------------------------------------------------- contract gate
 DUMP_SCRIPT = Path(__file__).resolve().parent.parent / "sandbox" / "openapi_dump.py"
 HTTP_METHODS = {"get", "put", "post", "delete", "patch", "head", "options", "trace"}
-COMMITTED_CANDIDATES = ("openapi.yaml", "src/main/resources/openapi.yaml")
-SPRINGDOC_DUMPS = ("target/openapi.json", "target/openapi.yaml")
+COMMITTED_CANDIDATES = COMMITTED_OPENAPI
 Shape = dict[str, set[str]]  # "METHOD /path/{}" -> declared status codes
 
 

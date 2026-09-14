@@ -21,7 +21,7 @@ from orchestrator.llm.fake import CANNED, FakeClient
 from orchestrator.models import Plan, Spec
 from orchestrator.service import OrchestratorService
 
-STANDARD_KEYS = {"feedback", "answers", "run_id", "target_stack"}
+STANDARD_KEYS = {"feedback", "answers", "run_id", "target_stack", "conventions"}
 
 
 @pytest.mark.parametrize("agent_cls", list(AGENTS.values()), ids=lambda a: a.name)
@@ -185,3 +185,18 @@ async def test_recording_client_reuses_valid_hits_and_rerecords_stale_ones(tmp_p
     spec, _ = await rec.structured("sys", "prompt", Spec)
     assert inner.calls == ["Spec", "Spec"] and spec.summary  # re-recorded
     assert json.loads(await asyncio.to_thread(stale.read_text))["output"]["summary"] == spec.summary
+
+
+def test_conventions_render_paths_gates_and_provisioned_files() -> None:
+    from orchestrator.engine.conventions import render_conventions
+    from orchestrator.models import load_policy
+
+    policy = load_policy(str(Path(__file__).resolve().parent.parent / "policy.yaml"))
+    java = render_conventions(policy, "java")
+    assert "src/**" in java and "pom.xml" in java and ".env*" in java  # allowed / protected / forbidden
+    assert "`./mvnw -q -Pit verify`" in java and "mvnw" in java and "ArchitectureTest.java" in java
+    assert "src/main/resources/openapi.yaml" in java and "Dockerfile" in java
+    python = render_conventions(policy, "python")
+    assert (
+        "pytest -q tests/unit" in python and "tests/test_architecture.py" in python and "mvnw" not in python
+    )
