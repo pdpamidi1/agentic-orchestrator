@@ -45,6 +45,8 @@ curl -s -X POST localhost:8081/api/v1/urls -H 'content-type: application/json' \
 curl -si localhost:8081/<short_code>            # 302 with Location
 make shortener-psql               # then: select short_code, long_url, code_source, expires_at from urls;
 make shortener-redis              # then: keys *   /   get <key>
+make shortener-up-all             # + Kafka (:9094 from the host) for the brownfield click-analytics build
+make shortener-kafka              # tail the url.clicked topic
 make shortener-down
 ```
 The orchestrator's own `postgres`/`redis` services (5432/6379, for the store and trace sink) stay separate.
