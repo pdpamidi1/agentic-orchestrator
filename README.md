@@ -35,6 +35,20 @@ produces spec v2; a planted failing test then drives diagnose -> re-plan (plan v
 Offline golden run: start the API with `SDLC_LLM=fake SDLC_TARGET_STACK=python`, run with `--record` and approve
 twice; the run is now in `runs/cache/` and `sdlc run --scenario greenfield --replay` completes it with no key.
 
+## Running the delivered url-shortener
+`sdlc deliver <run_id>` copies a COMPLETED run into `workspace/url-shortener` (a standalone Spring Boot / Maven
+project: `./mvnw test`, `./mvnw -Pit verify`). To run it against real Postgres and Redis and look at the data:
+```bash
+make shortener-up                 # postgres :5433, redis :6380, app :8081 (builds workspace/url-shortener/Dockerfile)
+curl -s -X POST localhost:8081/api/v1/urls -H 'content-type: application/json' \
+     -d '{"long_url":"https://example.com/a/very/long/path"}'
+curl -si localhost:8081/<short_code>            # 302 with Location
+make shortener-psql               # then: select short_code, long_url, code_source, expires_at from urls;
+make shortener-redis              # then: keys *   /   get <key>
+make shortener-down
+```
+The orchestrator's own `postgres`/`redis` services (5432/6379, for the store and trace sink) stay separate.
+
 ## Layout
 ```
 workflow.yaml  policy.yaml  CLAUDE.md  TASKS.md  docker-compose.yml

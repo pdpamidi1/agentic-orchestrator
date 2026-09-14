@@ -8,6 +8,34 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
+  # --- the delivered target project (workspace/url-shortener), profile "shortener" -------------------
+  # Separate instances and ports from the orchestrator's own postgres/redis so both stacks can run together.
+  shortener-postgres:
+    image: postgres:16-alpine
+    profiles: ["shortener"]
+    environment: { POSTGRES_DB: shortener, POSTGRES_USER: shortener, POSTGRES_PASSWORD: shortener }
+    ports: ["5433:5432"]
+    volumes: ["shortener-pgdata:/var/lib/postgresql/data"]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U shortener -d shortener"], interval: 5s, retries: 10 }
+  shortener-redis:
+    image: redis:7-alpine
+    profiles: ["shortener"]
+    ports: ["6380:6379"]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, retries: 10 }
+  shortener-app:
+    build: ./workspace/url-shortener            # the Dockerfile the run delivers (release checklist)
+    profiles: ["shortener"]
+    depends_on:
+      shortener-postgres: { condition: service_healthy }
+      shortener-redis: { condition: service_healthy }
+    ports: ["8081:8080"]
+    environment:                                # Spring Boot relaxed binding overrides application*.yml
+      SPRING_DATASOURCE_URL: jdbc:postgresql://shortener-postgres:5432/shortener
+      SPRING_DATASOURCE_USERNAME: shortener
+      SPRING_DATASOURCE_PASSWORD: shortener
+      SPRING_DATA_REDIS_HOST: shortener-redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      APP_BASE_URL: http://localhost:8081       # short_url host returned by POST /api/v1/urls
   kafka:
     image: apache/kafka:3.8.0
     profiles: ["kafka"]
@@ -21,3 +49,6 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+volumes:
+  shortener-pgdata: {}
