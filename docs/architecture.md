@@ -8,11 +8,11 @@
 |---|---|---|
 | Graph | Explicit DAG from `workflow.yaml`: nodes, edges, parallel groups, fallbacks, invalidation rules; readiness; cycle check | `engine/graph.py` |
 | Runner | Execution: parallel batches on asyncio with join semantics, entry/exit gates, bounded retries with structured feedback, fallback, rollback, safe-stop, re-planning by invalidation | `engine/runner.py` |
-| Handlers | What each node kind does: agent / executor (task-level DAG, HIGH tasks pause) / gate / input | `engine/handlers.py` |
+| Handlers | What each node kind does: agent / executor (task-level DAG; a HIGH task pauses the node, approving the node approves that task and the high-impact actions of the protected paths it touches) / gate (result stored once under `produces`, pass or fail) / input | `engine/handlers.py` |
 | Policy engine | Change control (allowed/protected/forbidden), scope + size limits, secret/banned-pattern/PII scan, command allowlist | `engine/policy_engine.py` |
 | Gates | Ordered validation: scope → compile → style → security → architecture → unit → integration → contract → acceptance(advisory) → release | `engine/gates.py`, `policy.yaml#gates` |
 | Agents | Requirements, planner, architecture, impact, security, risk, reviewer, diagnoser, documenter — prompt + schema | `agents/`, `prompts/` |
-| Executors | Claude Code CLI (primary), replay (recorded patches) | `executors/` |
+| Executors | Claude Code CLI (primary), replay (recorded patches), fake (`SDLC_LLM=fake`: trivial module + unit test per task, release artifacts from the Design when the task allows them; python stack only) | `executors/` |
 | LLM client | One `structured()` call shape, four backings: `anthropic` (tool-forced JSON + repair loop), `replay` (cached responses, replay semantics), `fake` (canned artifacts per schema, live semantics, no network), `recording` (anthropic + cache write). Chosen by `--replay`, then `SDLC_LLM`, then key presence | `llm/`, `service.py#_mode` |
 | Context | Versioned artifacts + lineage, feedback, answers, approvals | `engine/context.py` |
 | State | `RunState` persisted on every transition | `models/state.py`, `store/` |
@@ -67,7 +67,10 @@ layering rules → ArchUnit/import-linter, acceptance criteria → test names.
 
 ## Risks, trade-offs, limitations
 - LLM non-determinism: mitigated by schema-forced output + repair loop + replay; not eliminated.
-- Sandbox is process + path policy, not a container; a Docker executor is the first stretch item.
+- Sandbox is process + path policy, not a container; a Docker executor is the first stretch item. Tool output the gates
+  produce (`__pycache__`, `.coverage`, caches) is excluded via `.git/info/exclude` so it never reads as an agent change.
+- The offline loop (`SDLC_LLM=fake`) proves the graph, handlers, gates and approvals end to end, but only for the
+  python target stack: the java gates need a Maven wrapper the fake executor does not generate.
 - Node-level invalidation is coarser than task-level; acceptable for the prototype.
 - In-memory live-run registry: `approve`/`answer` need the same API process until T12 (resume from store).
 - Acceptance review is advisory by design; humans own quality.

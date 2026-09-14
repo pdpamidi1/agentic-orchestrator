@@ -8,7 +8,7 @@ Status legend: [ ] todo · [~] in progress · [x] done
       `tests/` are the spec for `engine/`). Do not weaken a test to make it pass; fix the engine.
 - [x] **T2 Stub agents (offline loop)**: add `llm/fake.py` (`FakeClient`) returning canned artifacts per schema, and a
       `SDLC_LLM=fake` setting. `sdlc run --scenario greenfield` must reach `approval_design` with no network.
-- [ ] **T3 Sandbox executor for the fake loop**: `executors/fake.py` writes a trivial file + test into the sandbox and commits.
+- [x] **T3 Sandbox executor for the fake loop**: `executors/fake.py` writes a trivial file + test into the sandbox and commits.
       Prove: implementation -> gates -> validation -> release_ready -> approval_release end to end with `SDLC_LLM=fake`.
 - [ ] **T4 Gates**: implement `openapi_diff` (python: import app and call `app.openapi()`; java: parse committed
       `openapi.yaml` vs springdoc dump produced by the integration gate) and the `architecture` gate for python via

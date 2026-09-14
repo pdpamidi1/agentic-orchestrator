@@ -52,7 +52,18 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor) -> dict[str, Any]:
                 return Blocked("plan has unsatisfiable task dependencies")
             for t in ready:  # task-level high-impact approval
                 if t.requires_approval and f"task:{t.id}" not in ctx.approvals:
-                    if ctx.replay and ctx.policy.autonomy.auto_approve_in_replay:
+                    if node.id in ctx.approvals:  # human approved the node while it was paused on this task
+                        ctx.approvals.discard(node.id)
+                        ctx.approvals.add(f"task:{t.id}")
+                        ctx.emit(
+                            Kind.POLICY_DECISION,
+                            node_id=node.id,
+                            task_id=t.id,
+                            actor="policy",
+                            status="APPROVED",
+                            payload={"action": "task.high_impact", "task": t.id},
+                        )
+                    elif ctx.replay and ctx.policy.autonomy.auto_approve_in_replay:
                         ctx.approvals.add(f"task:{t.id}")
                     else:
                         ctx.put("changeset", cs, node.id)
@@ -66,15 +77,25 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor) -> dict[str, Any]:
             results = await asyncio.gather(*(executor.execute(ctx, t, design, feedback) for t in batch))
             for t, r in zip(batch, results, strict=True):
                 if isinstance(r, Done):
-                    verdict = pe.check_scope(
-                        r.files_changed, t.allowed_files, {"task:" + t.id} & ctx.approvals
-                    )
+                    # an approved HIGH task may touch the protected paths it declared; map the human's
+                    # approval onto the high-impact actions those paths require
+                    approved: set[str] = set()
+                    if f"task:{t.id}" in ctx.approvals:
+                        approved = {
+                            pv.required_action
+                            for pv in (pe.classify(f) for f in r.files_changed)
+                            if pv.classification == "protected" and pv.required_action
+                        }
+                    verdict = pe.check_scope(r.files_changed, t.allowed_files, approved)
                     ctx.emit(
                         Kind.POLICY_DECISION,
                         task_id=t.id,
                         actor="policy",
                         status="OK" if verdict.ok else "VIOLATION",
-                        payload={"findings": [f.model_dump() for f in verdict.findings]},
+                        payload={
+                            "findings": [f.model_dump() for f in verdict.findings],
+                            "approved_actions": sorted(approved),
+                        },
                     )
                     if not verdict.ok:
                         await git.revert(r.commit_sha)
@@ -91,15 +112,21 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor) -> dict[str, Any]:
                     return Retry(f"task {t.id} blocked: {r.reason}", {"task": t.id, "reason": r.reason})
                 elif isinstance(r, Errored):
                     return Retry(f"task {t.id} errored: {r.reason}") if r.transient else Blocked(r.reason)
+        if ctx.get("changeset") is cs:
+            # already in context from an approval pause inside this node; the object carries every commit,
+            # so a second put would only bump the version and read as a replan downstream
+            return Success()
         return Success({"changeset": cs})
 
     async def gate_handler(node: NodeDef, ctx: RunContext) -> Outcome:
         attempt = (ctx.feedback.get(node.id) or {}).get("attempt", 0) + 1
         vr = await run_gates(list(node.gates), ctx, task_id=node.id, attempt=attempt)
-        if node.id == "validation":
-            ctx.put("validation_result", vr, node.id)
+        for name in node.produces:
+            # stored once, pass or fail: the diagnoser reads a failed validation_result.
+            # (`run_report` holds the release gate's result until TASKS T11 renders the real report.)
+            ctx.put(name, vr, node.id)
         if vr.passed:
-            return Success({"validation_result": vr} if node.produces else {})
+            return Success()
         return Retry(
             f"{node.id}: {len(vr.blocking_findings)} blocking findings",
             {"findings": [f.model_dump() for f in vr.blocking_findings][:25]},

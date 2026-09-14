@@ -14,6 +14,7 @@ from .engine.handlers import build_handlers
 from .engine.runner import Runner
 from .executors.base import CodeExecutor
 from .executors.claude_code_cli import ClaudeCodeCliExecutor
+from .executors.fake import FakeExecutor
 from .executors.replay import ReplayExecutor
 from .llm.client import AnthropicClient, LLMClient, RecordingClient, ReplayClient
 from .llm.fake import FakeClient
@@ -76,7 +77,7 @@ class OrchestratorService:
         executor: CodeExecutor
         if mode == "fake":
             llm = FakeClient()
-            executor = ReplayExecutor(self.s.cache_dir / "changesets")  # TASKS T3 swaps in a fake executor
+            executor = FakeExecutor()
         elif mode == "replay":
             llm = ReplayClient(self.s.cache_dir / "llm")
             executor = ReplayExecutor(self.s.cache_dir / "changesets")

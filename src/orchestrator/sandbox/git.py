@@ -17,11 +17,25 @@ class GitSandbox:
         out, _ = await proc.communicate()
         return proc.returncode or 0, out.decode(errors="replace")
 
+    # tool output the gates themselves produce; kept out of the tree diff without touching the agent's files
+    EXCLUDES = (
+        "__pycache__/",
+        "*.pyc",
+        ".pytest_cache/",
+        ".mypy_cache/",
+        ".ruff_cache/",
+        ".coverage",
+        "target/",
+    )
+
     async def ensure_repo(self) -> None:
         if not (self.root / ".git").exists():
             self.root.mkdir(parents=True, exist_ok=True)
             await self._git("init", "-q")
             await self._git("commit", "--allow-empty", "-q", "-m", "chore: initial (agentic-sdlc)")
+        exclude = self.root / ".git" / "info" / "exclude"
+        await asyncio.to_thread(exclude.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(exclude.write_text, "\n".join(self.EXCLUDES) + "\n", encoding="utf-8")
 
     async def start_run_branch(self, branch: str) -> None:
         rc, _ = await self._git("checkout", "-q", "-b", branch)

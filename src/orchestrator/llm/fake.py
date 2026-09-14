@@ -102,8 +102,17 @@ CANNED: dict[str, dict[str, Any]] = {
                 "acceptance_criteria_ids": ["AC3", "AC4"],
                 "definition_of_done": ["302/404/410 covered by tests"],
             },
+            {
+                "id": "T4",
+                "title": "Release artifacts: README, OpenAPI document, Dockerfile, CI workflow",
+                "depends_on": ["T2", "T3"],
+                "impact_level": "HIGH",
+                "allowed_files": ["README.md", "openapi.yaml", "Dockerfile", ".github/workflows/ci.yml"],
+                "definition_of_done": ["release checklist passes"],
+                "risk_notes": "protected: Dockerfile (infrastructure.change), CI workflow (release.config)",
+            },
         ],
-        "rationale": "schema first, then the two endpoints in parallel",
+        "rationale": "schema first, the two endpoints in parallel, then release artifacts under approval",
     },
     "Design": {
         "run_id": "fake",
