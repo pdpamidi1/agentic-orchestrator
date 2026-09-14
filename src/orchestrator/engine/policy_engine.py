@@ -13,6 +13,10 @@ from ..models.policy import Policy
 from ..models.validation import Finding
 
 
+def matches(path: str, patterns: list[str]) -> bool:
+    return _match(path, patterns)
+
+
 def _match(path: str, patterns: list[str]) -> bool:
     # fnmatch treats ** like *; good enough for path allowlists, and we normalise separators
     p = path.replace("\\", "/")

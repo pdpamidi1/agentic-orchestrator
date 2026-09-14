@@ -145,3 +145,76 @@ async def test_a_task_that_keeps_failing_blocks_after_its_own_allowance(tmp_path
     assert all(isinstance(o, Retry) for o in outcomes[:-1]) and isinstance(outcomes[-1], Blocked)
     assert outcomes[0].feedback["task_attempts"] == {"G1": 1} and "G1" in outcomes[-1].reason
     assert ex.order == ["G1"] * allowance  # only the failing task was retried; G2/G3 never started
+
+
+class BlocksThenNeedsScope:
+    """G2 reports BLOCKED naming an extra file; once granted it writes it and succeeds."""
+
+    def __init__(self) -> None:
+        self.seen_allowed: list[list[str]] = []
+
+    async def execute(
+        self, ctx: RunContext, task: TaskSpec, design: Design, feedback: dict[str, Any] | None
+    ) -> Any:
+        from orchestrator.executors.base import BlockedTask
+
+        git = GitSandbox(ctx.sandbox)
+        self.seen_allowed.append(list(task.allowed_files))
+        files = [f"src/{task.id.lower()}.py", f"tests/test_{task.id.lower()}.py"]
+        if task.id == "G2":
+            if "src/shared/util.py" not in task.allowed_files:
+                return BlockedTask("needs src/shared/util.py (helper used by G2) and .env to configure it")
+            files.append("src/shared/util.py")
+        for rel in files:
+            (ctx.sandbox / rel).parent.mkdir(parents=True, exist_ok=True)
+            (ctx.sandbox / rel).write_text(f"# {task.id}\n")
+        changed = await git.changed_files(await git.head())
+        sha = await git.commit_task(task.id, task.title, ctx.run_id)
+        return Done(files_changed=changed, tests_added=[], commit_sha=sha)
+
+
+async def test_blocked_task_asks_for_scope_and_continues_once_approved(tmp_path: Path) -> None:
+    from orchestrator.engine.outcomes import NeedsApproval
+
+    ex = BlocksThenNeedsScope()
+    ctx = RunContext(
+        run_id="r1",
+        scenario="t",
+        policy=POLICY,
+        sandbox=tmp_path / "sb",
+        trace=InMemorySink(),
+        target_stack="python",
+    )
+    concrete = [  # like a real plan: exact files per task, so a helper elsewhere is genuinely out of scope
+        {"id": f"G{i}", "title": f"task {i}", "parallel_group": "g", "definition_of_done": ["done"],
+         "allowed_files": [f"src/g{i}.py", f"tests/test_g{i}.py"]}
+        for i in (1, 2, 3)
+    ]  # fmt: skip
+    ctx.put("plan", Plan.model_validate({"run_id": "r1", "spec_version": 1, "tasks": concrete}), "planning")
+    ctx.put("design", Design.model_validate(CANNED["Design"]), "architecture")
+    graph = Graph.load(REPO / "workflow.yaml")
+    handler = build_handlers(FakeClient(), ex, graph)["executor"]
+    node = graph.nodes["implementation"]
+
+    out = await handler(node, ctx)
+    assert isinstance(out, NeedsApproval) and out.action == "task.scope_change", out
+    assert out.summary["task"] == "G2" and out.summary["files"] == [
+        "src/shared/util.py"
+    ]  # .env is forbidden: never offered
+    assert set(ctx.get("changeset").commits) == {"G1"}
+    requested = [
+        e for e in ctx.trace.events("r1") if e.kind == Kind.POLICY_DECISION and e.status == "SCOPE_REQUESTED"
+    ]
+    assert requested and requested[0].payload["files"] == ["src/shared/util.py"]
+
+    ctx.approvals.add(node.id)  # what Runner.approve does
+    out = await handler(node, ctx)
+    assert isinstance(out, Success), out
+    assert "src/shared/util.py" in ex.seen_allowed[-2]  # G2 re-ran with the widened list
+    assert "scope:G2:src/shared/util.py" in ctx.approvals and node.id not in ctx.approvals
+    statuses = [e.status for e in ctx.trace.events("r1") if e.kind == Kind.POLICY_DECISION]
+    assert "SCOPE_APPROVED" in statuses and statuses.count("OK") == 3 and "VIOLATION" not in statuses
+    assert (ctx.sandbox / "src" / "shared" / "util.py").exists()
+    assert (
+        ctx.feedback[node.id]["scope_change"]["task"] == "G2" and "scope_request" not in ctx.feedback[node.id]
+    )

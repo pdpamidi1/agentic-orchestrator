@@ -9,6 +9,7 @@ Node-kind handlers: how each kind of node in workflow.yaml is executed.
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from .context import RunContext
 from .gates import run_gates
 from .graph import Graph, NodeDef
 from .outcomes import Blocked, NeedsApproval, Outcome, Retry, Route, Success
-from .policy_engine import PolicyEngine
+from .policy_engine import PolicyEngine, matches
 from .provision import provision_sandbox
 
 
@@ -62,6 +63,30 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
                 return Blocked(f"task {t.id} failed {task_attempts[t.id]} times: {reason}")
             return Retry(reason, {**extra, "task": t.id, "task_attempts": task_attempts})
 
+        # a task that reported BLOCKED naming the files it needs paused the node for a scope approval: the
+        # human approving the node grants exactly those files (scope tokens, revoked on re-plan like the rest)
+        pending = (ctx.feedback.get(node.id) or {}).get("scope_request")
+        if pending and node.id in ctx.approvals:
+            ctx.approvals.discard(node.id)
+            ctx.approvals |= {f"scope:{pending['task']}:{f}" for f in pending["files"]}
+            ctx.emit(
+                Kind.POLICY_DECISION,
+                node_id=node.id,
+                task_id=pending["task"],
+                actor="policy",
+                status="SCOPE_APPROVED",
+                payload={"action": "task.scope_change", "files": pending["files"]},
+            )
+            fb = dict(ctx.feedback.get(node.id) or {})
+            fb.pop("scope_request")
+            fb["scope_change"] = pending  # the agent learns why its scope grew
+            ctx.feedback[node.id] = fb
+            feedback = fb
+
+        def widened(t: TaskSpec) -> TaskSpec:
+            extra = sorted(a.split(":", 2)[2] for a in ctx.approvals if a.startswith(f"scope:{t.id}:"))
+            return t.model_copy(update={"allowed_files": [*t.allowed_files, *extra]}) if extra else t
+
         remaining = {t.id: t for t in plan.tasks if t.id not in cs.commits}
         while remaining:
             ready = [t for t in remaining.values() if all(d in cs.commits for d in t.depends_on)]
@@ -95,7 +120,8 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
             # judged before the next task starts (a concurrent task's half-written files would otherwise land
             # in this task's commit and scope check). True parallelism needs per-task worktrees: a stretch
             # item.
-            for t in batch:
+            for original in batch:
+                t = widened(original)
                 r = await executor.execute(ctx, t, design, feedback)
                 if isinstance(r, Done):
                     # an approved HIGH task may touch the protected paths it declared; map the human's
@@ -107,6 +133,12 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
                             for pv in (pe.classify(f) for f in r.files_changed)
                             if pv.classification == "protected" and pv.required_action
                         }
+                    granted = set(t.allowed_files) - set(original.allowed_files)  # scope-approved files
+                    approved |= {
+                        pv.required_action
+                        for pv in (pe.classify(f) for f in r.files_changed if f in granted)
+                        if pv.classification == "protected" and pv.required_action
+                    }
                     verdict = pe.check_scope(r.files_changed, t.allowed_files, approved)
                     ctx.approvals |= approved  # the run-level gates see the same approvals
                     # write boundary: secrets, banned patterns and PII in what this task wrote
@@ -146,6 +178,30 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
                     cs.notes[t.id] = r.notes
                     remaining.pop(t.id)
                 elif isinstance(r, BlockedTask):
+                    wanted = [
+                        f
+                        for f in _requested_files(r.reason)
+                        if not matches(f, t.allowed_files)
+                        and pe.classify(f).classification in ("allowed", "protected")
+                    ]
+                    if wanted:  # agents propose scope, humans approve it: pause instead of a pointless retry
+                        ctx.put("changeset", cs, node.id)
+                        ctx.feedback.setdefault(node.id, {})["scope_request"] = {
+                            "task": t.id,
+                            "files": wanted,
+                            "reason": r.reason,
+                        }
+                        ctx.emit(
+                            Kind.POLICY_DECISION,
+                            node_id=node.id,
+                            task_id=t.id,
+                            actor="policy",
+                            status="SCOPE_REQUESTED",
+                            payload={"action": "task.scope_change", "files": wanted},
+                        )
+                        return NeedsApproval(
+                            "task.scope_change", {"task": t.id, "files": wanted, "reason": r.reason[:500]}
+                        )
                     return task_failed(t, f"task {t.id} blocked: {r.reason}", {"reason": r.reason})
                 elif isinstance(r, Errored):
                     if not r.transient:
@@ -199,3 +255,15 @@ def _read_all(root: Path, files: list[str]) -> dict[str, str]:
         if p.is_file():
             out[f] = p.read_text(encoding="utf-8", errors="replace")
     return out
+
+
+_PATH_RE = re.compile(r"(?<![\w/])((?:[\w.-]+/)+[\w.-]+\.\w+)")
+
+
+def _requested_files(reason: str) -> list[str]:
+    """Repository paths named in a BLOCKED reason, in order, deduplicated."""
+    seen: list[str] = []
+    for m in _PATH_RE.findall(reason):
+        if m not in seen:
+            seen.append(m)
+    return seen
