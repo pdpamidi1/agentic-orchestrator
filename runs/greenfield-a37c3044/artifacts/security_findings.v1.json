@@ -1,0 +1,117 @@
+{
+  "findings": [
+    {
+      "id": "SEC-001",
+      "severity": "high",
+      "area": "input-validation / response-header-injection",
+      "description": "The Location header of the 302 is populated verbatim from the stored long_url, and long_url is validated only by the regex '^(https?)://.+' plus a 2048 length cap. That regex accepts CR, LF, NUL and other control characters (Java regex '.' excludes \\n but the pattern is unanchored at the end and the DB CHECK only bounds length), as well as embedded whitespace, userinfo (https://user:pass@host) and non-ASCII/IDN homograph hosts. A value containing %0D%0A after decoding, or a raw control character injected through a JSON \\u escape, can lead to response splitting/header smuggling in front of proxies that do not normalise headers.",
+      "requirement": "Validate long_url by parsing it with java.net.URI (strict, absolute) in addition to Bean Validation: reject any value containing characters outside the printable ASCII range 0x21-0x7E, reject scheme other than http/https (case-insensitive), require a non-empty host, and reject userinfo. Re-encode/normalise the value before it is written into the Location header, and assert in an integration test that a long_url containing %0D%0A/control characters yields 400 problem+json and never a split response."
+    },
+    {
+      "id": "SEC-002",
+      "severity": "high",
+      "area": "short-code collision / mapping integrity",
+      "description": "RedisBatchCounterSource (key shortener:counter, seeded via counter.seed-offset=238328) and DbSequenceCounterSource (url_code_seq START WITH 238328) are two independent counters over the SAME value space. After any Redis fallback episode - or after a Redis flush, which the design explicitly allows ('Redis holds only derived state ... can be flushed at any time') - both sources will emit overlapping values and therefore identical base62 codes. If UrlWriteService persists via JpaRepository.save() on a detached entity with an assigned @Id, Hibernate performs a merge/UPDATE and silently overwrites the existing mapping, letting a later caller take over an already-published short link (link hijacking); at best it surfaces as a spurious 409 to an innocent caller.",
+      "requirement": "Guarantee disjoint code spaces or insert-only semantics: (a) persist new mappings with an explicit INSERT (e.g. @Query native insert, or Persistable#isNew / entityManager.persist) so a duplicate code can only raise DataIntegrityViolationException, never an UPDATE; (b) on PK violation for a GENERATED code, re-allocate and retry with a bounded retry count rather than mapping to 409; (c) make the two counter spaces non-overlapping (e.g. distinct high-order offset or stride) and initialise the Redis counter from max(url_code_seq, existing counter) rather than from zero after a flush. Cover with an integration test that flushes Redis mid-run and asserts no existing mapping is ever mutated."
+    },
+    {
+      "id": "SEC-003",
+      "severity": "high",
+      "area": "abuse / rate limiting / unauthenticated write",
+      "description": "POST /api/v1/urls is unauthenticated by design (auth is a declared non-goal) and has no rate limit, quota or request-size control in the design. An anonymous client can mint unlimited redirects, exhausting the counter space and Postgres storage, and can use the service's domain reputation to launder phishing/malware destinations. There is also no denylist for destinations pointing at internal/link-local addresses (127.0.0.1, 169.254.169.254, RFC1918, .internal) - even though the service never fetches the URL itself, downstream crawlers, preview bots and users are redirected there.",
+      "requirement": "Implement a per-client-IP (and per-instance global) rate limit on POST /api/v1/urls returning 429 with application/problem+json from GlobalExceptionHandler, with the limit exposed as a configuration property. Enforce Spring's server.max-http-request-header-size and a Jackson/servlet body size limit so oversized bodies are rejected before parsing. NOTE - AMBIGUITY: the spec does not state whether destination-host denylisting (loopback/private/link-local/metadata addresses) is in scope; raise this as an ambiguity and do not silently invent a policy. The exact rate-limit values and whether the limiter is in-process or Redis-backed are likewise unspecified and must be raised, not assumed."
+    },
+    {
+      "id": "SEC-004",
+      "severity": "medium",
+      "area": "routing / reserved-path shadowing",
+      "description": "GET /{short_code} is mapped at the bare root and custom_alias accepts any [0-9a-zA-Z]{3,32} value. Aliases such as 'actuator', 'api', 'health', 'metrics', 'swagger', 'v3', 'favicon' collide conceptually with framework and ops paths; while Spring's most-specific-match usually wins for literally registered paths, a registered alias can shadow paths added later (a new /v1 surface, a springdoc path, an actuator base path change) and can be used to impersonate operational endpoints in links.",
+      "requirement": "Maintain a configurable reserved-alias denylist (at minimum: api, v1, v2, v3, actuator, health, metrics, info, swagger-ui, openapi, docs, static, assets, favicon.ico, robots.txt) checked in UrlWriteService before persistence; reject with 400 (or 409, decided once and reflected in the committed openapi.yaml). Add a unit test per reserved value."
+    },
+    {
+      "id": "SEC-005",
+      "severity": "medium",
+      "area": "logging hygiene / PII",
+      "description": "long_url is fully attacker-controlled and routinely carries credentials, session tokens, password-reset tokens and personal identifiers in query strings. The design does not state what is logged on the write path, on cache degradation, or in the 500 branch of GlobalExceptionHandler. Logging the raw URL (or echoing it in a ProblemDetail 'detail' field) persists third-party secrets into log aggregation with no retention controls.",
+      "requirement": "Never log long_url at INFO or above; log only short_code, code_source, HTTP status and timing. If a URL must be logged for diagnosis, log it at DEBUG only, truncated to scheme+host and with query/fragment stripped. ProblemDetail 'detail' for 400 responses must describe the violated rule (field name + constraint) and must not echo the raw submitted URL. Verify with a test that asserts no log line and no error body contains the submitted query string."
+    },
+    {
+      "id": "SEC-006",
+      "severity": "medium",
+      "area": "error handling / information disclosure",
+      "description": "The catch-all Throwable -> 500 branch and the DataIntegrityViolationException handling can leak internals (SQL state, constraint names such as urls_short_code_format_chk, Hibernate messages, Redis host:port from connection exceptions) if exception.getMessage() is copied into ProblemDetail.detail. The 'instance' field, if built from the raw request URI, reflects unsanitised path input back to the client.",
+      "requirement": "GlobalExceptionHandler must use a fixed, non-reflective detail string per problem type for 5xx and for persistence failures (e.g. 'An unexpected error occurred'), correlate with a generated request/trace id that is logged server-side and returned as an extension member, and must never serialise exception messages, stack traces, causes, class names or SQL. The 'instance' value must be the matched route template or a sanitised/encoded URI, never raw echoed input. Assert in RedirectIT/CreateShortUrlIT that no 5xx body contains 'Exception', 'jdbc', 'redis', or a constraint name."
+    },
+    {
+      "id": "SEC-007",
+      "severity": "medium",
+      "area": "secret handling / configuration",
+      "description": "Postgres and Redis credentials and shortener.base-url are configuration inputs; the design mentions application properties, a Dockerfile and a README but no policy on where credentials come from. Committed application.yml with inline datasource passwords, or Dockerfile ARG/ENV-baked credentials, would place secrets in the image and in git history. Additionally shortener.base-url defaults to http://localhost:8080, so a production misconfiguration emits http:// short_urls, downgrading users to cleartext.",
+      "requirement": "No credential values in any committed file: application.yml/application-*.yml must reference environment placeholders only (${SPRING_DATASOURCE_PASSWORD} etc.) with no defaults; Testcontainers credentials live exclusively in test sources. The Dockerfile must not contain ARG/ENV secrets, must run as a non-root user, must use a pinned digest-referenced base image, and must not COPY the local .env/settings. Validate shortener.base-url with Bean Validation as an absolute URI and document in the README that it must be https in any non-local deployment."
+    },
+    {
+      "id": "SEC-008",
+      "severity": "medium",
+      "area": "operational surface exposure",
+      "description": "Spring Boot 4 with springdoc in the runtime artifact exposes /v3/api-docs and swagger-ui, and actuator (if pulled in transitively for health checks) exposes /actuator/* on the main port. Neither is covered by an acceptance criterion, so the default exposure would ship unreviewed on a service whose read path is intended to be internet-facing.",
+      "requirement": "Explicitly configure management.endpoints.web.exposure.include to health (and readiness/liveness groups) only, bind management to a separate port (management.server.port) not routed publicly, and disable or profile-gate springdoc UI/api-docs outside the local/dev profile while still allowing OpenApiContractIT to obtain the dump. Ensure /actuator/health does not expose DB/Redis details (management.endpoint.health.show-details=never)."
+    },
+    {
+      "id": "SEC-009",
+      "severity": "medium",
+      "area": "dependency policy / supply chain",
+      "description": "Target stack is Java 25 / Spring Boot 4 with Flyway, Spring Data JPA/Redis, springdoc and Testcontainers. No dependency versioning, provenance or vulnerability-scanning policy is stated. Unpinned or milestone/snapshot Spring Boot 4 artifacts, or a springdoc build that does not yet support Boot 4 GA, introduce both build instability and unscanned transitive CVEs.",
+      "requirement": "Pin all versions via the Spring Boot BOM plus explicit <version> for non-managed dependencies; forbid SNAPSHOT/milestone repositories in the committed pom/build file. Add a dependency vulnerability gate to the build (OWASP dependency-check or equivalent) failing on High/Critical, and generate a CycloneDX SBOM as a build artifact. Any new third-party dependency (e.g. a rate-limiting library) is a pre-announced approval item."
+    },
+    {
+      "id": "SEC-010",
+      "severity": "low",
+      "area": "enumeration / predictability",
+      "description": "Codes are base62 encodings of a monotonically increasing counter seeded at 62^3, so codes are fully sequential and trivially enumerable. Anyone can walk the space and harvest every destination URL ever created, including links the creator treated as unguessable capabilities. Cache-Control: private limits shared-cache retention but not enumeration.",
+      "requirement": "Document the enumerability explicitly in the README as an accepted property of this release (no authentication, no secrecy guarantee for short links). NOTE - AMBIGUITY: whether codes must be non-sequential (e.g. a Feistel/format-preserving permutation of the counter, which preserves uniqueness at zero collision cost) is not addressed by the spec or any AC; raise it as an ambiguity rather than deciding it in implementation. Regardless of the outcome, the redirect path must not leak whether a non-existent code was ever issued (404 body identical for all unknown codes)."
+    },
+    {
+      "id": "SEC-011",
+      "severity": "low",
+      "area": "cache integrity / key handling",
+      "description": "RedisUrlCache builds keys as shortener:url:{short_code}. If the path variable reaches the cache before format validation, a crafted code containing ':' , '*' or newline could target the counter key (shortener:counter) or poison unrelated keys; the design validates the pattern in the OpenAPI schema but does not state that the controller enforces it at runtime. Cached entries also have no invalidation path, so a mapping corrected directly in Postgres stays stale for up to 24h.",
+      "requirement": "Enforce ^[0-9a-zA-Z]{3,32}$ on the short_code path variable at the controller boundary (@Pattern on @PathVariable with validation enabled, or an explicit guard) so that non-matching input yields 404/400 problem+json before any Redis or JPA call. Keep the cache key prefix disjoint from the counter key namespace (e.g. shortener:cache:url:{code} vs shortener:counter) and document the 24h maximum staleness window in the README."
+    },
+    {
+      "id": "SEC-012",
+      "severity": "low",
+      "area": "CORS / browser surface",
+      "description": "No CORS policy is specified. A permissive default (or a later-added global @CrossOrigin) on POST /api/v1/urls would let any origin mint links using a victim's network position; the redirect endpoint is a top-level navigation and needs no CORS at all.",
+      "requirement": "Ship with CORS disabled (no global CorsConfigurationSource, no @CrossOrigin). If a browser client is required, the allowed origin list must be an explicit configuration property with no wildcard and allowCredentials=false, and must be reviewed as a separate change."
+    },
+    {
+      "id": "SEC-013",
+      "severity": "low",
+      "area": "data retention / PII in storage",
+      "description": "urls.long_url stores third-party URLs that may embed personal data or bearer tokens, and created_by is a reserved, nullable column. There is no retention or purge policy: expired rows (expires_at in the past) are kept indefinitely and merely return 410, so PII-bearing URLs persist forever.",
+      "requirement": "Confirm and document that created_by is never written in this release (assert in CreateShortUrlIT that the column is NULL). NOTE - AMBIGUITY: purge/retention of expired rows is not covered by any acceptance criterion - raise it as an ambiguity; do not add a background deletion job without an explicit requirement. The README must state that long_url is stored verbatim and that callers must not embed secrets in shortened URLs."
+    }
+  ],
+  "required_controls": [
+    "Input validation: Bean Validation on CreateUrlRequest (@NotBlank/@Size(max=2048)/@Pattern for long_url, @Pattern ^[0-9a-zA-Z]{3,32}$ for custom_alias, @Future for expiration_date) PLUS semantic java.net.URI parsing (absolute, scheme in {http,https} case-insensitive, non-empty host, no userinfo, no control/whitespace characters); @Pattern-enforced short_code path variable at the controller boundary; reserved-alias denylist; Jackson configured to reject unknown properties; servlet request body and header size limits.",
+    "Rate limiting: per-IP and global limit on POST /api/v1/urls, configurable, returning 429 as application/problem+json from GlobalExceptionHandler; limiter must fail closed-enough not to be bypassed when Redis is down (documented behaviour); redirect path protected at least by connection/concurrency limits.",
+    "Secret handling: zero credentials in committed configuration, Dockerfile, README or git history; environment/secret-manager injection only; Testcontainers credentials confined to test sources; non-root, pinned-digest container image; shortener.base-url validated as an absolute URI and https-only outside local profiles.",
+    "PII: long_url treated as potentially secret-bearing third-party data - not logged, not echoed in error bodies, not emitted in metrics labels or span attributes; created_by left NULL and asserted so by tests; README warning about embedding secrets in shortened URLs; retention question raised as an ambiguity.",
+    "Logging hygiene: structured logs keyed on short_code/status/code_source only; URLs only at DEBUG, truncated to scheme+host; cache-degradation warnings must exclude Redis host, port and credentials; no stack traces or exception messages in any HTTP response; server-side correlation id returned as a ProblemDetail extension member; log-injection prevented by never logging raw unvalidated path input.",
+    "Dependency policy: Spring Boot BOM-managed, fully pinned versions; no SNAPSHOT/milestone repositories; OWASP dependency-check (or equivalent) build gate failing on High/Critical; CycloneDX SBOM produced by the build; every new third-party dependency pre-approved.",
+    "Error-handling uniformity: all non-2xx responses (400/404/409/410/429/500) produced solely by GlobalExceptionHandler as RFC 9457 application/problem+json with fixed, non-reflective detail text and sanitised 'instance'.",
+    "Operational surface: actuator limited to health on a separate management port with show-details=never; springdoc UI/api-docs profile-gated; CORS disabled by default.",
+    "Data integrity: insert-only persistence for new mappings so a code collision can never overwrite an existing row; bounded retry on generated-code collision; disjoint Redis/DB counter spaces; Redis counter re-seeded from the DB high-water mark after a flush."
+  ],
+  "high_impact_actions_expected": [
+    "Adding a new third-party dependency for rate limiting (e.g. Bucket4j or Resilience4j) plus its Redis backend integration - dependency-policy approval required.",
+    "Adding OWASP dependency-check / CycloneDX SBOM plugins and a failing-build vulnerability gate to the build file and CI pipeline configuration.",
+    "Creating Flyway migration V1__create_urls_table.sql under the protected path src/main/resources/db/migration (forward-only; any subsequent change is a NEW Vn file, never an edit) - includes CREATE SEQUENCE url_code_seq and CHECK constraints.",
+    "Changing counter allocation semantics to guarantee disjoint Redis/DB code spaces and re-seeding the Redis counter from nextval/high-water mark - alters ADR-001/ADR-002 behaviour and AC-10/AC-11 expectations.",
+    "Introducing a 429 response and a reserved-alias rejection path, which changes the committed src/main/resources/openapi.yaml (contract change verified by OpenApiContractIT) and the documented response set for createShortUrl.",
+    "Authoring the Dockerfile with a pinned digest base image, non-root USER and no build-time secrets; plus container build/publish configuration.",
+    "Modifying management/actuator and springdoc exposure defaults and binding management to a separate port (deployment/ops-affecting configuration).",
+    "Writing security-negative integration tests that require Testcontainers control of Redis availability (stopping/flushing the Redis container mid-test) and CRLF/control-character payloads.",
+    "Escalating three ambiguities for decision before coding: (a) destination-host denylisting for private/loopback/metadata addresses, (b) rate-limit values and limiter placement, (c) retention/purge of expired rows and whether short codes must be non-sequential."
+  ]
+}

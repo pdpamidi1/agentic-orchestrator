@@ -1,0 +1,46 @@
+# Shared configuration for every deployment surface.
+# Deployment-specific settings live in application-read.yml / application-write.yml
+# (activate with SPRING_PROFILES_ACTIVE=read or SPRING_PROFILES_ACTIVE=write).
+# Only local development defaults appear here; real credentials come from the environment.
+
+spring:
+  application:
+    name: url-shortener
+  datasource:
+    url: ${SHORTENER_DB_URL:jdbc:postgresql://localhost:5432/shortener}
+    username: ${SHORTENER_DB_USERNAME:shortener}
+    password: ${SHORTENER_DB_PASSWORD:shortener}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  data:
+    redis:
+      host: ${SHORTENER_REDIS_HOST:localhost}
+      port: ${SHORTENER_REDIS_PORT:6379}
+      timeout: 2s
+
+server:
+  port: ${SERVER_PORT:8080}
+  error:
+    include-message: never
+    include-stacktrace: never
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+shortener:
+  # Public base URL used to build short links (no trailing slash).
+  base-url: ${SHORTENER_BASE_URL:http://localhost:8080}
+  # Counter values reserved from Redis per batch (INCRBY step).
+  counter-batch-size: 1000
+  # Default TTL for cached short-code lookups (AMB-9).
+  cache-ttl: 24h
+  # Offset added to the raw counter before base62 encoding (AMB-11); 62^5 => codes of >= 6 chars.
+  counter-seed-offset: 916132832

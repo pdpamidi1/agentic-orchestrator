@@ -1,0 +1,155 @@
+openapi: 3.1.0
+info:
+  title: OpenAPI definition
+  version: v0
+servers:
+- url: http://localhost:8080
+  description: Generated server url
+tags:
+- name: redirect
+  description: Short link resolution
+- name: urls
+  description: Short link creation
+paths:
+  /api/v1/urls:
+    post:
+      tags:
+      - urls
+      summary: Create a short URL
+      description: "Shortens an absolute http/https URL. Uses custom_alias as the\
+        \ short code when supplied, otherwise allocates a base62 code. Identical long_urls\
+        \ are never deduplicated."
+      operationId: createShortUrl
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUrlRequest"
+        required: true
+      responses:
+        "201":
+          description: Short URL created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateUrlResponse"
+        "400":
+          description: "Invalid long_url, custom_alias or expiration_date, or unreadable\
+            \ JSON body; nothing persisted"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+        "409":
+          description: custom_alias / short_code already taken; existing mapping unchanged
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+        "500":
+          description: Unhandled server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+  /{short_code}:
+    get:
+      tags:
+      - redirect
+      summary: Redirect to the long URL
+      description: "Resolves the short code (cache first, then database) and answers\
+        \ with a 302 redirect to the stored long_url. Expired links answer 410, unknown\
+        \ links 404."
+      operationId: redirectToLongUrl
+      parameters:
+      - name: short_code
+        in: path
+        description: Generated base62 code or custom alias
+        required: true
+        schema:
+          type: string
+        example: promo2024
+      responses:
+        "302":
+          description: Redirect to the stored long_url
+          headers:
+            Cache-Control:
+              description: Always `private`
+              style: simple
+              schema:
+                type: string
+            Location:
+              description: The stored long_url
+              style: simple
+              schema:
+                type: string
+                format: uri
+        "404":
+          description: Short code unknown in cache and database
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+        "410":
+          description: Short code expired (expires_at in the past)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+        "500":
+          description: Unhandled server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+components:
+  schemas:
+    CreateUrlRequest:
+      type: object
+      properties:
+        long_url:
+          type: string
+          maxLength: 2048
+          minLength: 0
+          pattern: ^https?://.+
+        custom_alias:
+          type: string
+          pattern: "^[0-9a-zA-Z]{3,32}$"
+        expiration_date:
+          type: string
+          format: date-time
+      required:
+      - long_url
+    CreateUrlResponse:
+      type: object
+      properties:
+        short_url:
+          type: string
+        short_code:
+          type: string
+        long_url:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        code_source:
+          type: string
+    ProblemDetail:
+      type: object
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+          format: int32
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri
+        properties:
+          type: object
+          additionalProperties: {}

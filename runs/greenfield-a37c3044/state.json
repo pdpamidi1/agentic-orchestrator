@@ -1,0 +1,36 @@
+{
+  "run_id": "greenfield-a37c3044",
+  "scenario": "greenfield",
+  "status": "COMPLETED",
+  "spec_version": 1,
+  "plan_version": 1,
+  "nodes": {
+    "requirement": "PASSED",
+    "clarify": "PASSED",
+    "planning": "PASSED",
+    "architecture": "PASSED",
+    "impact": "SKIPPED",
+    "security_review": "PASSED",
+    "risk_analysis": "PASSED",
+    "approval_design": "PASSED",
+    "implementation": "PASSED",
+    "unit_tests": "PASSED",
+    "code_review": "PASSED",
+    "integration_tests": "PASSED",
+    "validation": "PASSED",
+    "diagnose": "SKIPPED",
+    "documentation": "PASSED",
+    "release_readiness": "PASSED",
+    "approval_release": "PASSED"
+  },
+  "artifact_versions": {},
+  "pending_questions": [],
+  "halt_reason": null,
+  "budget": {
+    "tokens_used": 180771,
+    "cost_usd": 2.42898,
+    "replans": 0,
+    "started_at": "2026-09-14T12:25:23.206466Z"
+  },
+  "updated_at": "2026-09-14T12:30:28.985008Z"
+}

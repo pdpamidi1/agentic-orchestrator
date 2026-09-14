@@ -1,0 +1,16 @@
+# "write" deployment profile: the short-link creation surface.
+#
+# Instances started with SPRING_PROFILES_ACTIVE=write only register the write-side beans
+# (@Profile("write")): URL validation, short-code allocation from the Redis counter (in batches
+# of shortener.counter-batch-size, seeded by shortener.counter-seed-offset) and persistence.
+# Fewer instances are needed here than on the read side; each one owns its counter batch.
+
+spring:
+  config:
+    activate:
+      on-profile: write
+
+server:
+  tomcat:
+    threads:
+      max: 50

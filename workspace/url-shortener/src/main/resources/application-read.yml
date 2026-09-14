@@ -1,0 +1,22 @@
+# "read" deployment profile: the redirect surface.
+#
+# Instances started with SPRING_PROFILES_ACTIVE=read only register the read-side beans
+# (@Profile("read")): short-code lookup, cache read-through and 3xx redirects.
+# They never allocate short codes, so no counter batches are reserved from Redis.
+# Scale these horizontally behind the public hostname configured in shortener.base-url.
+
+spring:
+  config:
+    activate:
+      on-profile: read
+  jpa:
+    properties:
+      hibernate:
+        connection:
+          provider_disables_autocommit: true
+
+server:
+  # Redirect-heavy traffic; keep connections cheap.
+  tomcat:
+    threads:
+      max: 200

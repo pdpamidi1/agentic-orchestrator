@@ -1,0 +1,5 @@
+{"node_id": "approval_design", "action": "plan.approve", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "implementation", "action": "task.high_impact", "decision": "APPROVED", "by": "human"}
+{"node_id": "approval_release", "action": "release.merge", "decision": "APPROVED", "by": "human"}

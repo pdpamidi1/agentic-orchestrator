@@ -1,0 +1,14 @@
+{
+  "task_id": "release_readiness",
+  "attempt": 1,
+  "gates": [
+    {
+      "gate_id": "release",
+      "required": true,
+      "status": "PASSED",
+      "took_seconds": 0.0,
+      "findings": [],
+      "stdout_tail": ""
+    }
+  ]
+}

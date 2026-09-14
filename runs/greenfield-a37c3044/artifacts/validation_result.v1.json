@@ -1,0 +1,78 @@
+{
+  "task_id": "validation",
+  "attempt": 1,
+  "gates": [
+    {
+      "gate_id": "scope",
+      "required": true,
+      "status": "PASSED",
+      "took_seconds": 0.035,
+      "findings": [],
+      "stdout_tail": ""
+    },
+    {
+      "gate_id": "compile",
+      "required": true,
+      "status": "PASSED",
+      "took_seconds": 17.182,
+      "findings": [],
+      "stdout_tail": "WARNING: A restricted method in java.lang.System has been called\nWARNING: java.lang.System::load has been called by org.fusesource.jansi.internal.JansiLoader in an unnamed module (file:/home/pdpamidi3/.m2/wrapper/dists/apache-maven-3.9.9/3477a4f1/lib/jansi-2.4.1.jar)\nWARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module\nWARNING: Restricted methods will be blocked in a future release unless native access is enabled\n\nWARNING: A terminally deprecated method in sun.misc.Unsafe has been called\nWARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/home/pdpamidi3/.m2/wrapper/dists/apache-maven-3.9.9/3477a4f1/lib/guava-33.2.1-jre.jar)\nWARNING: Please consider reporting this to the maintainers of class com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper\nWARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release\n"
+    },
+    {
+      "gate_id": "style",
+      "required": false,
+      "status": "PASSED",
+      "took_seconds": 13.23,
+      "findings": [],
+      "stdout_tail": "WARNING: A restricted method in java.lang.System has been called\nWARNING: java.lang.System::load has been called by org.fusesource.jansi.internal.JansiLoader in an unnamed module (file:/home/pdpamidi3/.m2/wrapper/dists/apache-maven-3.9.9/3477a4f1/lib/jansi-2.4.1.jar)\nWARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module\nWARNING: Restricted methods will be blocked in a future release unless native access is enabled\n\nWARNING: A terminally deprecated method in sun.misc.Unsafe has been called\nWARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/home/pdpamidi3/.m2/wrapper/dists/apache-maven-3.9.9/3477a4f1/lib/guava-33.2.1-jre.jar)\nWARNING: Please consider reporting this to the maintainers of class com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper\nWARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release\n"
+    },
+    {
+      "gate_id": "security",
+      "required": true,
+      "status": "PASSED",
+      "took_seconds": 0.122,
+      "findings": [],
+      "stdout_tail": ""
+    },
+    {
+      "gate_id": "architecture",
+      "required": true,
+      "status": "PASSED",
+      "took_seconds": 11.846,
+      "findings": [],
+      "stdout_tail": "WARNING: A restricted method in java.lang.System has been called\nWARNING: java.lang.System::load has been called by org.fusesource.jansi.internal.JansiLoader in an unnamed module (file:/home/pdpamidi3/.m2/wrapper/dists/apache-maven-3.9.9/3477a4f1/lib/jansi-2.4.1.jar)\nWARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module\nWARNING: Restricted methods will be blocked in a future release unless native access is enabled\n\nWARNING: A terminally deprecated method in sun.misc.Unsafe has been called\nWARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/home/pdpamidi3/.m2/wrapper/dists/apache-maven-3.9.9/3477a4f1/lib/guava-33.2.1-jre.jar)\nWARNING: Please consider reporting this to the maintainers of class com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper\nWARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release\n"
+    },
+    {
+      "gate_id": "unit",
+      "required": true,
+      "status": "PASSED",
+      "took_seconds": 37.563,
+      "findings": [],
+      "stdout_tail": "atcherServlet -- Initializing Servlet ''\n07:27:05.244 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 0 ms\n07:27:05.288 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n07:27:05.288 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n07:27:05.288 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 0 ms\n07:27:05.332 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n07:27:05.333 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n07:27:05.333 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 0 ms\n07:27:05.383 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n07:27:05.383 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n07:27:05.383 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 0 ms\n07:27:05.423 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n07:27:05.423 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n07:27:05.423 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 0 ms\n07:27:05.459 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n07:27:05.459 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n07:27:05.460 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 1 ms\n07:27:05.492 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n07:27:05.492 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n07:27:05.493 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 1 ms\n07:27:05.536 [main] INFO org.springframework.mock.web.MockServletContext -- Initializing Spring TestDispatcherServlet ''\n07:27:05.536 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Initializing Servlet ''\n07:27:05.537 [main] INFO org.springframework.test.web.servlet.TestDispatcherServlet -- Completed initialization in 1 ms\n07:27:05.666 [main] INFO com.example.shortener.write.UrlWriteService -- Short code '100001' was taken concurrently; rejecting as conflict\n07:27:05.750 [main] INFO com.example.shortener.write.UrlWriteService -- Short code 'promo2024' was taken concurrently; rejecting as conflict\n07:27:07.448 [main] WARN com.example.shortener.codegen.ShortCodeAllocator -- Primary short-code counter (redis) unavailable: RedisConnectionFailureException; falling back to db_sequence\n07:27:07.471 [main] WARN com.example.shortener.codegen.ShortCodeAllocator -- Primary short-code counter (redis) unavailable: RedisConnectionFailureException; falling back to db_sequence\n07:27:07.491 [main] WARN com.example.shortener.codegen.ShortCodeAllocator -- Primary short-code counter (redis) unavailable: RedisConnectionFailureException; falling back to db_sequence\n07:27:07.537 [main] WARN com.example.shortener.codegen.ShortCodeAllocator -- Primary short-code counter (redis) unavailable: QueryTimeoutException; falling back to db_sequence\n07:27:07.554 [main] WARN com.example.shortener.codegen.ShortCodeAllocator -- Primary short-code counter (redis) unavailable: RedisConnectionFailureException; falling back to db_sequence\n07:27:07.567 [main] WARN com.example.shortener.codegen.ShortCodeAllocator -- Primary short-code counter (redis) unavailable: IllegalStateException; falling back to db_sequence\n"
+    },
+    {
+      "gate_id": "integration",
+      "required": true,
+      "status": "PASSED",
+      "took_seconds": 121.183,
+      "findings": [],
+      "stdout_tail": "LDialect\n\tDatabase version: 17.11\n\tDefault catalog/schema: test/public\n\tAutocommit mode: undefined/unknown\n\tIsolation level: READ_COMMITTED [default READ_COMMITTED]\n\tJDBC fetch size: none\n\tPool: DatasourceConnectionProviderImpl\n\tMinimum pool size: undefined/unknown\n\tMaximum pool size: undefined/unknown\n2026-09-14T07:27:46.789-05:00  INFO 534631 --- [url-shortener] [           main] o.h.e.t.j.p.i.JtaPlatformInitiator       : HHH000489: No JTA platform available (set 'hibernate.transaction.jta.platform' to enable JTA platform integration)\n2026-09-14T07:27:46.813-05:00  INFO 534631 --- [url-shortener] [           main] j.LocalContainerEntityManagerFactoryBean : Initialized JPA EntityManagerFactory for persistence unit 'default'\n2026-09-14T07:27:47.149-05:00  INFO 534631 --- [url-shortener] [           main] o.s.boot.tomcat.TomcatWebServer          : Tomcat started on port 43795 (http) with context path '/'\n2026-09-14T07:27:47.152-05:00  INFO 534631 --- [url-shortener] [           main] o.a.maven.surefire.booter.ForkedBooter   : Started ForkedBooter in 1.328 seconds (process running for 39.169)\n2026-09-14T07:27:47.153-05:00  WARN 534631 --- [url-shortener] [           main] o.s.core.events.SpringDocAppInitializer  : SpringDoc /v3/api-docs endpoint is enabled by default. To disable it in production, set the property 'springdoc.api-docs.enabled=false'\n2026-09-14T07:27:47.153-05:00  WARN 534631 --- [url-shortener] [           main] o.s.core.events.SpringDocAppInitializer  : SpringDoc /swagger-ui.html endpoint is enabled by default. To disable it in production, set the property 'springdoc.swagger-ui.enabled=false'\n2026-09-14T07:27:47.156-05:00  INFO 534631 --- [url-shortener] [o-auto-3-exec-1] o.a.c.c.C.[Tomcat-1].[localhost].[/]     : Initializing Spring DispatcherServlet 'dispatcherServlet'\n2026-09-14T07:27:47.156-05:00  INFO 534631 --- [url-shortener] [o-auto-3-exec-1] o.s.web.servlet.DispatcherServlet        : Initializing Servlet 'dispatcherServlet'\n2026-09-14T07:27:47.158-05:00  INFO 534631 --- [url-shortener] [o-auto-3-exec-1] o.s.web.servlet.DispatcherServlet        : Completed initialization in 2 ms\n2026-09-14T07:27:47.215-05:00  INFO 534631 --- [url-shortener] [           main] o.s.boot.tomcat.GracefulShutdown         : Commencing graceful shutdown. Waiting for active requests to complete\n2026-09-14T07:27:47.217-05:00  INFO 534631 --- [url-shortener] [tomcat-shutdown] o.s.boot.tomcat.GracefulShutdown         : Graceful shutdown complete\n2026-09-14T07:27:47.224-05:00  INFO 534631 --- [url-shortener] [           main] j.LocalContainerEntityManagerFactoryBean : Closing JPA EntityManagerFactory for persistence unit 'default'\n2026-09-14T07:27:47.224-05:00  INFO 534631 --- [url-shortener] [           main] com.zaxxer.hikari.HikariDataSource       : HikariPool-3 - Shutdown initiated...\n2026-09-14T07:27:47.226-05:00  INFO 534631 --- [url-shortener] [           main] com.zaxxer.hikari.HikariDataSource       : HikariPool-3 - Shutdown completed.\n2026-09-14T07:27:47.686-05:00  INFO 533974 --- [url-shortener] [on(4)-127.0.0.1] inMXBeanRegistrar$SpringApplicationAdmin : Application shutdown requested.\n2026-09-14T07:27:47.691-05:00  INFO 533974 --- [url-shortener] [on(4)-127.0.0.1] o.s.boot.tomcat.GracefulShutdown         : Commencing graceful shutdown. Waiting for active requests to complete\n2026-09-14T07:27:47.696-05:00  INFO 533974 --- [url-shortener] [tomcat-shutdown] o.s.boot.tomcat.GracefulShutdown         : Graceful shutdown complete\n2026-09-14T07:27:47.743-05:00  INFO 533974 --- [url-shortener] [on(4)-127.0.0.1] j.LocalContainerEntityManagerFactoryBean : Closing JPA EntityManagerFactory for persistence unit 'default'\n2026-09-14T07:27:47.747-05:00  INFO 533974 --- [url-shortener] [on(4)-127.0.0.1] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Shutdown initiated...\n2026-09-14T07:27:48.043-05:00  INFO 533974 --- [url-shortener] [on(4)-127.0.0.1] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Shutdown completed.\n"
+    },
+    {
+      "gate_id": "contract",
+      "required": true,
+      "status": "PASSED",
+      "took_seconds": 0.048,
+      "findings": [],
+      "stdout_tail": ""
+    },
+    {
+      "gate_id": "acceptance",
+      "required": false,
+      "status": "PASSED",
+      "took_seconds": 0.0,
+      "findings": [],
+      "stdout_tail": ""
+    }
+  ]
+}

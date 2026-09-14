@@ -1,0 +1,22 @@
+{
+  "task_id": "integration_tests",
+  "attempt": 1,
+  "gates": [
+    {
+      "gate_id": "integration",
+      "required": true,
+      "status": "PASSED",
+      "took_seconds": 121.183,
+      "findings": [],
+      "stdout_tail": "LDialect\n\tDatabase version: 17.11\n\tDefault catalog/schema: test/public\n\tAutocommit mode: undefined/unknown\n\tIsolation level: READ_COMMITTED [default READ_COMMITTED]\n\tJDBC fetch size: none\n\tPool: DatasourceConnectionProviderImpl\n\tMinimum pool size: undefined/unknown\n\tMaximum pool size: undefined/unknown\n2026-09-14T07:27:46.789-05:00  INFO 534631 --- [url-shortener] [           main] o.h.e.t.j.p.i.JtaPlatformInitiator       : HHH000489: No JTA platform available (set 'hibernate.transaction.jta.platform' to enable JTA platform integration)\n2026-09-14T07:27:46.813-05:00  INFO 534631 --- [url-shortener] [           main] j.LocalContainerEntityManagerFactoryBean : Initialized JPA EntityManagerFactory for persistence unit 'default'\n2026-09-14T07:27:47.149-05:00  INFO 534631 --- [url-shortener] [           main] o.s.boot.tomcat.TomcatWebServer          : Tomcat started on port 43795 (http) with context path '/'\n2026-09-14T07:27:47.152-05:00  INFO 534631 --- [url-shortener] [           main] o.a.maven.surefire.booter.ForkedBooter   : Started ForkedBooter in 1.328 seconds (process running for 39.169)\n2026-09-14T07:27:47.153-05:00  WARN 534631 --- [url-shortener] [           main] o.s.core.events.SpringDocAppInitializer  : SpringDoc /v3/api-docs endpoint is enabled by default. To disable it in production, set the property 'springdoc.api-docs.enabled=false'\n2026-09-14T07:27:47.153-05:00  WARN 534631 --- [url-shortener] [           main] o.s.core.events.SpringDocAppInitializer  : SpringDoc /swagger-ui.html endpoint is enabled by default. To disable it in production, set the property 'springdoc.swagger-ui.enabled=false'\n2026-09-14T07:27:47.156-05:00  INFO 534631 --- [url-shortener] [o-auto-3-exec-1] o.a.c.c.C.[Tomcat-1].[localhost].[/]     : Initializing Spring DispatcherServlet 'dispatcherServlet'\n2026-09-14T07:27:47.156-05:00  INFO 534631 --- [url-shortener] [o-auto-3-exec-1] o.s.web.servlet.DispatcherServlet        : Initializing Servlet 'dispatcherServlet'\n2026-09-14T07:27:47.158-05:00  INFO 534631 --- [url-shortener] [o-auto-3-exec-1] o.s.web.servlet.DispatcherServlet        : Completed initialization in 2 ms\n2026-09-14T07:27:47.215-05:00  INFO 534631 --- [url-shortener] [           main] o.s.boot.tomcat.GracefulShutdown         : Commencing graceful shutdown. Waiting for active requests to complete\n2026-09-14T07:27:47.217-05:00  INFO 534631 --- [url-shortener] [tomcat-shutdown] o.s.boot.tomcat.GracefulShutdown         : Graceful shutdown complete\n2026-09-14T07:27:47.224-05:00  INFO 534631 --- [url-shortener] [           main] j.LocalContainerEntityManagerFactoryBean : Closing JPA EntityManagerFactory for persistence unit 'default'\n2026-09-14T07:27:47.224-05:00  INFO 534631 --- [url-shortener] [           main] com.zaxxer.hikari.HikariDataSource       : HikariPool-3 - Shutdown initiated...\n2026-09-14T07:27:47.226-05:00  INFO 534631 --- [url-shortener] [           main] com.zaxxer.hikari.HikariDataSource       : HikariPool-3 - Shutdown completed.\n2026-09-14T07:27:47.686-05:00  INFO 533974 --- [url-shortener] [on(4)-127.0.0.1] inMXBeanRegistrar$SpringApplicationAdmin : Application shutdown requested.\n2026-09-14T07:27:47.691-05:00  INFO 533974 --- [url-shortener] [on(4)-127.0.0.1] o.s.boot.tomcat.GracefulShutdown         : Commencing graceful shutdown. Waiting for active requests to complete\n2026-09-14T07:27:47.696-05:00  INFO 533974 --- [url-shortener] [tomcat-shutdown] o.s.boot.tomcat.GracefulShutdown         : Graceful shutdown complete\n2026-09-14T07:27:47.743-05:00  INFO 533974 --- [url-shortener] [on(4)-127.0.0.1] j.LocalContainerEntityManagerFactoryBean : Closing JPA EntityManagerFactory for persistence unit 'default'\n2026-09-14T07:27:47.747-05:00  INFO 533974 --- [url-shortener] [on(4)-127.0.0.1] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Shutdown initiated...\n2026-09-14T07:27:48.043-05:00  INFO 533974 --- [url-shortener] [on(4)-127.0.0.1] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Shutdown completed.\n"
+    },
+    {
+      "gate_id": "contract",
+      "required": true,
+      "status": "PASSED",
+      "took_seconds": 0.048,
+      "findings": [],
+      "stdout_tail": ""
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+{
+  "criteria": [
+    {
+      "id": "AC-1",
+      "verdict": "PASS",
+      "evidence": "Write path implemented in src/main/java/com/example/shortener/write/UrlWriteController.java + UrlWriteService.java; base URL from config/ShortenerProperties.java (default http://localhost:8080 asserted by ShortenerPropertiesTest); persistence columns per src/main/resources/db/migration/V1__create_urls_table.sql; end-to-end coverage in src/test/java/com/example/shortener/it/CreateShortUrlIT.java (201 + short_url shape + persisted row with created_by null, code_source set) and unit coverage in write/UrlWriteServiceTest.java."
+    },
+    {
+      "id": "AC-2",
+      "verdict": "PASS",
+      "evidence": "Bean Validation rules on api/dto/CreateUrlRequest.java (@NotBlank, max 2048, http/https-only pattern) covered by api/dto/CreateUrlRequestValidationTest.java (ftp scheme, >2048 chars); 400 problem+json emitted by api/error/GlobalExceptionHandler.java, asserted in api/error/GlobalExceptionHandlerTest.java and it/CreateShortUrlIT.java (no row persisted)."
+    },
+    {
+      "id": "AC-3",
+      "verdict": "PASS",
+      "evidence": "api/error/AliasAlreadyExistsException.java mapped to 409 problem+json in GlobalExceptionHandler; raised in write/UrlWriteService.java (pre-check + DataIntegrityViolation); covered by write/UrlWriteServiceTest.java (alias conflict) and it/CreateShortUrlIT.java (409 on taken alias, existing mapping unchanged)."
+    },
+    {
+      "id": "AC-4",
+      "verdict": "PASS",
+      "evidence": "No dedup logic in write/UrlWriteService.java; explicit no-dedup case in write/UrlWriteServiceTest.java and distinct-codes-for-repeated-long_url assertion in it/CreateShortUrlIT.java."
+    },
+    {
+      "id": "AC-5",
+      "verdict": "PASS",
+      "evidence": "custom_alias pattern [0-9a-zA-Z]{3,32} on api/dto/CreateUrlRequest.java; api/dto/CreateUrlRequestValidationTest.java covers bad charset and lengths 2 and 33; 400 problem+json via GlobalExceptionHandler (GlobalExceptionHandlerTest)."
+    },
+    {
+      "id": "AC-6",
+      "verdict": "PASS",
+      "evidence": "expiration_date typed as OffsetDateTime with future constraint in api/dto/CreateUrlRequest.java (past-date case in CreateUrlRequestValidationTest.java); malformed ISO-8601 handled as unreadable-body 400 problem+json in api/error/GlobalExceptionHandler.java, asserted in GlobalExceptionHandlerTest.java and it/CreateShortUrlIT.java. Caveat: malformed-ISO parsing cannot be exercised by pure Bean-Validation unit tests, so the handler/IT assertions are the only real evidence."
+    },
+    {
+      "id": "AC-7",
+      "verdict": "PASS",
+      "evidence": "read/RedirectController.java maps GET /{short_code} returning 302 + Location + Cache-Control: private; asserted in read/RedirectControllerTest.java (@WebMvcTest) and it/RedirectIT.java."
+    },
+    {
+      "id": "AC-8",
+      "verdict": "PASS",
+      "evidence": "api/error/ShortCodeNotFoundException.java -> 404 problem+json in GlobalExceptionHandler; read/UrlReadServiceTest.java (not-found case) and it/RedirectIT.java (404 for unknown code, problem+json)."
+    },
+    {
+      "id": "AC-9",
+      "verdict": "PASS",
+      "evidence": "api/error/ShortCodeExpiredException.java -> 410 problem+json; expiry helper covered by domain/UrlMappingTest.java; read/UrlReadServiceTest.java (expired case) and it/RedirectIT.java (410 for expired code)."
+    },
+    {
+      "id": "AC-10",
+      "verdict": "PASS",
+      "evidence": "codegen/RedisBatchCounterSource.java reserves ranges via a single INCRBY batchSize (default 1000 per ShortenerProperties/ShortenerPropertiesTest); codegen/RedisBatchCounterSourceTest.java asserts exactly one INCRBY per batch and strictly increasing unique values under concurrency; code_source='redis' persisted via domain/CodeSource.java and asserted in codegen/ShortCodeAllocatorTest.java and it/CreateShortUrlIT.java. Cross-instance uniqueness is argued from the shared Redis key but not exercised by a multi-instance test."
+    },
+    {
+      "id": "AC-11",
+      "verdict": "PASS",
+      "evidence": "codegen/DbSequenceCounterSource.java (nextval url_code_seq from V1__create_urls_table.sql) with fallback selection in codegen/ShortCodeAllocator.java; codegen/ShortCodeAllocatorTest.java asserts fallback path and CodeSource.DB_SEQUENCE; it/CacheAndFallbackIT.java asserts 201 + code_source db_sequence with Redis unreachable."
+    },
+    {
+      "id": "AC-12",
+      "verdict": "PASS",
+      "evidence": "read/UrlReadService.java checks read/UrlCache.java first; read/UrlReadServiceTest.java verifies the repository is never touched on a cache hit; read/RedisUrlCacheTest.java asserts TTL computation bounds (min(remaining expiry, default 24h)); it/CacheAndFallbackIT.java asserts cache-hit redirect and TTL <= remaining expiry."
+    },
+    {
+      "id": "AC-13",
+      "verdict": "PASS",
+      "evidence": "read/RedisUrlCache.java get/put failures caught and logged as degradation, bypass in read/UrlReadService.java; read/UrlReadServiceTest.java (Redis-down bypass) and it/CacheAndFallbackIT.java (302 served from Postgres with Redis stopped)."
+    },
+    {
+      "id": "AC-14",
+      "verdict": "PASS",
+      "evidence": "write/UrlWriteController.java @Profile(\"!read\") and read/RedirectController.java @Profile(\"!write\") per plan T5/T6 DoD; src/main/resources/application-read.yml and application-write.yml; it/ProfileSeparationIT.java boots read (POST -> 404), write (GET -> 404) and default (both served)."
+    },
+    {
+      "id": "AC-15",
+      "verdict": "PASS",
+      "evidence": "src/main/resources/db/migration/V1__create_urls_table.sql (+ domain/MigrationScriptTest.java asserting all required columns and url_code_seq); committed src/main/resources/openapi.yaml with parity check in it/OpenApiContractIT.java; Testcontainers base in it/AbstractIntegrationTest.java (Postgres + Redis); Dockerfile and README.md present (T8 commit d4f4bbf)."
+    },
+    {
+      "id": "AC-16",
+      "verdict": "PASS",
+      "evidence": "api/error/GlobalExceptionHandler.java (@RestControllerAdvice extending ResponseEntityExceptionHandler) maps 400/404/409/410 and unhandled 500 to ProblemDetail; api/error/GlobalExceptionHandlerTest.java asserts status, application/problem+json Content-Type and body fields per exception; reinforced by it/CreateShortUrlIT.java and it/RedirectIT.java. Not verified: the 404 returned when a controller is absent under the read/write profile (DispatcherServlet no-handler path) may not flow through the advice unless spring.mvc.throw-exception-if-no-handler-found is enabled."
+    },
+    {
+      "id": "AC-14-note",
+      "verdict": "PASS",
+      "evidence": "Duplicate of AC-14 coverage; no additional finding."
+    }
+  ],
+  "concerns": [
+    "Plan/allowed-files deviation: commit T7 (b3f5cf8) re-touches src/main/java/com/example/shortener/codegen/RedisBatchCounterSource.java, codegen/ShortCodeAllocator.java and read/RedisUrlCache.java, which are not in T7's allowed_files (T7 is limited to openapi.yaml and the it/ test package). These late production-code edits to the counter/cache internals need an explicit justification and a check that T4/T6 unit tests were updated accordingly, otherwise the governed file-scope contract is broken.",
+    "AC-16 edge case: 404s produced because a controller is not registered under the 'read'/'write' profile are served by Spring's default no-handler path and are likely text/plain or the default error body rather than application/problem+json. Confirm ProfileSeparationIT asserts only status and that the spec's 'every error response is problem+json' intent is either met (throw-exception-if-no-handler-found + advice) or documented as an accepted exception.",
+    "AC-10 cross-instance uniqueness is asserted only by an in-process concurrency test (RedisBatchCounterSourceTest) plus reasoning about the shared Redis key; there is no test that runs two allocator instances against the same Testcontainers Redis to prove non-overlapping batches.",
+    "Ambiguities AMB-9 (24h default cache TTL), AMB-10 (gaps accepted on restart) and AMB-11 (counter seed so codes are >= 3 chars) remain open in the spec and were implemented at their defaults. They are documented in docs/operations.md/README, but they still require explicit human confirmation rather than being treated as settled.",
+    "Malformed ISO-8601 expiration_date cannot be covered by CreateUrlRequestValidationTest (it fails during Jackson deserialization, not validation). Verify the malformed case is actually asserted in GlobalExceptionHandlerTest/CreateShortUrlIT rather than only the past-date case.",
+    "Unverifiable from the changeset alone: no gate/test execution output was supplied (./mvnw test, -Pit verify, ArchitectureTest, spotless:check). All verdicts above rest on the presence of the named files/tests and the plan DoD, not on observed green runs.",
+    "Security/PII: no auth is in scope (per non-goals) and created_by is left null, which is correct; however GET /{short_code} and POST bodies contain user-supplied URLs - confirm the degradation/error logs in RedisUrlCache, ShortCodeAllocator and GlobalExceptionHandler do not log full long_url values or Redis/DB connection strings.",
+    "Scope: docs/operations.md and .github/workflows/ci.yml are beyond the spec deliverable list (Dockerfile, README, OpenAPI, tests). They are plan-sanctioned (T8) and low risk, but are additive scope relative to the spec."
+  ],
+  "recommendation": "REVISE"
+}
