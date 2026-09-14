@@ -144,7 +144,7 @@ class ReplayClient:
 class AnthropicClient:
     """Structured outputs: `messages.stream(output_format=schema)` makes the API constrain the reply to the
     schema's JSON and the SDK validate it into the Pydantic model. Model-agnostic (no forced tool use, which
-    Claude Fable 5.1 rejects) and compatible with adaptive thinking, which is on by default on Claude Opus 5.
+    current models reject) and compatible with adaptive thinking, which is on by default on Claude Opus 5.
     Model-level validators (e.g. Plan acyclicity) can still fail -> errors are fed back, up to max_repairs.
     """
 
