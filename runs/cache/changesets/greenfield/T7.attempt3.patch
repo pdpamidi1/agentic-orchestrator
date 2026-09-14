@@ -1,0 +1,1312 @@
+diff --git a/src/main/java/com/example/shortener/codegen/RedisBatchCounterSource.java b/src/main/java/com/example/shortener/codegen/RedisBatchCounterSource.java
+index de20701..6dd6a67 100644
+--- a/src/main/java/com/example/shortener/codegen/RedisBatchCounterSource.java
++++ b/src/main/java/com/example/shortener/codegen/RedisBatchCounterSource.java
+@@ -5,6 +5,7 @@ import com.example.shortener.domain.CodeSource;
+ import java.util.Objects;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.data.redis.core.StringRedisTemplate;
+ import org.springframework.stereotype.Component;
+ 
+@@ -39,6 +40,7 @@ public class RedisBatchCounterSource implements CounterSource {
+   private long rangeEnd = 0;
+ 
+   /** Creates a source using the configured {@code shortener.counter-batch-size}. */
++  @Autowired
+   public RedisBatchCounterSource(StringRedisTemplate redis, ShortenerProperties properties) {
+     this(redis, Objects.requireNonNull(properties, "properties").counterBatchSize());
+   }
+diff --git a/src/main/java/com/example/shortener/codegen/ShortCodeAllocator.java b/src/main/java/com/example/shortener/codegen/ShortCodeAllocator.java
+index bcc6d12..867a18c 100644
+--- a/src/main/java/com/example/shortener/codegen/ShortCodeAllocator.java
++++ b/src/main/java/com/example/shortener/codegen/ShortCodeAllocator.java
+@@ -4,6 +4,7 @@ import com.example.shortener.config.ShortenerProperties;
+ import java.util.Objects;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.beans.factory.annotation.Qualifier;
+ import org.springframework.stereotype.Component;
+ 
+@@ -34,6 +35,7 @@ public class ShortCodeAllocator {
+   private final long seedOffset;
+ 
+   /** Creates an allocator using the configured {@code shortener.counter-seed-offset}. */
++  @Autowired
+   public ShortCodeAllocator(
+       @Qualifier(PRIMARY_SOURCE) CounterSource primary,
+       @Qualifier(FALLBACK_SOURCE) CounterSource fallback,
+diff --git a/src/main/java/com/example/shortener/read/RedisUrlCache.java b/src/main/java/com/example/shortener/read/RedisUrlCache.java
+index 0407198..533318e 100644
+--- a/src/main/java/com/example/shortener/read/RedisUrlCache.java
++++ b/src/main/java/com/example/shortener/read/RedisUrlCache.java
+@@ -8,6 +8,7 @@ import java.util.Objects;
+ import java.util.Optional;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.data.redis.core.StringRedisTemplate;
+ import org.springframework.stereotype.Component;
+ 
+@@ -39,6 +40,7 @@ public class RedisUrlCache implements UrlCache {
+   private final Clock clock;
+ 
+   /** Creates a cache using the configured {@code shortener.cache-ttl} and the system UTC clock. */
++  @Autowired
+   public RedisUrlCache(StringRedisTemplate redis, ShortenerProperties properties) {
+     this(redis, Objects.requireNonNull(properties, "properties").cacheTtl(), Clock.systemUTC());
+   }
+diff --git a/src/main/resources/openapi.yaml b/src/main/resources/openapi.yaml
+new file mode 100644
+index 0000000..a80f27a
+--- /dev/null
++++ b/src/main/resources/openapi.yaml
+@@ -0,0 +1,155 @@
++openapi: 3.1.0
++info:
++  title: OpenAPI definition
++  version: v0
++servers:
++- url: http://localhost:8080
++  description: Generated server url
++tags:
++- name: redirect
++  description: Short link resolution
++- name: urls
++  description: Short link creation
++paths:
++  /api/v1/urls:
++    post:
++      tags:
++      - urls
++      summary: Create a short URL
++      description: "Shortens an absolute http/https URL. Uses custom_alias as the\
++        \ short code when supplied, otherwise allocates a base62 code. Identical long_urls\
++        \ are never deduplicated."
++      operationId: createShortUrl
++      requestBody:
++        content:
++          application/json:
++            schema:
++              $ref: "#/components/schemas/CreateUrlRequest"
++        required: true
++      responses:
++        "201":
++          description: Short URL created
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/CreateUrlResponse"
++        "400":
++          description: "Invalid long_url, custom_alias or expiration_date, or unreadable\
++            \ JSON body; nothing persisted"
++          content:
++            application/problem+json:
++              schema:
++                $ref: "#/components/schemas/ProblemDetail"
++        "409":
++          description: custom_alias / short_code already taken; existing mapping unchanged
++          content:
++            application/problem+json:
++              schema:
++                $ref: "#/components/schemas/ProblemDetail"
++        "500":
++          description: Unhandled server error
++          content:
++            application/problem+json:
++              schema:
++                $ref: "#/components/schemas/ProblemDetail"
++  /{short_code}:
++    get:
++      tags:
++      - redirect
++      summary: Redirect to the long URL
++      description: "Resolves the short code (cache first, then database) and answers\
++        \ with a 302 redirect to the stored long_url. Expired links answer 410, unknown\
++        \ links 404."
++      operationId: redirectToLongUrl
++      parameters:
++      - name: short_code
++        in: path
++        description: Generated base62 code or custom alias
++        required: true
++        schema:
++          type: string
++        example: promo2024
++      responses:
++        "302":
++          description: Redirect to the stored long_url
++          headers:
++            Cache-Control:
++              description: Always `private`
++              style: simple
++              schema:
++                type: string
++            Location:
++              description: The stored long_url
++              style: simple
++              schema:
++                type: string
++                format: uri
++        "404":
++          description: Short code unknown in cache and database
++          content:
++            application/problem+json:
++              schema:
++                $ref: "#/components/schemas/ProblemDetail"
++        "410":
++          description: Short code expired (expires_at in the past)
++          content:
++            application/problem+json:
++              schema:
++                $ref: "#/components/schemas/ProblemDetail"
++        "500":
++          description: Unhandled server error
++          content:
++            application/problem+json:
++              schema:
++                $ref: "#/components/schemas/ProblemDetail"
++components:
++  schemas:
++    CreateUrlRequest:
++      type: object
++      properties:
++        long_url:
++          type: string
++          maxLength: 2048
++          minLength: 0
++          pattern: ^https?://.+
++        custom_alias:
++          type: string
++          pattern: "^[0-9a-zA-Z]{3,32}$"
++        expiration_date:
++          type: string
++          format: date-time
++      required:
++      - long_url
++    CreateUrlResponse:
++      type: object
++      properties:
++        short_url:
++          type: string
++        short_code:
++          type: string
++        long_url:
++          type: string
++        expires_at:
++          type: string
++          format: date-time
++        code_source:
++          type: string
++    ProblemDetail:
++      type: object
++      properties:
++        type:
++          type: string
++          format: uri
++        title:
++          type: string
++        status:
++          type: integer
++          format: int32
++        detail:
++          type: string
++        instance:
++          type: string
++          format: uri
++        properties:
++          type: object
++          additionalProperties: {}
+diff --git a/src/test/java/com/example/shortener/it/AbstractIntegrationTest.java b/src/test/java/com/example/shortener/it/AbstractIntegrationTest.java
+new file mode 100644
+index 0000000..4d65cc3
+--- /dev/null
++++ b/src/test/java/com/example/shortener/it/AbstractIntegrationTest.java
+@@ -0,0 +1,251 @@
++package com.example.shortener.it;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.example.shortener.domain.UrlMappingRepository;
++import com.example.shortener.read.RedisUrlCache;
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicLong;
++import org.junit.jupiter.api.BeforeEach;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.core.env.Environment;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.test.context.DynamicPropertyRegistry;
++import org.springframework.test.context.DynamicPropertySource;
++import org.testcontainers.containers.GenericContainer;
++import org.testcontainers.postgresql.PostgreSQLContainer;
++import org.testcontainers.utility.DockerImageName;
++import org.yaml.snakeyaml.Yaml;
++
++/**
++ * Base class of every {@code *IT}: boots the whole application on a random port against a real
++ * PostgreSQL and a real Redis started once per JVM with Testcontainers, wires their coordinates in
++ * with {@link DynamicPropertySource} and lets Flyway migrate the schema on start-up.
++ *
++ * <p>The containers are started in a static initialiser (not with {@code @Container}) so that the
++ * Spring test context, which is cached and shared across IT classes, never outlives them. Redis
++ * counter batches are set to one so that every code allocation touches Redis and outages are
++ * observable ({@code CacheAndFallbackIT}).
++ *
++ * <p>HTTP is driven with the JDK client and redirects disabled, so a {@code 302} is observed as
++ * such. Bodies are parsed into plain maps; assertions never depend on application DTO classes.
++ *
++ * <p>These classes are only run by failsafe under {@code ./mvnw -Pit verify}; {@code ./mvnw test}
++ * stays container-free.
++ */
++@SpringBootTest(
++    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
++    properties = {
++      "shortener.base-url=" + AbstractIntegrationTest.BASE_URL,
++      "shortener.counter-batch-size=1"
++    })
++public abstract class AbstractIntegrationTest {
++
++  /** Public base URL configured for the tests; {@code short_url} must start with it. */
++  public static final String BASE_URL = "http://short.test";
++
++  /** Route of the write endpoint (operationId {@code createShortUrl}). */
++  protected static final String URLS_PATH = "/api/v1/urls";
++
++  /** Media type of every error response. */
++  protected static final String PROBLEM_JSON = "application/problem+json";
++
++  static final String POSTGRES_IMAGE = "postgres:17-alpine";
++  static final String REDIS_IMAGE = "redis:7-alpine";
++  static final int REDIS_PORT = 6379;
++
++  @SuppressWarnings("resource")
++  static final PostgreSQLContainer POSTGRES =
++      new PostgreSQLContainer(DockerImageName.parse(POSTGRES_IMAGE));
++
++  @SuppressWarnings({"rawtypes", "unchecked", "resource"})
++  static final GenericContainer REDIS =
++      new GenericContainer(DockerImageName.parse(REDIS_IMAGE)).withExposedPorts(REDIS_PORT);
++
++  static {
++    POSTGRES.start();
++    REDIS.start();
++  }
++
++  private static final HttpClient HTTP =
++      HttpClient.newBuilder()
++          .followRedirects(HttpClient.Redirect.NEVER)
++          .connectTimeout(Duration.ofSeconds(10))
++          .build();
++
++  private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(60);
++  private static final AtomicLong SEQUENCE = new AtomicLong();
++
++  @Autowired protected UrlMappingRepository repository;
++  @Autowired protected StringRedisTemplate redis;
++  @Autowired private Environment environment;
++
++  @DynamicPropertySource
++  static void containerProperties(DynamicPropertyRegistry registry) {
++    containerProperties().forEach((key, value) -> registry.add(key, () -> value));
++  }
++
++  /**
++   * Spring properties pointing at the shared containers; also used to boot additional application
++   * instances with other profiles ({@code ProfileSeparationIT}).
++   */
++  protected static Map<String, String> containerProperties() {
++    Map<String, String> properties = new LinkedHashMap<>();
++    properties.put("spring.datasource.url", POSTGRES.getJdbcUrl());
++    properties.put("spring.datasource.username", POSTGRES.getUsername());
++    properties.put("spring.datasource.password", POSTGRES.getPassword());
++    properties.put("spring.datasource.driver-class-name", "org.postgresql.Driver");
++    properties.put("spring.data.redis.host", REDIS.getHost());
++    properties.put("spring.data.redis.port", String.valueOf(REDIS.getMappedPort(REDIS_PORT)));
++    return properties;
++  }
++
++  /** Every test starts from an empty {@code urls} table and an empty URL cache. */
++  @BeforeEach
++  void resetState() {
++    repository.deleteAllInBatch();
++    clearUrlCache();
++  }
++
++  /** Removes every cached mapping but leaves the counter key untouched. */
++  protected void clearUrlCache() {
++    try {
++      Set<String> keys = redis.keys(RedisUrlCache.KEY_PREFIX + "*");
++      if (keys != null && !keys.isEmpty()) {
++        redis.delete(keys);
++      }
++    } catch (RuntimeException redisUnavailable) {
++      // Nothing cached to clear when Redis is down; the tests that need it assert on it.
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // HTTP
++  // ---------------------------------------------------------------------------------------------
++
++  /** Port of the application booted by {@code @SpringBootTest}. */
++  protected int port() {
++    return environment.getRequiredProperty("local.server.port", Integer.class);
++  }
++
++  /** Origin of the application booted by {@code @SpringBootTest}. */
++  protected String origin() {
++    return "http://localhost:" + port();
++  }
++
++  protected HttpResponse<String> get(String path) {
++    return get(origin(), path);
++  }
++
++  protected HttpResponse<String> post(String path, String jsonBody) {
++    return post(origin(), path, jsonBody);
++  }
++
++  protected static HttpResponse<String> get(String origin, String path) {
++    return send(HttpRequest.newBuilder(URI.create(origin + path)).GET());
++  }
++
++  protected static HttpResponse<String> post(String origin, String path, String jsonBody) {
++    return send(
++        HttpRequest.newBuilder(URI.create(origin + path))
++            .header("Content-Type", "application/json")
++            .header("Accept", "application/json, application/problem+json")
++            .POST(HttpRequest.BodyPublishers.ofString(jsonBody)));
++  }
++
++  private static HttpResponse<String> send(HttpRequest.Builder request) {
++    try {
++      return HTTP.send(
++          request.timeout(REQUEST_TIMEOUT).build(), HttpResponse.BodyHandlers.ofString());
++    } catch (IOException e) {
++      throw new UncheckedIOException(e);
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
++      throw new IllegalStateException("interrupted while waiting for the response", e);
++    }
++  }
++
++  protected static String contentType(HttpResponse<?> response) {
++    return response.headers().firstValue("Content-Type").orElse("");
++  }
++
++  protected static String header(HttpResponse<?> response, String name) {
++    return response.headers().firstValue(name).orElse(null);
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // JSON
++  // ---------------------------------------------------------------------------------------------
++
++  /** Parses a JSON (or YAML) document into a map. */
++  @SuppressWarnings("unchecked")
++  protected static Map<String, Object> json(String document) {
++    Object parsed = new Yaml().load(document);
++    assertThat(parsed).as("document is a JSON object: %s", document).isInstanceOf(Map.class);
++    return (Map<String, Object>) parsed;
++  }
++
++  /** Renders a {@code createShortUrl} request body; {@code null} fields are omitted. */
++  protected static String createRequest(String longUrl, String customAlias, String expirationDate) {
++    StringBuilder body = new StringBuilder("{\"long_url\":").append(quote(longUrl));
++    if (customAlias != null) {
++      body.append(",\"custom_alias\":").append(quote(customAlias));
++    }
++    if (expirationDate != null) {
++      body.append(",\"expiration_date\":").append(quote(expirationDate));
++    }
++    return body.append('}').toString();
++  }
++
++  private static String quote(String value) {
++    if (value == null) {
++      return "null";
++    }
++    return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
++  }
++
++  /** A long URL that no other test in this JVM has used. */
++  protected static String uniqueLongUrl() {
++    return "https://example.com/it/" + SEQUENCE.incrementAndGet() + "?q=1&lang=en";
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // Shared assertions
++  // ---------------------------------------------------------------------------------------------
++
++  /** Creates a short link through the API and returns its {@code short_code}. */
++  protected String createShortCode(String longUrl) {
++    HttpResponse<String> response = post(URLS_PATH, createRequest(longUrl, null, null));
++    assertThat(response.statusCode()).as("createShortUrl: %s", response.body()).isEqualTo(201);
++    return (String) json(response.body()).get("short_code");
++  }
++
++  /**
++   * Asserts that a response is an RFC 9457 problem (AC-16): the expected status, {@code
++   * application/problem+json}, the standard members, {@code instance} equal to the request path and
++   * no leaked exception class names.
++   *
++   * @return the parsed problem body
++   */
++  protected static Map<String, Object> assertProblem(
++      HttpResponse<String> response, int expectedStatus) {
++    assertThat(response.statusCode()).as("status of %s", response.body()).isEqualTo(expectedStatus);
++    assertThat(contentType(response)).startsWith(PROBLEM_JSON);
++    Map<String, Object> problem = json(response.body());
++    assertThat(problem).containsKeys("type", "title", "status", "detail", "instance");
++    assertThat(problem.get("status")).isEqualTo(expectedStatus);
++    assertThat(problem.get("instance")).isEqualTo(response.request().uri().getRawPath());
++    assertThat(response.body()).doesNotContain("Exception").doesNotContain("\tat ");
++    return problem;
++  }
++}
+diff --git a/src/test/java/com/example/shortener/it/CacheAndFallbackIT.java b/src/test/java/com/example/shortener/it/CacheAndFallbackIT.java
+new file mode 100644
+index 0000000..f098922
+--- /dev/null
++++ b/src/test/java/com/example/shortener/it/CacheAndFallbackIT.java
+@@ -0,0 +1,193 @@
++package com.example.shortener.it;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.example.shortener.domain.CodeSource;
++import com.example.shortener.domain.UrlMapping;
++import com.example.shortener.read.RedisUrlCache;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.time.Instant;
++import java.time.temporal.ChronoUnit;
++import java.util.Map;
++import java.util.concurrent.TimeUnit;
++import org.junit.jupiter.api.MethodOrderer;
++import org.junit.jupiter.api.Order;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.TestMethodOrder;
++
++/**
++ * Redis behaviour end to end: a redirect populates the cache and later redirects are served from it
++ * (AC-12), the TTL never exceeds the remaining expiry (AMB-9) and an unreachable Redis still yields
++ * {@code 201} with {@code code_source = db_sequence} on write (AC-11) and a {@code 302} served from
++ * Postgres on read (AC-13).
++ *
++ * <p>The outage is produced by pausing the Redis container: every command then hits the configured
++ * client timeout, which is exactly how a dead or partitioned Redis looks from the application. The
++ * container is unpaused again before the method returns so the shared test context and the other IT
++ * classes are unaffected; the outage test therefore runs last.
++ */
++@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
++class CacheAndFallbackIT extends AbstractIntegrationTest {
++
++  private static final Duration DEFAULT_CACHE_TTL = Duration.ofHours(24);
++
++  // --- cache hit (AC-12) -----------------------------------------------------------------------
++
++  @Test
++  @Order(1)
++  void firstRedirectPopulatesTheCacheAndLaterRedirectsAreServedFromIt() {
++    String longUrl = uniqueLongUrl();
++    String shortCode = createShortCode(longUrl);
++    String key = RedisUrlCache.keyOf(shortCode);
++    assertThat(redis.hasKey(key)).as("creation does not warm the cache").isFalse();
++
++    HttpResponse<String> first = get("/" + shortCode);
++    assertThat(first.statusCode()).isEqualTo(302);
++    assertThat(redis.opsForValue().get(key)).isEqualTo(longUrl);
++
++    // Remove the row: only the cache can answer now.
++    repository.deleteById(shortCode);
++    repository.flush();
++    assertThat(repository.findByShortCode(shortCode)).isEmpty();
++
++    HttpResponse<String> second = get("/" + shortCode);
++
++    assertThat(second.statusCode()).isEqualTo(302);
++    assertThat(header(second, "Location")).isEqualTo(longUrl);
++    assertThat(header(second, "Cache-Control")).isEqualTo("private");
++  }
++
++  // --- TTL bound (AMB-9) -----------------------------------------------------------------------
++
++  @Test
++  @Order(2)
++  void cacheTtlNeverExceedsTheRemainingExpiry() {
++    Duration remaining = Duration.ofMinutes(30);
++    Instant expiry = Instant.now().plus(remaining).truncatedTo(ChronoUnit.SECONDS);
++    HttpResponse<String> created =
++        post(URLS_PATH, createRequest(uniqueLongUrl(), null, expiry.toString()));
++    assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
++    String shortCode = (String) json(created.body()).get("short_code");
++
++    assertThat(get("/" + shortCode).statusCode()).isEqualTo(302);
++
++    Long ttlSeconds = redis.getExpire(RedisUrlCache.keyOf(shortCode), TimeUnit.SECONDS);
++    assertThat(ttlSeconds).isNotNull().isPositive().isLessThanOrEqualTo(remaining.toSeconds());
++  }
++
++  @Test
++  @Order(3)
++  void neverExpiringLinkIsCachedForTheDefaultTtl() {
++    String shortCode = createShortCode(uniqueLongUrl());
++
++    assertThat(get("/" + shortCode).statusCode()).isEqualTo(302);
++
++    Long ttlSeconds = redis.getExpire(RedisUrlCache.keyOf(shortCode), TimeUnit.SECONDS);
++    assertThat(ttlSeconds)
++        .isNotNull()
++        .isPositive()
++        .isLessThanOrEqualTo(DEFAULT_CACHE_TTL.toSeconds())
++        .isGreaterThan(DEFAULT_CACHE_TTL.minusMinutes(5).toSeconds());
++  }
++
++  @Test
++  @Order(4)
++  void expiredMappingIsNeverCached() {
++    Instant now = Instant.now();
++    repository.saveAndFlush(
++        new UrlMapping(
++            "staleIT",
++            "https://example.com/stale",
++            now.minus(2, ChronoUnit.DAYS),
++            now.minus(1, ChronoUnit.DAYS),
++            CodeSource.REDIS));
++
++    assertThat(get("/staleIT").statusCode()).isEqualTo(410);
++
++    assertThat(redis.hasKey(RedisUrlCache.keyOf("staleIT"))).isFalse();
++  }
++
++  // --- Redis outage (AC-11, AC-13) -------------------------------------------------------------
++
++  @Test
++  @Order(5)
++  void unreachableRedisFallsBackToDbSequenceOnWriteAndPostgresOnRead() {
++    String cachedBeforeOutage = uniqueLongUrl();
++    String warmCode = createShortCode(cachedBeforeOutage);
++    String coldUrl = uniqueLongUrl();
++    String coldCode = createShortCode(coldUrl);
++    assertThat(get("/" + warmCode).statusCode()).isEqualTo(302);
++    assertThat(redis.hasKey(RedisUrlCache.keyOf(warmCode))).isTrue();
++    assertThat(redis.hasKey(RedisUrlCache.keyOf(coldCode))).isFalse();
++
++    String fallbackUrl = uniqueLongUrl();
++    String fallbackCode;
++    pauseRedis();
++    try {
++      // Write: the Redis counter is unreachable, the Postgres sequence takes over (AC-11).
++      HttpResponse<String> created = post(URLS_PATH, createRequest(fallbackUrl, null, null));
++      assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
++      Map<String, Object> body = json(created.body());
++      assertThat(body.get("code_source")).isEqualTo("db_sequence");
++      fallbackCode = (String) body.get("short_code");
++      UrlMapping row = repository.findByShortCode(fallbackCode).orElseThrow();
++      assertThat(row.getCodeSource()).isEqualTo(CodeSource.DB_SEQUENCE);
++      assertThat(row.getLongUrl()).isEqualTo(fallbackUrl);
++
++      // Read: cache lookups fail, the redirect is served straight from Postgres (AC-13).
++      HttpResponse<String> cold = get("/" + coldCode);
++      assertThat(cold.statusCode()).isEqualTo(302);
++      assertThat(header(cold, "Location")).isEqualTo(coldUrl);
++      assertThat(header(cold, "Cache-Control")).isEqualTo("private");
++
++      HttpResponse<String> warm = get("/" + warmCode);
++      assertThat(warm.statusCode()).isEqualTo(302);
++      assertThat(header(warm, "Location")).isEqualTo(cachedBeforeOutage);
++
++      HttpResponse<String> unknown = get("/unknownDuringOutage");
++      assertProblem(unknown, 404);
++    } finally {
++      unpauseRedis();
++    }
++
++    // Recovery: Redis answers again, the primary counter and the cache are back in use.
++    awaitRedis();
++    HttpResponse<String> afterRecovery = get("/" + fallbackCode);
++    assertThat(afterRecovery.statusCode()).isEqualTo(302);
++    assertThat(redis.opsForValue().get(RedisUrlCache.keyOf(fallbackCode))).isEqualTo(fallbackUrl);
++    HttpResponse<String> recoveredWrite =
++        post(URLS_PATH, createRequest(uniqueLongUrl(), null, null));
++    assertThat(recoveredWrite.statusCode()).as(recoveredWrite.body()).isEqualTo(201);
++    assertThat(json(recoveredWrite.body()).get("code_source")).isEqualTo("redis");
++  }
++
++  private static void pauseRedis() {
++    REDIS.getDockerClient().pauseContainerCmd(REDIS.getContainerId()).exec();
++  }
++
++  private static void unpauseRedis() {
++    REDIS.getDockerClient().unpauseContainerCmd(REDIS.getContainerId()).exec();
++  }
++
++  /** Waits until the application's Redis connection answers again after the pause. */
++  private void awaitRedis() {
++    Instant deadline = Instant.now().plusSeconds(60);
++    while (true) {
++      try {
++        redis.opsForValue().get("shortener:it:probe");
++        return;
++      } catch (RuntimeException notYet) {
++        if (Instant.now().isAfter(deadline)) {
++          throw notYet;
++        }
++        try {
++          Thread.sleep(250);
++        } catch (InterruptedException e) {
++          Thread.currentThread().interrupt();
++          throw new IllegalStateException("interrupted while waiting for Redis", e);
++        }
++      }
++    }
++  }
++}
+diff --git a/src/test/java/com/example/shortener/it/CreateShortUrlIT.java b/src/test/java/com/example/shortener/it/CreateShortUrlIT.java
+new file mode 100644
+index 0000000..a58ba08
+--- /dev/null
++++ b/src/test/java/com/example/shortener/it/CreateShortUrlIT.java
+@@ -0,0 +1,153 @@
++package com.example.shortener.it;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.example.shortener.domain.UrlMapping;
++import java.net.http.HttpResponse;
++import java.time.Instant;
++import java.time.temporal.ChronoUnit;
++import java.util.Map;
++import java.util.regex.Pattern;
++import java.util.stream.Stream;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.Arguments;
++import org.junit.jupiter.params.provider.MethodSource;
++
++/**
++ * {@code POST /api/v1/urls} end to end against PostgreSQL and Redis: 201 + response shape +
++ * persisted row (AC-1, AC-2), 400 problem+json with nothing persisted (AC-5, AC-6, AC-16), 409 on a
++ * taken alias with the existing mapping unchanged (AC-3) and distinct codes for a repeated {@code
++ * long_url} (AC-4).
++ */
++class CreateShortUrlIT extends AbstractIntegrationTest {
++
++  private static final Pattern SHORT_CODE = Pattern.compile("^[0-9a-zA-Z]{3,32}$");
++  private static final String VALID_URL = "https://example.com/landing?campaign=it";
++
++  // --- 201 (AC-1) ------------------------------------------------------------------------------
++
++  @Test
++  void createsShortUrlAndPersistsRowWithoutCreator() {
++    Instant expiry = Instant.now().plus(1, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS);
++    String longUrl = uniqueLongUrl();
++
++    HttpResponse<String> response =
++        post(URLS_PATH, createRequest(longUrl, null, expiry.toString()));
++
++    assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
++    assertThat(contentType(response)).startsWith("application/json");
++    Map<String, Object> body = json(response.body());
++    assertThat(body)
++        .containsOnlyKeys("short_url", "short_code", "long_url", "expires_at", "code_source");
++    String shortCode = (String) body.get("short_code");
++    assertThat(shortCode).matches(SHORT_CODE);
++    assertThat(body.get("short_url")).isEqualTo(BASE_URL + "/" + shortCode);
++    assertThat(body.get("long_url")).isEqualTo(longUrl);
++    assertThat(Instant.parse((String) body.get("expires_at"))).isEqualTo(expiry);
++    assertThat(body.get("code_source")).isEqualTo("redis");
++    assertThat(header(response, "Location")).isEqualTo(BASE_URL + "/" + shortCode);
++
++    UrlMapping row = repository.findByShortCode(shortCode).orElseThrow();
++    assertThat(row.getLongUrl()).isEqualTo(longUrl);
++    assertThat(row.getExpiresAt()).isEqualTo(expiry);
++    assertThat(row.getCreatedAt()).isNotNull();
++    assertThat(row.getCreatedBy()).isNull();
++    assertThat(row.getCodeSource().wireValue()).isEqualTo(body.get("code_source"));
++  }
++
++  @Test
++  void linkWithoutExpiryHasNullExpiresAt() {
++    HttpResponse<String> response = post(URLS_PATH, createRequest(VALID_URL, null, null));
++
++    assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
++    Map<String, Object> body = json(response.body());
++    assertThat(body).containsKey("expires_at");
++    assertThat(body.get("expires_at")).isNull();
++    String shortCode = (String) body.get("short_code");
++    assertThat(repository.findByShortCode(shortCode).orElseThrow().getExpiresAt()).isNull();
++  }
++
++  // --- custom alias (AC-2) ---------------------------------------------------------------------
++
++  @Test
++  void customAliasBecomesTheShortCode() {
++    HttpResponse<String> response = post(URLS_PATH, createRequest(VALID_URL, "promoIT2026", null));
++
++    assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
++    Map<String, Object> body = json(response.body());
++    assertThat(body.get("short_code")).isEqualTo("promoIT2026");
++    assertThat(body.get("short_url")).isEqualTo(BASE_URL + "/promoIT2026");
++    UrlMapping row = repository.findByShortCode("promoIT2026").orElseThrow();
++    assertThat(row.getLongUrl()).isEqualTo(VALID_URL);
++    assertThat(row.getCreatedBy()).isNull();
++  }
++
++  // --- 400 (AC-5, AC-6, AC-16) -----------------------------------------------------------------
++
++  static Stream<Arguments> invalidRequests() {
++    return Stream.of(
++        Arguments.of("non-http scheme", createRequest("ftp://example.com/file", null, null)),
++        Arguments.of("missing scheme", createRequest("example.com/path", null, null)),
++        Arguments.of("blank long_url", createRequest("   ", null, null)),
++        Arguments.of("missing long_url", "{\"custom_alias\":\"abc123\"}"),
++        Arguments.of(
++            "long_url over 2048 characters",
++            createRequest("https://example.com/" + "a".repeat(2040), null, null)),
++        Arguments.of("custom_alias too short", createRequest(VALID_URL, "ab", null)),
++        Arguments.of("custom_alias too long", createRequest(VALID_URL, "a".repeat(33), null)),
++        Arguments.of(
++            "custom_alias with forbidden characters", createRequest(VALID_URL, "bad-alias!", null)),
++        Arguments.of(
++            "expiration_date in the past", createRequest(VALID_URL, null, "2000-01-01T00:00:00Z")),
++        Arguments.of("malformed expiration_date", createRequest(VALID_URL, null, "next-week")),
++        Arguments.of("unreadable JSON body", "{\"long_url\": "),
++        Arguments.of("JSON array instead of object", "[\"https://example.com\"]"));
++  }
++
++  @ParameterizedTest(name = "{0}")
++  @MethodSource("invalidRequests")
++  void invalidRequestIs400ProblemJsonAndPersistsNothing(String description, String body) {
++    HttpResponse<String> response = post(URLS_PATH, body);
++
++    Map<String, Object> problem = assertProblem(response, 400);
++    assertThat(problem.get("type").toString()).startsWith("https://");
++    assertThat(repository.count()).as("nothing persisted for: %s", description).isZero();
++  }
++
++  // --- 409 (AC-3) ------------------------------------------------------------------------------
++
++  @Test
++  void takenAliasIs409AndLeavesTheExistingMappingUnchanged() {
++    String original = "https://example.com/original";
++    HttpResponse<String> first = post(URLS_PATH, createRequest(original, "takenIT", null));
++    assertThat(first.statusCode()).as(first.body()).isEqualTo(201);
++    UrlMapping before = repository.findByShortCode("takenIT").orElseThrow();
++
++    HttpResponse<String> second =
++        post(URLS_PATH, createRequest("https://example.com/other", "takenIT", null));
++
++    Map<String, Object> problem = assertProblem(second, 409);
++    assertThat(problem.get("type").toString()).endsWith("alias-already-exists");
++    UrlMapping after = repository.findByShortCode("takenIT").orElseThrow();
++    assertThat(after.getLongUrl()).isEqualTo(original);
++    assertThat(after.getCreatedAt()).isEqualTo(before.getCreatedAt());
++    assertThat(after.getCodeSource()).isEqualTo(before.getCodeSource());
++    assertThat(repository.count()).isEqualTo(1);
++  }
++
++  // --- no deduplication (AC-4) -----------------------------------------------------------------
++
++  @Test
++  void repeatedLongUrlGetsDistinctShortCodes() {
++    String longUrl = uniqueLongUrl();
++
++    String firstCode = createShortCode(longUrl);
++    String secondCode = createShortCode(longUrl);
++
++    assertThat(secondCode).isNotEqualTo(firstCode);
++    assertThat(repository.findByShortCode(firstCode)).isPresent();
++    assertThat(repository.findByShortCode(secondCode)).isPresent();
++    assertThat(repository.count()).isEqualTo(2);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/it/OpenApiContractIT.java b/src/test/java/com/example/shortener/it/OpenApiContractIT.java
+new file mode 100644
+index 0000000..241efc5
+--- /dev/null
++++ b/src/test/java/com/example/shortener/it/OpenApiContractIT.java
+@@ -0,0 +1,274 @@
++package com.example.shortener.it;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.UncheckedIOException;
++import java.net.http.HttpResponse;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++import org.junit.jupiter.api.Test;
++import org.springframework.core.io.ClassPathResource;
++import org.yaml.snakeyaml.Yaml;
++
++/**
++ * Contract parity (AC-15): the committed {@code src/main/resources/openapi.yaml} must describe
++ * exactly what the running application exposes. The document generated by springdoc from the live
++ * context is compared with the committed one operation by operation, status code by status code
++ * (plus media types, response headers, parameters, request bodies and schema properties); any drift
++ * fails the build with the list of differences.
++ */
++class OpenApiContractIT extends AbstractIntegrationTest {
++
++  private static final String COMMITTED_DOCUMENT = "openapi.yaml";
++  private static final String API_DOCS_PATH = "/v3/api-docs.yaml";
++
++  @Test
++  void committedDocumentMatchesTheRunningApplication() {
++    Map<String, Object> committed = committedDocument();
++    Map<String, Object> live = liveDocument();
++
++    List<String> drift = new ArrayList<>();
++    comparePaths(map(committed.get("paths")), map(live.get("paths")), drift);
++    compareSchemas(
++        map(map(committed.get("components")).get("schemas")),
++        map(map(live.get("components")).get("schemas")),
++        drift);
++
++    assertThat(drift)
++        .as("src/main/resources/openapi.yaml drifted from the running application")
++        .isEmpty();
++  }
++
++  @Test
++  void committedDocumentDescribesExactlyTheTwoOperations() {
++    Map<String, Object> paths = map(committedDocument().get("paths"));
++
++    assertThat(paths.keySet()).containsExactlyInAnyOrder("/api/v1/urls", "/{short_code}");
++
++    Map<String, Object> create = map(map(paths.get("/api/v1/urls")).get("post"));
++    assertThat(map(paths.get("/api/v1/urls")).keySet()).containsExactly("post");
++    assertThat(create.get("operationId")).isEqualTo("createShortUrl");
++    assertThat(map(create.get("responses")).keySet())
++        .containsExactlyInAnyOrder("201", "400", "409", "500");
++    assertThat(map(map(create.get("requestBody")).get("content")).keySet())
++        .containsExactly("application/json");
++    assertThat(map(map(map(create.get("responses")).get("201")).get("content")).keySet())
++        .containsExactly("application/json");
++    for (String status : List.of("400", "409", "500")) {
++      assertThat(map(map(map(create.get("responses")).get(status)).get("content")).keySet())
++          .as("createShortUrl %s", status)
++          .containsExactly("application/problem+json");
++    }
++
++    Map<String, Object> redirect = map(map(paths.get("/{short_code}")).get("get"));
++    assertThat(map(paths.get("/{short_code}")).keySet()).containsExactly("get");
++    assertThat(redirect.get("operationId")).isEqualTo("redirectToLongUrl");
++    assertThat(map(redirect.get("responses")).keySet())
++        .containsExactlyInAnyOrder("302", "404", "410", "500");
++    Map<String, Object> found = map(map(redirect.get("responses")).get("302"));
++    assertThat(map(found.get("headers")).keySet())
++        .containsExactlyInAnyOrder("Location", "Cache-Control");
++    assertThat(found).doesNotContainKey("content");
++    for (String status : List.of("404", "410", "500")) {
++      assertThat(map(map(map(redirect.get("responses")).get(status)).get("content")).keySet())
++          .as("redirectToLongUrl %s", status)
++          .containsExactly("application/problem+json");
++    }
++
++    Map<String, Object> schemas = map(map(committedDocument().get("components")).get("schemas"));
++    assertThat(map(map(schemas.get("CreateUrlRequest")).get("properties")).keySet())
++        .containsExactlyInAnyOrder("long_url", "custom_alias", "expiration_date");
++    assertThat(map(map(schemas.get("CreateUrlResponse")).get("properties")).keySet())
++        .containsExactlyInAnyOrder(
++            "short_url", "short_code", "long_url", "expires_at", "code_source");
++    assertThat(schemas).containsKey("ProblemDetail");
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // Documents
++  // ---------------------------------------------------------------------------------------------
++
++  private static Map<String, Object> committedDocument() {
++    ClassPathResource resource = new ClassPathResource(COMMITTED_DOCUMENT);
++    assertThat(resource.exists()).as("committed %s on the classpath", COMMITTED_DOCUMENT).isTrue();
++    try (InputStream in = resource.getInputStream()) {
++      Object parsed = new Yaml().load(in);
++      assertThat(parsed).isInstanceOf(Map.class);
++      return map(parsed);
++    } catch (IOException e) {
++      throw new UncheckedIOException(e);
++    }
++  }
++
++  private Map<String, Object> liveDocument() {
++    HttpResponse<String> response = get(API_DOCS_PATH);
++    assertThat(response.statusCode()).as("GET %s", API_DOCS_PATH).isEqualTo(200);
++    return json(response.body());
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // Comparison
++  // ---------------------------------------------------------------------------------------------
++
++  private static void comparePaths(
++      Map<String, Object> committed, Map<String, Object> live, List<String> drift) {
++    for (String path : union(committed.keySet(), live.keySet())) {
++      if (!committed.containsKey(path)) {
++        drift.add("path " + path + " is exposed by the application but not documented");
++        continue;
++      }
++      if (!live.containsKey(path)) {
++        drift.add("path " + path + " is documented but not exposed by the application");
++        continue;
++      }
++      Map<String, Object> committedItem = map(committed.get(path));
++      Map<String, Object> liveItem = map(live.get(path));
++      for (String method : union(committedItem.keySet(), liveItem.keySet())) {
++        String operation = method.toUpperCase() + " " + path;
++        if (!committedItem.containsKey(method)) {
++          drift.add(operation + " is exposed by the application but not documented");
++          continue;
++        }
++        if (!liveItem.containsKey(method)) {
++          drift.add(operation + " is documented but not exposed by the application");
++          continue;
++        }
++        compareOperation(
++            operation, map(committedItem.get(method)), map(liveItem.get(method)), drift);
++      }
++    }
++  }
++
++  private static void compareOperation(
++      String operation,
++      Map<String, Object> committed,
++      Map<String, Object> live,
++      List<String> drift) {
++    compareValue(
++        operation + " operationId", committed.get("operationId"), live.get("operationId"), drift);
++    compareKeys(
++        operation + " request body media types",
++        map(map(committed.get("requestBody")).get("content")).keySet(),
++        map(map(live.get("requestBody")).get("content")).keySet(),
++        drift);
++    compareValue(
++        operation + " request body required",
++        map(committed.get("requestBody")).get("required"),
++        map(live.get("requestBody")).get("required"),
++        drift);
++    compareKeys(
++        operation + " parameters",
++        parameterNames(committed.get("parameters")),
++        parameterNames(live.get("parameters")),
++        drift);
++
++    Map<String, Object> committedResponses = map(committed.get("responses"));
++    Map<String, Object> liveResponses = map(live.get("responses"));
++    for (String status : union(committedResponses.keySet(), liveResponses.keySet())) {
++      String response = operation + " -> " + status;
++      if (!committedResponses.containsKey(status)) {
++        drift.add(response + " is exposed by the application but not documented");
++        continue;
++      }
++      if (!liveResponses.containsKey(status)) {
++        drift.add(response + " is documented but not exposed by the application");
++        continue;
++      }
++      Map<String, Object> committedResponse = map(committedResponses.get(status));
++      Map<String, Object> liveResponse = map(liveResponses.get(status));
++      compareKeys(
++          response + " media types",
++          map(committedResponse.get("content")).keySet(),
++          map(liveResponse.get("content")).keySet(),
++          drift);
++      compareKeys(
++          response + " headers",
++          map(committedResponse.get("headers")).keySet(),
++          map(liveResponse.get("headers")).keySet(),
++          drift);
++      for (String mediaType : map(liveResponse.get("content")).keySet()) {
++        compareValue(
++            response + " " + mediaType + " schema",
++            map(map(committedResponse.get("content")).get(mediaType)).get("schema"),
++            map(map(liveResponse.get("content")).get(mediaType)).get("schema"),
++            drift);
++      }
++    }
++  }
++
++  private static void compareSchemas(
++      Map<String, Object> committed, Map<String, Object> live, List<String> drift) {
++    compareKeys("component schemas", committed.keySet(), live.keySet(), drift);
++    for (String name : union(committed.keySet(), live.keySet())) {
++      if (!committed.containsKey(name) || !live.containsKey(name)) {
++        continue;
++      }
++      Map<String, Object> committedSchema = map(committed.get(name));
++      Map<String, Object> liveSchema = map(live.get(name));
++      compareKeys(
++          "schema " + name + " properties",
++          map(committedSchema.get("properties")).keySet(),
++          map(liveSchema.get("properties")).keySet(),
++          drift);
++      compareKeys(
++          "schema " + name + " required",
++          list(committedSchema.get("required")),
++          list(liveSchema.get("required")),
++          drift);
++    }
++  }
++
++  private static void compareKeys(
++      String what, Collection<String> committed, Collection<String> live, List<String> drift) {
++    Set<String> documented = new TreeSet<>(committed);
++    Set<String> exposed = new TreeSet<>(live);
++    if (!documented.equals(exposed)) {
++      drift.add(what + ": documented " + documented + " but application exposes " + exposed);
++    }
++  }
++
++  private static void compareValue(String what, Object committed, Object live, List<String> drift) {
++    if (committed == null ? live != null : !committed.equals(live)) {
++      drift.add(what + ": documented " + committed + " but application exposes " + live);
++    }
++  }
++
++  private static Set<String> parameterNames(Object parameters) {
++    Set<String> names = new LinkedHashSet<>();
++    if (parameters instanceof List<?> list) {
++      for (Object parameter : list) {
++        Map<String, Object> p = map(parameter);
++        names.add(p.get("in") + ":" + p.get("name") + ":required=" + p.get("required"));
++      }
++    }
++    return names;
++  }
++
++  private static Set<String> union(Set<String> first, Set<String> second) {
++    Set<String> union = new TreeSet<>(first);
++    union.addAll(second);
++    return union;
++  }
++
++  @SuppressWarnings("unchecked")
++  private static Map<String, Object> map(Object value) {
++    return value instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
++  }
++
++  private static List<String> list(Object value) {
++    List<String> result = new ArrayList<>();
++    if (value instanceof List<?> l) {
++      for (Object item : l) {
++        result.add(String.valueOf(item));
++      }
++    }
++    return result;
++  }
++}
+diff --git a/src/test/java/com/example/shortener/it/ProfileSeparationIT.java b/src/test/java/com/example/shortener/it/ProfileSeparationIT.java
+new file mode 100644
+index 0000000..c127603
+--- /dev/null
++++ b/src/test/java/com/example/shortener/it/ProfileSeparationIT.java
+@@ -0,0 +1,92 @@
++package com.example.shortener.it;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.example.shortener.UrlShortenerApplication;
++import java.net.http.HttpResponse;
++import java.util.ArrayList;
++import java.util.List;
++import org.junit.jupiter.api.Test;
++import org.springframework.boot.builder.SpringApplicationBuilder;
++import org.springframework.context.ConfigurableApplicationContext;
++
++/**
++ * Deployment surfaces (AC-14): an instance started with {@code spring.profiles.active=read}
++ * registers only the redirect endpoint (POST answers 404), one started with {@code write} registers
++ * only the creation endpoint (GET answers 404), and the default profile serves both.
++ *
++ * <p>The read and write instances are booted programmatically on a random port against the same
++ * containers as the shared test context, so a link created by one surface is resolvable by the
++ * other exactly as in production.
++ */
++class ProfileSeparationIT extends AbstractIntegrationTest {
++
++  @Test
++  void defaultProfileServesBothSurfaces() {
++    String longUrl = uniqueLongUrl();
++
++    HttpResponse<String> created = post(URLS_PATH, createRequest(longUrl, null, null));
++    assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
++    String shortCode = (String) json(created.body()).get("short_code");
++
++    HttpResponse<String> redirect = get("/" + shortCode);
++    assertThat(redirect.statusCode()).isEqualTo(302);
++    assertThat(header(redirect, "Location")).isEqualTo(longUrl);
++  }
++
++  @Test
++  void readProfileServesRedirectsButNotCreation() {
++    String longUrl = uniqueLongUrl();
++    String shortCode = createShortCode(longUrl);
++
++    try (ConfigurableApplicationContext readInstance = boot("read")) {
++      String origin = originOf(readInstance);
++
++      HttpResponse<String> created =
++          post(origin, URLS_PATH, createRequest(uniqueLongUrl(), null, null));
++      assertProblem(created, 404);
++
++      HttpResponse<String> redirect = get(origin, "/" + shortCode);
++      assertThat(redirect.statusCode()).isEqualTo(302);
++      assertThat(header(redirect, "Location")).isEqualTo(longUrl);
++      assertThat(header(redirect, "Cache-Control")).isEqualTo("private");
++    }
++  }
++
++  @Test
++  void writeProfileServesCreationButNotRedirects() {
++    String longUrl = uniqueLongUrl();
++    String shortCode = createShortCode(longUrl);
++
++    try (ConfigurableApplicationContext writeInstance = boot("write")) {
++      String origin = originOf(writeInstance);
++
++      HttpResponse<String> redirect = get(origin, "/" + shortCode);
++      assertProblem(redirect, 404);
++      assertThat(header(redirect, "Location")).isNull();
++
++      HttpResponse<String> created =
++          post(origin, URLS_PATH, createRequest(uniqueLongUrl(), "writeOnlyIT", null));
++      assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
++      assertThat(json(created.body()).get("short_code")).isEqualTo("writeOnlyIT");
++      assertThat(repository.findByShortCode("writeOnlyIT")).isPresent();
++    }
++  }
++
++  /** Boots a second application instance with the given profile on a random port. */
++  private static ConfigurableApplicationContext boot(String profile) {
++    List<String> args = new ArrayList<>();
++    args.add("--spring.profiles.active=" + profile);
++    args.add("--server.port=0");
++    args.add("--shortener.base-url=" + BASE_URL);
++    args.add("--shortener.counter-batch-size=1");
++    containerProperties().forEach((key, value) -> args.add("--" + key + "=" + value));
++    return new SpringApplicationBuilder(UrlShortenerApplication.class)
++        .run(args.toArray(String[]::new));
++  }
++
++  private static String originOf(ConfigurableApplicationContext context) {
++    return "http://localhost:"
++        + context.getEnvironment().getRequiredProperty("local.server.port", Integer.class);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/it/RedirectIT.java b/src/test/java/com/example/shortener/it/RedirectIT.java
+new file mode 100644
+index 0000000..45d401c
+--- /dev/null
++++ b/src/test/java/com/example/shortener/it/RedirectIT.java
+@@ -0,0 +1,92 @@
++package com.example.shortener.it;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.example.shortener.domain.CodeSource;
++import com.example.shortener.domain.UrlMapping;
++import java.net.http.HttpResponse;
++import java.time.Instant;
++import java.time.temporal.ChronoUnit;
++import java.util.Map;
++import org.junit.jupiter.api.Test;
++
++/**
++ * {@code GET /{short_code}} end to end: 302 with {@code Location} = stored {@code long_url} and
++ * {@code Cache-Control: private} (AC-7), 404 for an unknown code (AC-8), 410 for an expired code
++ * (AC-9); every error is {@code application/problem+json} (AC-16).
++ */
++class RedirectIT extends AbstractIntegrationTest {
++
++  // --- 302 (AC-7) ------------------------------------------------------------------------------
++
++  @Test
++  void knownCodeRedirectsWithLocationAndPrivateCacheControl() {
++    String longUrl = "https://example.com/some/path?x=1&y=2#frag";
++    String shortCode = createShortCode(longUrl);
++
++    HttpResponse<String> response = get("/" + shortCode);
++
++    assertThat(response.statusCode()).isEqualTo(302);
++    assertThat(header(response, "Location")).isEqualTo(longUrl);
++    assertThat(header(response, "Cache-Control")).isEqualTo("private");
++    assertThat(response.body()).isEmpty();
++  }
++
++  @Test
++  void customAliasRedirectsToItsLongUrl() {
++    HttpResponse<String> created =
++        post(URLS_PATH, createRequest("https://example.com/alias-target", "aliasIT", null));
++    assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
++
++    HttpResponse<String> response = get("/aliasIT");
++
++    assertThat(response.statusCode()).isEqualTo(302);
++    assertThat(header(response, "Location")).isEqualTo("https://example.com/alias-target");
++    assertThat(header(response, "Cache-Control")).isEqualTo("private");
++  }
++
++  @Test
++  void unexpiredCodeRedirectsUntilItsExpiry() {
++    String longUrl = uniqueLongUrl();
++    Instant expiry = Instant.now().plus(1, ChronoUnit.HOURS).truncatedTo(ChronoUnit.SECONDS);
++    HttpResponse<String> created = post(URLS_PATH, createRequest(longUrl, null, expiry.toString()));
++    assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
++    String shortCode = (String) json(created.body()).get("short_code");
++
++    HttpResponse<String> response = get("/" + shortCode);
++
++    assertThat(response.statusCode()).isEqualTo(302);
++    assertThat(header(response, "Location")).isEqualTo(longUrl);
++  }
++
++  // --- 404 (AC-8) ------------------------------------------------------------------------------
++
++  @Test
++  void unknownCodeIs404ProblemJson() {
++    HttpResponse<String> response = get("/doesNotExist");
++
++    Map<String, Object> problem = assertProblem(response, 404);
++    assertThat(problem.get("type").toString()).endsWith("short-code-not-found");
++    assertThat(header(response, "Location")).isNull();
++  }
++
++  // --- 410 (AC-9) ------------------------------------------------------------------------------
++
++  @Test
++  void expiredCodeIs410ProblemJson() {
++    Instant now = Instant.now();
++    repository.saveAndFlush(
++        new UrlMapping(
++            "expiredIT",
++            "https://example.com/expired",
++            now.minus(2, ChronoUnit.DAYS),
++            now.minus(1, ChronoUnit.DAYS),
++            CodeSource.REDIS));
++
++    HttpResponse<String> response = get("/expiredIT");
++
++    Map<String, Object> problem = assertProblem(response, 410);
++    assertThat(problem.get("type").toString()).endsWith("short-code-expired");
++    assertThat(header(response, "Location")).isNull();
++  }
++}

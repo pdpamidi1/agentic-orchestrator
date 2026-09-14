@@ -192,3 +192,27 @@ def test_executor_max_attempts_scale_with_the_plan(graph, ctx) -> None:  # type:
     per_task = ctx.policy.budgets.max_attempts_per_task
     assert Runner._max_attempts(graph.nodes["impl"], ctx) == per_task * 4
     assert Runner._max_attempts(graph.nodes["a"], ctx) == per_task
+
+
+async def test_halted_run_resumes_on_approval_with_a_fresh_task_allowance(graph, ctx, state, store):  # type: ignore[no-untyped-def]
+    from orchestrator.engine.outcomes import Blocked
+
+    hs = make_handlers(
+        {
+            "a": [Success({"spec": spec()})],
+            "b": [Success({"plan": "p"})],
+            "impl": [Blocked("task t1 failed 3 times: spend limit"), Success({"changeset": "cs"})],
+        }
+    )
+    ctx.replay = True  # auto-approve the design so we reach impl
+    r = Runner(graph, hs, store, sleep=no_sleep)
+    st = await r.run(ctx, state)
+    assert st.status == RunStatus.HALTED and st.halt_reason == "impl.blocked"
+    ctx.feedback["impl"] = {"task_attempts": {"t1": 3}, "reason": "x", "attempt": 1}
+    st = await r.approve(ctx, st, "impl", "reviewer")  # the human resumes after review
+    kinds = [e.kind for e in ctx.trace.events("r1")]
+    assert Kind.RUN_RESUMED in kinds and "task_attempts" not in ctx.feedback["impl"]
+    assert (
+        st.status in (RunStatus.COMPLETED, RunStatus.AWAITING_APPROVAL)
+        and st.nodes["impl"] == NodeStatus.PASSED
+    )

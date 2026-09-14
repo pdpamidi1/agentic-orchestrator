@@ -3,6 +3,7 @@ recorded fake run replays end to end (the offline golden run)."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +43,9 @@ async def test_recorded_patches_replay_into_an_identical_tree(tmp_path: Path, ct
     await git.ensure_repo()
     rec = RecordingExecutor(FakeExecutor(plant=None), cache)
     for t in plan.tasks[:2]:
-        assert isinstance(await rec.execute(ctx, t, design, {"attempt": 1}), Done)
+        done = await rec.execute(ctx, t, design, {"attempt": 1})
+        assert isinstance(done, Done)
+        await rec.accepted(ctx, t, done, [])  # what the handler does after an OK verdict
     assert sorted(p.name for p in (cache / ctx.scenario).glob("*")) == [
         "T1.attempt2.patch",
         "T1.patch",
@@ -165,3 +168,36 @@ async def test_relative_cache_dir_still_applies_patches(
     replayed = await ReplayExecutor(cache).execute(other, plan.tasks[0], design, None)
     assert isinstance(replayed, Done), replayed
     assert (other.sandbox / "src/shortener/t1.py").exists()
+
+
+async def test_accepted_patch_and_granted_scope_replay_together(tmp_path: Path, ctx: RunContext) -> None:
+    """The handler promotes an OK attempt to <task>.patch and stores the human-granted scope beside it; a
+    later run replays both, so the scope check passes without re-asking."""
+    plan, design = Plan.model_validate(CANNED["Plan"]), Design.model_validate(CANNED["Design"])
+    cache = tmp_path / "changesets"
+    await GitSandbox(ctx.sandbox).ensure_repo()
+    rec = RecordingExecutor(FakeExecutor(plant=None), cache)
+    task = plan.tasks[0]
+    done = await rec.execute(ctx, task, design, {"attempt": 4})  # attempt 5: only the attempt file so far
+    assert isinstance(done, Done)
+    folder = cache / ctx.scenario
+    assert (folder / "T1.attempt5.patch").exists() and not (folder / "T1.patch").exists()
+    await rec.accepted(ctx, task, done, ["src/shared/util.py"])
+    assert (folder / "T1.patch").exists() and json.loads((folder / "T1.scope.json").read_text()) == [
+        "src/shared/util.py"
+    ]
+
+    other = RunContext(
+        run_id="r2", scenario=ctx.scenario, policy=ctx.policy, sandbox=tmp_path / "sb2", trace=ctx.trace
+    )
+    await GitSandbox(other.sandbox).ensure_repo()
+    reused = await RecordingExecutor(FakeExecutor(plant=None), cache).execute(
+        other, task, design, None
+    )  # attempt 1: no exact file
+    assert (
+        isinstance(reused, Done)
+        and reused.granted_scope == ["src/shared/util.py"]
+        and "T1.patch" in reused.notes
+    )
+    replayed = await ReplayExecutor(cache).execute(other, plan.tasks[1], design, None)
+    assert not isinstance(replayed, Done)  # T2 never recorded: still a miss

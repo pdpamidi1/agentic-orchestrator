@@ -4,6 +4,7 @@ Record them from a live run with --record; then the whole demo runs without an A
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -15,13 +16,21 @@ from .base import Done, Errored, ExecResult
 
 
 def recorded_patch(cache_dir: Path, scenario: str, task_id: str, attempt: int) -> Path | None:
-    """The exact attempt's patch if recorded, else the task's latest, else None."""
+    """The exact attempt's patch if recorded, else the task's last policy-accepted patch, else None."""
     exact = cache_dir / scenario / f"{task_id}.attempt{attempt}.patch"
-    latest = cache_dir / scenario / f"{task_id}.patch"
-    return exact if exact.exists() else latest if latest.exists() else None
+    accepted = cache_dir / scenario / f"{task_id}.patch"
+    return exact if exact.exists() else accepted if accepted.exists() else None
 
 
-async def apply_recorded(ctx: RunContext, task: TaskSpec, patch: Path) -> Done | Errored:
+def recorded_scope(cache_dir: Path, scenario: str, task_id: str) -> list[str]:
+    """Files a human granted the task beyond its plan (task.scope_change) when it was recorded."""
+    sidecar = cache_dir / scenario / f"{task_id}.scope.json"
+    return list(json.loads(sidecar.read_text(encoding="utf-8"))) if sidecar.exists() else []
+
+
+async def apply_recorded(
+    ctx: RunContext, task: TaskSpec, patch: Path, granted_scope: list[str] | None = None
+) -> Done | Errored:
     """git apply + one commit per task, exactly like a live executor would leave the sandbox."""
     git = GitSandbox(ctx.sandbox)
     base = await git.head()
@@ -40,6 +49,7 @@ async def apply_recorded(ctx: RunContext, task: TaskSpec, patch: Path) -> Done |
         tests_added=[f for f in changed if "test" in f.lower()],
         commit_sha=sha,
         notes=f"replayed {patch.name}",
+        granted_scope=list(granted_scope or []),
     )
 
 
@@ -55,4 +65,4 @@ class ReplayExecutor:
         if patch is None:
             missing = self.cache_dir / ctx.scenario / f"{task.id}.patch"
             return Errored(f"no recorded patch for {task.id} ({missing})", transient=False)
-        return await apply_recorded(ctx, task, patch)
+        return await apply_recorded(ctx, task, patch, recorded_scope(self.cache_dir, ctx.scenario, task.id))

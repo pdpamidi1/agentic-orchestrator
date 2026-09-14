@@ -1,0 +1,1026 @@
+diff --git a/src/main/java/com/example/shortener/read/RedirectController.java b/src/main/java/com/example/shortener/read/RedirectController.java
+new file mode 100644
+index 0000000..2944ff0
+--- /dev/null
++++ b/src/main/java/com/example/shortener/read/RedirectController.java
+@@ -0,0 +1,116 @@
++package com.example.shortener.read;
++
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.Parameter;
++import io.swagger.v3.oas.annotations.headers.Header;
++import io.swagger.v3.oas.annotations.media.Content;
++import io.swagger.v3.oas.annotations.media.Schema;
++import io.swagger.v3.oas.annotations.responses.ApiResponse;
++import io.swagger.v3.oas.annotations.responses.ApiResponses;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import java.util.Objects;
++import org.springframework.context.annotation.Profile;
++import org.springframework.http.CacheControl;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.http.ProblemDetail;
++import org.springframework.http.ResponseEntity;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * {@code GET /{short_code}} (operationId {@code redirectToLongUrl}): the only read endpoint.
++ *
++ * <p>Registered under the default and {@code read} profiles and absent under the {@code write}
++ * profile, so a write-only instance answers 404 to this route (AC-14). A resolved code yields
++ * {@code 302 Found} with {@code Location} set to the stored {@code long_url} verbatim and {@code
++ * Cache-Control: private} (AC-7). Every non-2xx outcome (404 unknown, 410 expired, 500 unexpected)
++ * is rendered by {@code GlobalExceptionHandler} as {@code application/problem+json}; this class
++ * never builds an error body and never catches infrastructure exceptions.
++ */
++@RestController
++@Profile(RedirectController.PROFILE_EXPRESSION)
++@Tag(name = "redirect", description = "Short link resolution")
++public class RedirectController {
++
++  /** Profile expression: registered everywhere except on write-only instances. */
++  public static final String PROFILE_EXPRESSION = "!write";
++
++  /** Route of the redirect endpoint. */
++  public static final String PATH = "/{short_code}";
++
++  /** Value of the {@code Cache-Control} header on every redirect. */
++  static final CacheControl CACHE_CONTROL = CacheControl.empty().cachePrivate();
++
++  private final UrlReadService service;
++
++  public RedirectController(UrlReadService service) {
++    this.service = Objects.requireNonNull(service, "service");
++  }
++
++  /**
++   * Redirects to the long URL behind a short code.
++   *
++   * @param shortCode the short code from the path
++   * @return 302 Found with {@code Location} = long URL and {@code Cache-Control: private}
++   */
++  @Operation(
++      operationId = "redirectToLongUrl",
++      summary = "Redirect to the long URL",
++      description =
++          "Resolves the short code (cache first, then database) and answers with a 302 redirect"
++              + " to the stored long_url. Expired links answer 410, unknown links 404.")
++  @ApiResponses({
++    @ApiResponse(
++        responseCode = "302",
++        description = "Redirect to the stored long_url",
++        headers = {
++          @Header(
++              name = HttpHeaders.LOCATION,
++              description = "The stored long_url",
++              schema = @Schema(type = "string", format = "uri")),
++          @Header(
++              name = HttpHeaders.CACHE_CONTROL,
++              description = "Always `private`",
++              schema = @Schema(type = "string"))
++        }),
++    @ApiResponse(
++        responseCode = "404",
++        description = "Short code unknown in cache and database",
++        content =
++            @Content(
++                mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
++                schema = @Schema(implementation = ProblemDetail.class))),
++    @ApiResponse(
++        responseCode = "410",
++        description = "Short code expired (expires_at in the past)",
++        content =
++            @Content(
++                mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
++                schema = @Schema(implementation = ProblemDetail.class))),
++    @ApiResponse(
++        responseCode = "500",
++        description = "Unhandled server error",
++        content =
++            @Content(
++                mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
++                schema = @Schema(implementation = ProblemDetail.class)))
++  })
++  @GetMapping(path = PATH)
++  public ResponseEntity<Void> redirectToLongUrl(
++      @Parameter(
++              name = "short_code",
++              description = "Generated base62 code or custom alias",
++              example = "promo2024")
++          @PathVariable("short_code")
++          String shortCode) {
++    String longUrl = service.resolve(shortCode);
++    // The stored long_url is forwarded verbatim; no re-parsing that could alter or reject it.
++    return ResponseEntity.status(HttpStatus.FOUND)
++        .header(HttpHeaders.LOCATION, longUrl)
++        .cacheControl(CACHE_CONTROL)
++        .build();
++  }
++}
+diff --git a/src/main/java/com/example/shortener/read/RedisUrlCache.java b/src/main/java/com/example/shortener/read/RedisUrlCache.java
+new file mode 100644
+index 0000000..0407198
+--- /dev/null
++++ b/src/main/java/com/example/shortener/read/RedisUrlCache.java
+@@ -0,0 +1,129 @@
++package com.example.shortener.read;
++
++import com.example.shortener.config.ShortenerProperties;
++import java.time.Clock;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.Objects;
++import java.util.Optional;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.stereotype.Component;
++
++/**
++ * {@link UrlCache} backed by Redis: one string key {@code shortener:url:{short_code}} per mapping
++ * holding the long URL (AC-12).
++ *
++ * <p>The TTL of an entry is {@code min(expires_at - now, shortener.cache-ttl)}; entries of
++ * never-expiring mappings live for the default TTL (24h, AMB-9). Because the TTL never outlives
++ * {@code expires_at}, Redis evicts an entry no later than the mapping expires and an expired link
++ * is never served from the cache.
++ *
++ * <p>This is the boundary class that owns the Redis technology on the read side (with {@code
++ * RedisBatchCounterSource} on the write side). Every Redis failure on {@code GET} or {@code SET} is
++ * caught here, logged as a cache degradation warning and turned into a miss / no-op so the redirect
++ * is served straight from Postgres (AC-13). The warning names the failure class only: exception
++ * messages may embed connection URIs and therefore credentials, so they are logged at DEBUG only.
++ */
++@Component
++public class RedisUrlCache implements UrlCache {
++
++  /** Prefix of every cache key; the short code follows. */
++  public static final String KEY_PREFIX = "shortener:url:";
++
++  private static final Logger log = LoggerFactory.getLogger(RedisUrlCache.class);
++
++  private final StringRedisTemplate redis;
++  private final Duration defaultTtl;
++  private final Clock clock;
++
++  /** Creates a cache using the configured {@code shortener.cache-ttl} and the system UTC clock. */
++  public RedisUrlCache(StringRedisTemplate redis, ShortenerProperties properties) {
++    this(redis, Objects.requireNonNull(properties, "properties").cacheTtl(), Clock.systemUTC());
++  }
++
++  /**
++   * Creates a cache with an explicit default TTL and clock.
++   *
++   * @param redis template used for {@code GET} / {@code SET ... PX}
++   * @param defaultTtl TTL of entries whose mapping never expires and upper bound for all others;
++   *     must be positive
++   * @param clock source of "now" for the remaining-time computation
++   */
++  public RedisUrlCache(StringRedisTemplate redis, Duration defaultTtl, Clock clock) {
++    this.redis = Objects.requireNonNull(redis, "redis");
++    this.defaultTtl = Objects.requireNonNull(defaultTtl, "defaultTtl");
++    this.clock = Objects.requireNonNull(clock, "clock");
++    if (defaultTtl.isZero() || defaultTtl.isNegative()) {
++      throw new IllegalArgumentException("defaultTtl must be positive but was " + defaultTtl);
++    }
++  }
++
++  /** The configured default / maximum TTL. */
++  public Duration defaultTtl() {
++    return defaultTtl;
++  }
++
++  /** Renders the Redis key of a short code: {@code shortener:url:{short_code}}. */
++  public static String keyOf(String shortCode) {
++    return KEY_PREFIX + Objects.requireNonNull(shortCode, "shortCode");
++  }
++
++  /**
++   * TTL an entry receives for the given expiry: the remaining time to {@code expiresAt}, capped by
++   * the default TTL; the default TTL when {@code expiresAt} is {@code null}; {@link Duration#ZERO}
++   * when the mapping is already expired (such an entry must not be written).
++   *
++   * @param expiresAt expiry instant of the mapping, or {@code null} when it never expires
++   * @param now the reference instant
++   */
++  public Duration ttlFor(Instant expiresAt, Instant now) {
++    Objects.requireNonNull(now, "now");
++    if (expiresAt == null) {
++      return defaultTtl;
++    }
++    Duration remaining = Duration.between(now, expiresAt);
++    if (remaining.isZero() || remaining.isNegative()) {
++      return Duration.ZERO;
++    }
++    return remaining.compareTo(defaultTtl) < 0 ? remaining : defaultTtl;
++  }
++
++  @Override
++  public Optional<String> get(String shortCode) {
++    String key = keyOf(shortCode);
++    try {
++      return Optional.ofNullable(redis.opsForValue().get(key));
++    } catch (RuntimeException e) {
++      degraded("GET", key, e);
++      return Optional.empty();
++    }
++  }
++
++  @Override
++  public void put(String shortCode, String longUrl, Instant expiresAt) {
++    String key = keyOf(shortCode);
++    Objects.requireNonNull(longUrl, "longUrl");
++    Duration ttl = ttlFor(expiresAt, clock.instant());
++    if (ttl.isZero()) {
++      log.debug("Not caching {}: mapping already expired at {}", key, expiresAt);
++      return;
++    }
++    try {
++      redis.opsForValue().set(key, longUrl, ttl);
++    } catch (RuntimeException e) {
++      degraded("SET", key, e);
++    }
++  }
++
++  /** Logs a cache degradation without the exception message (it may carry connection details). */
++  private static void degraded(String command, String key, RuntimeException e) {
++    log.warn(
++        "Redis cache degraded: {} {} failed with {}; serving redirect from database",
++        command,
++        key,
++        e.getClass().getSimpleName());
++    log.debug("Redis cache failure detail for {} {}", command, key, e);
++  }
++}
+diff --git a/src/main/java/com/example/shortener/read/UrlCache.java b/src/main/java/com/example/shortener/read/UrlCache.java
+new file mode 100644
+index 0000000..641282d
+--- /dev/null
++++ b/src/main/java/com/example/shortener/read/UrlCache.java
+@@ -0,0 +1,37 @@
++package com.example.shortener.read;
++
++import java.time.Instant;
++import java.util.Optional;
++
++/**
++ * Read-through cache of {@code short_code -> long_url} lookups in front of the {@code urls} table
++ * (AC-12, AC-13).
++ *
++ * <p>Implementations are <em>best effort</em>: a failing backend must never surface to callers.
++ * {@link #get} answers {@link Optional#empty()} and {@link #put} silently does nothing when the
++ * cache is unavailable, so the caller falls back to the database. All other code talks to this
++ * interface; only {@link RedisUrlCache} may reference Spring Data Redis types.
++ */
++public interface UrlCache {
++
++  /**
++   * Looks up the long URL cached for a short code.
++   *
++   * @param shortCode the short code
++   * @return the cached long URL, or empty on a miss <em>or</em> when the cache is unavailable
++   */
++  Optional<String> get(String shortCode);
++
++  /**
++   * Caches the long URL of a short code until it expires.
++   *
++   * <p>The entry lives for the remaining time to {@code expiresAt}, capped by the configured
++   * default TTL; when {@code expiresAt} is {@code null} the default TTL applies (AMB-9). A mapping
++   * that is already expired is never cached.
++   *
++   * @param shortCode the short code
++   * @param longUrl the long URL to cache
++   * @param expiresAt expiry instant of the mapping, or {@code null} when it never expires
++   */
++  void put(String shortCode, String longUrl, Instant expiresAt);
++}
+diff --git a/src/main/java/com/example/shortener/read/UrlReadService.java b/src/main/java/com/example/shortener/read/UrlReadService.java
+new file mode 100644
+index 0000000..0c059cb
+--- /dev/null
++++ b/src/main/java/com/example/shortener/read/UrlReadService.java
+@@ -0,0 +1,96 @@
++package com.example.shortener.read;
++
++import com.example.shortener.api.error.ShortCodeExpiredException;
++import com.example.shortener.api.error.ShortCodeNotFoundException;
++import com.example.shortener.domain.UrlMapping;
++import com.example.shortener.domain.UrlMappingRepository;
++import java.time.Clock;
++import java.time.Instant;
++import java.util.Objects;
++import java.util.Optional;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++
++/**
++ * Read path of the shortener: resolves a short code to the long URL to redirect to (AC-7, AC-8,
++ * AC-9, AC-12, AC-13).
++ *
++ * <ol>
++ *   <li>The {@link UrlCache} is consulted first; on a hit the long URL is returned and Postgres is
++ *       not queried at all.
++ *   <li>On a miss the mapping is loaded from {@link UrlMappingRepository}. An unknown code raises
++ *       {@link ShortCodeNotFoundException} (404); a mapping whose {@code expires_at} is not after
++ *       "now" raises {@link ShortCodeExpiredException} (410) and is never cached.
++ *   <li>A live mapping is written to the cache with a TTL bounded by its {@code expires_at} (the
++ *       cache computes {@code min(remaining, default 24h)}, AMB-9) and its long URL is returned.
++ * </ol>
++ *
++ * <p>Cache unavailability is handled inside the cache implementation, which answers a miss / no-op;
++ * this service therefore serves from Postgres whenever Redis is down without catching
++ * infrastructure exceptions itself (AC-13). The single repository call runs in its own read
++ * transaction, so a cache hit borrows no database connection.
++ *
++ * <p>This class carries no web annotations; every non-2xx outcome is expressed as an exception that
++ * {@code GlobalExceptionHandler} renders as {@code application/problem+json}.
++ */
++@Service
++public class UrlReadService {
++
++  private static final Logger log = LoggerFactory.getLogger(UrlReadService.class);
++
++  private final UrlCache cache;
++  private final UrlMappingRepository repository;
++  private final Clock clock;
++
++  /** Creates the service with the system UTC clock. */
++  @Autowired
++  public UrlReadService(UrlCache cache, UrlMappingRepository repository) {
++    this(cache, repository, Clock.systemUTC());
++  }
++
++  /**
++   * Creates the service with an explicit clock.
++   *
++   * @param cache read-through cache consulted before the database
++   * @param repository the {@code urls} repository
++   * @param clock source of the "now" used to decide whether a mapping has expired
++   */
++  public UrlReadService(UrlCache cache, UrlMappingRepository repository, Clock clock) {
++    this.cache = Objects.requireNonNull(cache, "cache");
++    this.repository = Objects.requireNonNull(repository, "repository");
++    this.clock = Objects.requireNonNull(clock, "clock");
++  }
++
++  /**
++   * Resolves a short code to the long URL it redirects to.
++   *
++   * @param shortCode the short code taken from the request path
++   * @return the stored {@code long_url}
++   * @throws ShortCodeNotFoundException when the code is known to neither cache nor database (404)
++   * @throws ShortCodeExpiredException when the mapping's {@code expires_at} has passed (410)
++   */
++  public String resolve(String shortCode) {
++    Objects.requireNonNull(shortCode, "shortCode");
++    Optional<String> cached = cache.get(shortCode);
++    if (cached.isPresent()) {
++      log.debug("Cache hit for short code '{}'", shortCode);
++      return cached.get();
++    }
++
++    UrlMapping mapping =
++        repository
++            .findByShortCode(shortCode)
++            .orElseThrow(() -> new ShortCodeNotFoundException(shortCode));
++    Instant now = clock.instant();
++    if (mapping.isExpired(now)) {
++      log.debug("Short code '{}' expired at {}", shortCode, mapping.getExpiresAt());
++      throw new ShortCodeExpiredException(shortCode, mapping.getExpiresAt());
++    }
++
++    cache.put(shortCode, mapping.getLongUrl(), mapping.getExpiresAt());
++    log.debug("Cache miss for short code '{}'; loaded from database", shortCode);
++    return mapping.getLongUrl();
++  }
++}
+diff --git a/src/test/java/com/example/shortener/read/RedirectControllerTest.java b/src/test/java/com/example/shortener/read/RedirectControllerTest.java
+new file mode 100644
+index 0000000..a660488
+--- /dev/null
++++ b/src/test/java/com/example/shortener/read/RedirectControllerTest.java
+@@ -0,0 +1,190 @@
++package com.example.shortener.read;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import com.example.shortener.api.error.GlobalExceptionHandler;
++import com.example.shortener.api.error.ShortCodeExpiredException;
++import com.example.shortener.api.error.ShortCodeNotFoundException;
++import java.time.Instant;
++import java.util.List;
++import org.junit.jupiter.api.Test;
++import org.springframework.boot.test.context.runner.ApplicationContextRunner;
++import org.springframework.context.annotation.Profile;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.assertj.MockMvcTester;
++import org.springframework.test.web.servlet.assertj.MvcTestResult;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * {@link RedirectController} behind a standalone MockMvc together with the real {@link
++ * GlobalExceptionHandler} (the Boot 4 {@code @WebMvcTest} slice module is not a declared
++ * dependency): 302 + Location + Cache-Control: private (AC-7), 404 (AC-8) and 410 (AC-9)
++ * problem+json bodies, 500 (AC-16) and profile gating (AC-14).
++ */
++class RedirectControllerTest {
++
++  private static final String CODE = "promo2024";
++  private static final String LONG_URL = "https://example.com/some/path?x=1&y=2";
++
++  /** Contract values of {@link GlobalExceptionHandler} (package-private there). */
++  private static final String PROBLEM_TYPE_BASE = "https://example.com/problems/";
++
++  private static final String DETAIL_INTERNAL_ERROR =
++      "An unexpected error occurred while processing the request";
++
++  private final UrlReadService service = mock(UrlReadService.class);
++
++  private final MockMvcTester mvc =
++      MockMvcTester.of(
++          List.of(new RedirectController(service)),
++          builder -> builder.setControllerAdvice(new GlobalExceptionHandler()).build());
++
++  // --- 302 (AC-7) ------------------------------------------------------------------------------
++
++  @Test
++  void knownCodeRedirectsWith302LocationAndPrivateCacheControl() {
++    when(service.resolve(CODE)).thenReturn(LONG_URL);
++
++    MvcTestResult result = get(CODE);
++
++    assertThat(result).hasStatus(HttpStatus.FOUND);
++    assertThat(result).headers().hasValue(HttpHeaders.LOCATION, LONG_URL);
++    assertThat(result).headers().hasValue(HttpHeaders.CACHE_CONTROL, "private");
++    assertThat(result).body().isEmpty();
++    verify(service).resolve(CODE);
++  }
++
++  @Test
++  void locationIsTheStoredLongUrlVerbatim() {
++    String stored = "https://example.com/a%20b/c?q=%C3%A9&r=1#frag";
++    when(service.resolve("abc123")).thenReturn(stored);
++
++    MvcTestResult result = get("abc123");
++
++    assertThat(result).hasStatus(HttpStatus.FOUND);
++    assertThat(result).headers().hasValue(HttpHeaders.LOCATION, stored);
++  }
++
++  // --- 404 (AC-8) ------------------------------------------------------------------------------
++
++  @Test
++  void unknownCodeIs404ProblemJson() {
++    when(service.resolve("nope123")).thenThrow(new ShortCodeNotFoundException("nope123"));
++
++    MvcTestResult result = get("nope123");
++
++    assertProblem(result, HttpStatus.NOT_FOUND, "short-code-not-found", "/nope123");
++    assertThat(result).bodyJson().extractingPath("$.title").isEqualTo("Short code not found");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("nope123");
++    assertThat(result).headers().doesNotContainHeader(HttpHeaders.LOCATION);
++  }
++
++  // --- 410 (AC-9) ------------------------------------------------------------------------------
++
++  @Test
++  void expiredCodeIs410ProblemJson() {
++    Instant expiredAt = Instant.parse("2020-01-01T00:00:00Z");
++    when(service.resolve("old456")).thenThrow(new ShortCodeExpiredException("old456", expiredAt));
++
++    MvcTestResult result = get("old456");
++
++    assertProblem(result, HttpStatus.GONE, "short-code-expired", "/old456");
++    assertThat(result).bodyJson().extractingPath("$.title").isEqualTo("Short code expired");
++    assertThat(result)
++        .bodyJson()
++        .extractingPath("$.detail")
++        .asString()
++        .contains("old456", "2020-01-01T00:00:00Z");
++    assertThat(result).headers().doesNotContainHeader(HttpHeaders.LOCATION);
++  }
++
++  // --- 500 (AC-16) -----------------------------------------------------------------------------
++
++  @Test
++  void unexpectedServiceFailureIs500ProblemWithoutInternalDetails() {
++    when(service.resolve(CODE)).thenThrow(new IllegalStateException("connection pool exhausted"));
++
++    MvcTestResult result = get(CODE);
++
++    assertProblem(result, HttpStatus.INTERNAL_SERVER_ERROR, "internal-error", "/" + CODE);
++    assertThat(result).bodyJson().extractingPath("$.detail").isEqualTo(DETAIL_INTERNAL_ERROR);
++    assertThat(bodyOf(result))
++        .doesNotContain("connection pool exhausted")
++        .doesNotContain("IllegalStateException")
++        .doesNotContain("com.example");
++  }
++
++  // --- request shape -------------------------------------------------------------------------
++
++  @Test
++  void postOnTheRedirectRouteIsMethodNotAllowed() {
++    MvcTestResult result = mvc.post().uri("/" + CODE).exchange();
++
++    assertProblem(result, HttpStatus.METHOD_NOT_ALLOWED, "method-not-allowed", "/" + CODE);
++  }
++
++  // --- profile gating (AC-14) ------------------------------------------------------------------
++
++  @Test
++  void controllerIsGatedOnNotWriteProfileAndMapsGetShortCode() throws NoSuchMethodException {
++    Profile profile = RedirectController.class.getAnnotation(Profile.class);
++    assertThat(profile).isNotNull();
++    assertThat(profile.value()).containsExactly("!write");
++    assertThat(RedirectController.class.isAnnotationPresent(RestController.class)).isTrue();
++    GetMapping mapping =
++        RedirectController.class
++            .getMethod("redirectToLongUrl", String.class)
++            .getAnnotation(GetMapping.class);
++    assertThat(mapping).isNotNull();
++    assertThat(mapping.path()).containsExactly("/{short_code}");
++  }
++
++  @Test
++  void controllerIsAbsentUnderTheWriteProfileAndPresentOtherwise() {
++    ApplicationContextRunner runner =
++        new ApplicationContextRunner()
++            .withBean(UrlReadService.class, () -> mock(UrlReadService.class))
++            .withUserConfiguration(RedirectController.class);
++
++    runner
++        .withPropertyValues("spring.profiles.active=write")
++        .run(context -> assertThat(context).doesNotHaveBean(RedirectController.class));
++    runner
++        .withPropertyValues("spring.profiles.active=read")
++        .run(context -> assertThat(context).hasSingleBean(RedirectController.class));
++    runner.run(context -> assertThat(context).hasSingleBean(RedirectController.class));
++  }
++
++  // --- helpers ---------------------------------------------------------------------------------
++
++  private MvcTestResult get(String shortCode) {
++    return mvc.get().uri("/" + shortCode).exchange();
++  }
++
++  private static void assertProblem(
++      MvcTestResult result, HttpStatus status, String typeSlug, String instance) {
++    assertThat(result).hasStatus(status).hasContentType(MediaType.APPLICATION_PROBLEM_JSON);
++    assertThat(result).bodyJson().extractingPath("$.status").isEqualTo(status.value());
++    assertThat(result).bodyJson().extractingPath("$.type").isEqualTo(PROBLEM_TYPE_BASE + typeSlug);
++    assertThat(result).bodyJson().extractingPath("$.title").asString().isNotBlank();
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().isNotBlank();
++    assertThat(result).bodyJson().extractingPath("$.instance").isEqualTo(instance);
++    assertThat(result).bodyJson().doesNotHavePath("$.stackTrace");
++    assertThat(result).bodyJson().doesNotHavePath("$.trace");
++    assertThat(result).bodyJson().doesNotHavePath("$.exception");
++  }
++
++  private static String bodyOf(MvcTestResult result) {
++    try {
++      return result.getResponse().getContentAsString();
++    } catch (java.io.UnsupportedEncodingException e) {
++      throw new IllegalStateException(e);
++    }
++  }
++}
+diff --git a/src/test/java/com/example/shortener/read/RedisUrlCacheTest.java b/src/test/java/com/example/shortener/read/RedisUrlCacheTest.java
+new file mode 100644
+index 0000000..2e53f82
+--- /dev/null
++++ b/src/test/java/com/example/shortener/read/RedisUrlCacheTest.java
+@@ -0,0 +1,223 @@
++package com.example.shortener.read;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatCode;
++import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import ch.qos.logback.classic.Level;
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.core.read.ListAppender;
++import com.example.shortener.config.ShortenerProperties;
++import java.time.Clock;
++import java.time.Duration;
++import java.time.Instant;
++import java.time.ZoneOffset;
++import java.util.List;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.slf4j.LoggerFactory;
++import org.springframework.dao.QueryTimeoutException;
++import org.springframework.data.redis.RedisConnectionFailureException;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.data.redis.core.ValueOperations;
++
++/**
++ * {@link RedisUrlCache}: key layout and TTL bounds {@code min(expires_at - now, default 24h)}
++ * (AC-12, AMB-9) plus Redis-failure degradation to a miss / no-op with a credential-free warning
++ * (AC-13).
++ */
++class RedisUrlCacheTest {
++
++  private static final Instant NOW = Instant.parse("2026-09-14T12:00:00Z");
++  private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
++  private static final Duration DEFAULT_TTL = Duration.ofHours(24);
++  private static final String CODE = "promo2024";
++  private static final String KEY = "shortener:url:promo2024";
++  private static final String LONG_URL = "https://example.com/some/path";
++
++  private final StringRedisTemplate redis = mock(StringRedisTemplate.class);
++
++  @SuppressWarnings("unchecked")
++  private final ValueOperations<String, String> ops = mock(ValueOperations.class);
++
++  private final RedisUrlCache cache = new RedisUrlCache(redis, DEFAULT_TTL, CLOCK);
++
++  private final ListAppender<ILoggingEvent> logEvents = new ListAppender<>();
++  private final Logger cacheLogger = (Logger) LoggerFactory.getLogger(RedisUrlCache.class);
++
++  @BeforeEach
++  void setUp() {
++    when(redis.opsForValue()).thenReturn(ops);
++    logEvents.start();
++    cacheLogger.addAppender(logEvents);
++  }
++
++  @AfterEach
++  void tearDown() {
++    cacheLogger.detachAppender(logEvents);
++    logEvents.stop();
++  }
++
++  // --- key layout ------------------------------------------------------------------------------
++
++  @Test
++  void keyIsPrefixedShortCode() {
++    assertThat(RedisUrlCache.KEY_PREFIX).isEqualTo("shortener:url:");
++    assertThat(RedisUrlCache.keyOf(CODE)).isEqualTo(KEY);
++  }
++
++  // --- TTL bounds (AMB-9) ----------------------------------------------------------------------
++
++  @Test
++  void ttlIsDefaultWhenMappingNeverExpires() {
++    assertThat(cache.ttlFor(null, NOW)).isEqualTo(DEFAULT_TTL);
++  }
++
++  @Test
++  void ttlIsRemainingTimeWhenExpiryIsWithinTheDefault() {
++    assertThat(cache.ttlFor(NOW.plus(Duration.ofHours(3)), NOW)).isEqualTo(Duration.ofHours(3));
++    assertThat(cache.ttlFor(NOW.plusMillis(1500), NOW)).isEqualTo(Duration.ofMillis(1500));
++  }
++
++  @Test
++  void ttlIsCappedByTheDefaultWhenExpiryIsFurtherAway() {
++    assertThat(cache.ttlFor(NOW.plus(Duration.ofDays(30)), NOW)).isEqualTo(DEFAULT_TTL);
++    assertThat(cache.ttlFor(NOW.plus(DEFAULT_TTL).plusMillis(1), NOW)).isEqualTo(DEFAULT_TTL);
++  }
++
++  @Test
++  void ttlEqualsDefaultExactlyAtTheBoundary() {
++    assertThat(cache.ttlFor(NOW.plus(DEFAULT_TTL), NOW)).isEqualTo(DEFAULT_TTL);
++  }
++
++  @Test
++  void ttlIsZeroForExpiredOrExpiringNowMappings() {
++    assertThat(cache.ttlFor(NOW, NOW)).isEqualTo(Duration.ZERO);
++    assertThat(cache.ttlFor(NOW.minusSeconds(1), NOW)).isEqualTo(Duration.ZERO);
++  }
++
++  @Test
++  void defaultTtlComesFromPropertiesAndMustBePositive() {
++    ShortenerProperties properties =
++        new ShortenerProperties(
++            ShortenerProperties.DEFAULT_BASE_URL,
++            ShortenerProperties.DEFAULT_COUNTER_BATCH_SIZE,
++            Duration.ofHours(6),
++            ShortenerProperties.DEFAULT_COUNTER_SEED_OFFSET);
++
++    assertThat(new RedisUrlCache(redis, properties).defaultTtl()).isEqualTo(Duration.ofHours(6));
++    assertThatIllegalArgumentException()
++        .isThrownBy(() -> new RedisUrlCache(redis, Duration.ZERO, CLOCK));
++    assertThatIllegalArgumentException()
++        .isThrownBy(() -> new RedisUrlCache(redis, Duration.ofSeconds(-1), CLOCK));
++  }
++
++  // --- get / put -------------------------------------------------------------------------------
++
++  @Test
++  void getReturnsCachedValueOnHit() {
++    when(ops.get(KEY)).thenReturn(LONG_URL);
++
++    assertThat(cache.get(CODE)).contains(LONG_URL);
++  }
++
++  @Test
++  void getReturnsEmptyOnMiss() {
++    when(ops.get(KEY)).thenReturn(null);
++
++    assertThat(cache.get(CODE)).isEmpty();
++  }
++
++  @Test
++  void putUsesDefaultTtlForNeverExpiringMapping() {
++    cache.put(CODE, LONG_URL, null);
++
++    verify(ops).set(KEY, LONG_URL, DEFAULT_TTL);
++  }
++
++  @Test
++  void putUsesRemainingTimeAsTtl() {
++    cache.put(CODE, LONG_URL, NOW.plus(Duration.ofMinutes(90)));
++
++    verify(ops).set(KEY, LONG_URL, Duration.ofMinutes(90));
++  }
++
++  @Test
++  void putCapsTtlAtTheDefault() {
++    cache.put(CODE, LONG_URL, NOW.plus(Duration.ofDays(7)));
++
++    verify(ops).set(KEY, LONG_URL, DEFAULT_TTL);
++  }
++
++  @Test
++  void putSkipsAlreadyExpiredMappings() {
++    cache.put(CODE, LONG_URL, NOW.minusSeconds(1));
++    cache.put(CODE, LONG_URL, NOW);
++
++    verify(ops, never()).set(anyString(), anyString(), any(Duration.class));
++  }
++
++  // --- degradation (AC-13) ---------------------------------------------------------------------
++
++  @Test
++  void getFailureIsAMissAndLogsADegradationWarningWithoutTheExceptionMessage() {
++    String message = "Unable to connect to redis.internal:6379";
++    when(ops.get(KEY)).thenThrow(new RedisConnectionFailureException(message));
++
++    assertThat(cache.get(CODE)).isEmpty();
++
++    ILoggingEvent warning = singleWarning();
++    assertThat(warning.getFormattedMessage())
++        .contains("cache degraded", "GET", KEY, "RedisConnectionFailureException")
++        .doesNotContain(message)
++        .doesNotContain("redis.internal");
++    assertThat(warning.getThrowableProxy()).isNull();
++  }
++
++  @Test
++  void putFailureIsANoOpAndLogsADegradationWarningWithoutTheExceptionMessage() {
++    String message = "Redis command timed out after 2000 ms against redis.internal:6379";
++    doThrow(new QueryTimeoutException(message))
++        .when(ops)
++        .set(anyString(), anyString(), any(Duration.class));
++
++    assertThatCode(() -> cache.put(CODE, LONG_URL, null)).doesNotThrowAnyException();
++
++    ILoggingEvent warning = singleWarning();
++    assertThat(warning.getFormattedMessage())
++        .contains("cache degraded", "SET", KEY, "QueryTimeoutException")
++        .doesNotContain(message)
++        .doesNotContain("redis.internal");
++    assertThat(warning.getThrowableProxy()).isNull();
++  }
++
++  @Test
++  void templateFailureBeforeTheCommandIsDegradedToo() {
++    when(redis.opsForValue()).thenThrow(new IllegalStateException("template not initialised"));
++
++    assertThat(cache.get(CODE)).isEmpty();
++    assertThatCode(() -> cache.put(CODE, LONG_URL, null)).doesNotThrowAnyException();
++    assertThat(warnings()).hasSize(2);
++  }
++
++  // --- helpers ---------------------------------------------------------------------------------
++
++  private List<ILoggingEvent> warnings() {
++    return logEvents.list.stream().filter(e -> e.getLevel() == Level.WARN).toList();
++  }
++
++  private ILoggingEvent singleWarning() {
++    List<ILoggingEvent> warnings = warnings();
++    assertThat(warnings).hasSize(1);
++    return warnings.get(0);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/read/UrlReadServiceTest.java b/src/test/java/com/example/shortener/read/UrlReadServiceTest.java
+new file mode 100644
+index 0000000..d25176e
+--- /dev/null
++++ b/src/test/java/com/example/shortener/read/UrlReadServiceTest.java
+@@ -0,0 +1,193 @@
++package com.example.shortener.read;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.verifyNoMoreInteractions;
++import static org.mockito.Mockito.when;
++
++import com.example.shortener.api.error.ShortCodeExpiredException;
++import com.example.shortener.api.error.ShortCodeNotFoundException;
++import com.example.shortener.domain.CodeSource;
++import com.example.shortener.domain.UrlMapping;
++import com.example.shortener.domain.UrlMappingRepository;
++import java.time.Clock;
++import java.time.Duration;
++import java.time.Instant;
++import java.time.ZoneOffset;
++import java.util.Optional;
++import org.junit.jupiter.api.Test;
++import org.springframework.data.redis.RedisConnectionFailureException;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.data.redis.core.ValueOperations;
++
++/**
++ * {@link UrlReadService} with mocked cache and repository: cache hit never touches Postgres
++ * (AC-12), miss loads and populates the cache (AC-7), unknown code is 404 (AC-8), expired code is
++ * 410 and never cached (AC-9), Redis-down bypass serves from Postgres (AC-13).
++ */
++class UrlReadServiceTest {
++
++  private static final Instant NOW = Instant.parse("2026-09-14T12:00:00Z");
++  private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
++  private static final String CODE = "promo2024";
++  private static final String LONG_URL = "https://example.com/some/path?x=1";
++
++  private final UrlCache cache = mock(UrlCache.class);
++  private final UrlMappingRepository repository = mock(UrlMappingRepository.class);
++  private final UrlReadService service = new UrlReadService(cache, repository, CLOCK);
++
++  private static UrlMapping mapping(Instant expiresAt) {
++    return new UrlMapping(
++        CODE, LONG_URL, NOW.minus(Duration.ofDays(1)), expiresAt, CodeSource.REDIS);
++  }
++
++  // --- cache hit (AC-12) -----------------------------------------------------------------------
++
++  @Test
++  void cacheHitReturnsCachedUrlAndNeverTouchesTheRepository() {
++    when(cache.get(CODE)).thenReturn(Optional.of(LONG_URL));
++
++    String resolved = service.resolve(CODE);
++
++    assertThat(resolved).isEqualTo(LONG_URL);
++    verifyNoInteractions(repository);
++    verify(cache).get(CODE);
++    verify(cache, never()).put(anyString(), anyString(), any());
++    verifyNoMoreInteractions(cache);
++  }
++
++  // --- cache miss (AC-7) -----------------------------------------------------------------------
++
++  @Test
++  void cacheMissLoadsFromRepositoryAndPopulatesCacheWithExpiry() {
++    Instant expiresAt = NOW.plus(Duration.ofHours(3));
++    when(cache.get(CODE)).thenReturn(Optional.empty());
++    when(repository.findByShortCode(CODE)).thenReturn(Optional.of(mapping(expiresAt)));
++
++    String resolved = service.resolve(CODE);
++
++    assertThat(resolved).isEqualTo(LONG_URL);
++    verify(repository).findByShortCode(CODE);
++    verify(cache).put(CODE, LONG_URL, expiresAt);
++  }
++
++  @Test
++  void cacheMissOnNeverExpiringMappingPopulatesCacheWithNullExpiry() {
++    when(cache.get(CODE)).thenReturn(Optional.empty());
++    when(repository.findByShortCode(CODE)).thenReturn(Optional.of(mapping(null)));
++
++    assertThat(service.resolve(CODE)).isEqualTo(LONG_URL);
++
++    verify(cache).put(CODE, LONG_URL, null);
++  }
++
++  // --- unknown (AC-8) --------------------------------------------------------------------------
++
++  @Test
++  void unknownCodeIsShortCodeNotFoundAndNothingIsCached() {
++    when(cache.get(CODE)).thenReturn(Optional.empty());
++    when(repository.findByShortCode(CODE)).thenReturn(Optional.empty());
++
++    assertThatThrownBy(() -> service.resolve(CODE))
++        .isInstanceOf(ShortCodeNotFoundException.class)
++        .hasMessageContaining(CODE)
++        .extracting("shortCode")
++        .isEqualTo(CODE);
++    verify(cache, never()).put(anyString(), anyString(), any());
++  }
++
++  // --- expired (AC-9) --------------------------------------------------------------------------
++
++  @Test
++  void expiredCodeIsShortCodeExpiredAndIsNotCached() {
++    Instant expiredAt = NOW.minus(Duration.ofMinutes(1));
++    when(cache.get(CODE)).thenReturn(Optional.empty());
++    when(repository.findByShortCode(CODE)).thenReturn(Optional.of(mapping(expiredAt)));
++
++    assertThatThrownBy(() -> service.resolve(CODE))
++        .isInstanceOf(ShortCodeExpiredException.class)
++        .hasMessageContaining(CODE)
++        .extracting("expiredAt")
++        .isEqualTo(expiredAt);
++    verify(cache, never()).put(anyString(), anyString(), any());
++  }
++
++  @Test
++  void codeExpiringExactlyNowIsAlreadyExpired() {
++    when(cache.get(CODE)).thenReturn(Optional.empty());
++    when(repository.findByShortCode(CODE)).thenReturn(Optional.of(mapping(NOW)));
++
++    assertThatThrownBy(() -> service.resolve(CODE)).isInstanceOf(ShortCodeExpiredException.class);
++    verify(cache, never()).put(anyString(), anyString(), any());
++  }
++
++  @Test
++  void codeExpiringOneSecondFromNowIsStillServedAndCached() {
++    Instant expiresAt = NOW.plusSeconds(1);
++    when(cache.get(CODE)).thenReturn(Optional.empty());
++    when(repository.findByShortCode(CODE)).thenReturn(Optional.of(mapping(expiresAt)));
++
++    assertThat(service.resolve(CODE)).isEqualTo(LONG_URL);
++    verify(cache).put(CODE, LONG_URL, expiresAt);
++  }
++
++  // --- Redis down (AC-13) ----------------------------------------------------------------------
++
++  @Test
++  void redisDownOnGetAndSetIsBypassedAndTheRedirectIsServedFromPostgres() {
++    StringRedisTemplate redis = mock(StringRedisTemplate.class);
++    @SuppressWarnings("unchecked")
++    ValueOperations<String, String> ops = mock(ValueOperations.class);
++    when(redis.opsForValue()).thenReturn(ops);
++    when(ops.get(anyString())).thenThrow(new RedisConnectionFailureException("refused"));
++    doThrow(new RedisConnectionFailureException("refused"))
++        .when(ops)
++        .set(anyString(), anyString(), any(Duration.class));
++    UrlReadService degraded =
++        new UrlReadService(
++            new RedisUrlCache(redis, Duration.ofHours(24), CLOCK), repository, CLOCK);
++    when(repository.findByShortCode(CODE))
++        .thenReturn(Optional.of(mapping(NOW.plus(Duration.ofHours(1)))));
++
++    String resolved = degraded.resolve(CODE);
++
++    assertThat(resolved).isEqualTo(LONG_URL);
++    verify(repository).findByShortCode(CODE);
++    verify(ops).get(RedisUrlCache.keyOf(CODE));
++    verify(ops).set(RedisUrlCache.keyOf(CODE), LONG_URL, Duration.ofHours(1));
++  }
++
++  @Test
++  void redisDownStillYields404ForUnknownAnd410ForExpiredCodes() {
++    StringRedisTemplate redis = mock(StringRedisTemplate.class);
++    @SuppressWarnings("unchecked")
++    ValueOperations<String, String> ops = mock(ValueOperations.class);
++    when(redis.opsForValue()).thenReturn(ops);
++    when(ops.get(anyString())).thenThrow(new RedisConnectionFailureException("refused"));
++    UrlReadService degraded =
++        new UrlReadService(
++            new RedisUrlCache(redis, Duration.ofHours(24), CLOCK), repository, CLOCK);
++    when(repository.findByShortCode("missing")).thenReturn(Optional.empty());
++    when(repository.findByShortCode(CODE))
++        .thenReturn(Optional.of(mapping(NOW.minus(Duration.ofDays(1)))));
++
++    assertThatThrownBy(() -> degraded.resolve("missing"))
++        .isInstanceOf(ShortCodeNotFoundException.class);
++    assertThatThrownBy(() -> degraded.resolve(CODE)).isInstanceOf(ShortCodeExpiredException.class);
++  }
++
++  // --- guards ----------------------------------------------------------------------------------
++
++  @Test
++  void rejectsNullShortCode() {
++    assertThatThrownBy(() -> service.resolve(null)).isInstanceOf(NullPointerException.class);
++    verifyNoInteractions(cache, repository);
++  }
++}

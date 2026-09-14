@@ -123,6 +123,21 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
             for original in batch:
                 t = widened(original)
                 r = await executor.execute(ctx, t, design, feedback)
+                if isinstance(r, Done) and r.granted_scope:  # a recorded run's human grant, replayed with it
+                    ctx.approvals |= {f"scope:{t.id}:{f}" for f in r.granted_scope}
+                    ctx.emit(
+                        Kind.POLICY_DECISION,
+                        node_id=node.id,
+                        task_id=t.id,
+                        actor="policy",
+                        status="SCOPE_APPROVED",
+                        payload={
+                            "action": "task.scope_change",
+                            "files": r.granted_scope,
+                            "source": "recorded",
+                        },
+                    )
+                    t = widened(original)
                 if isinstance(r, Done):
                     # an approved HIGH task may touch the protected paths it declared; map the human's
                     # approval onto the high-impact actions those paths require
@@ -172,6 +187,11 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
                             f"task {t.id} violated policy: {', '.join(sorted({f.rule for f in findings}))}",
                             {"findings": [f.model_dump() for f in findings]},
                         )
+                    accepted = getattr(executor, "accepted", None)
+                    if (
+                        accepted is not None
+                    ):  # e.g. RecordingExecutor promotes this attempt to the replayable one
+                        await accepted(ctx, t, r, sorted(granted))
                     cs.commits[t.id] = r.commit_sha
                     cs.files_changed += r.files_changed
                     cs.tests_added += r.tests_added

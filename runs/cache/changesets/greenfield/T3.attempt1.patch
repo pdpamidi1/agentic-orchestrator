@@ -1,9 +1,9 @@
 diff --git a/src/main/java/com/example/shortener/api/dto/CreateUrlRequest.java b/src/main/java/com/example/shortener/api/dto/CreateUrlRequest.java
 new file mode 100644
-index 0000000..c28bc23
+index 0000000..baed989
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/api/dto/CreateUrlRequest.java
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,44 @@
 +package com.example.shortener.api.dto;
 +
 +import com.fasterxml.jackson.annotation.JsonProperty;
@@ -14,78 +14,84 @@ index 0000000..c28bc23
 +import java.time.OffsetDateTime;
 +
 +/**
-+ * Body of {@code POST /api/v1/urls} ({@code createShortUrl}), serialised with snake_case names.
++ * Request body of {@code POST /api/v1/urls} (operationId {@code createShortUrl}).
 + *
-+ * <p>Bean Validation encodes the contract of the {@code CreateUrlRequest} schema (AC-2, AC-5,
-+ * AC-6). A malformed {@code expiration_date} never reaches validation: Jackson rejects it while
-+ * reading the body, which {@code GlobalExceptionHandler} renders as a 400 problem.
++ * <p>JSON property names are snake_case as mandated by the API contract. Structural rules are
++ * expressed as Bean Validation constraints so that a controller's {@code @Valid} rejects invalid
++ * input with a 400 before any service code runs (AC-2, AC-5, AC-6).
 + *
-+ * @param longUrl absolute http or https URL, at most {@value #LONG_URL_MAX_LENGTH} characters
-+ * @param customAlias optional caller-chosen short code matching {@value #ALIAS_PATTERN}
-+ * @param expirationDate optional ISO-8601 instant that must lie in the future
++ * @param longUrl absolute {@code http} or {@code https} URL, non-blank, at most 2048 characters
++ * @param customAlias optional caller-chosen short code, {@code [0-9a-zA-Z]} and 3 to 32 characters
++ * @param expirationDate optional ISO-8601 date-time (with offset) that must lie in the future; a
++ *     value that cannot be parsed as ISO-8601 is rejected while reading the body
 + */
 +public record CreateUrlRequest(
 +    @JsonProperty("long_url")
 +        @NotBlank(message = "must not be blank")
-+        @Size(max = LONG_URL_MAX_LENGTH, message = "must be at most {max} characters")
++        @Size(max = MAX_LONG_URL_LENGTH, message = "must be at most 2048 characters")
 +        @Pattern(regexp = LONG_URL_PATTERN, message = "must be an absolute http or https URL")
 +        String longUrl,
 +    @JsonProperty("custom_alias")
-+        @Pattern(regexp = ALIAS_PATTERN, message = "must be 3 to 32 characters from [0-9a-zA-Z]")
++        @Pattern(
++            regexp = CUSTOM_ALIAS_PATTERN,
++            message = "must be 3 to 32 characters from [0-9a-zA-Z]")
 +        String customAlias,
 +    @JsonProperty("expiration_date") @Future(message = "must be in the future")
 +        OffsetDateTime expirationDate) {
 +
-+  /** Maximum length of {@code long_url}; matches {@code urls_long_url_len_chk}. */
-+  public static final int LONG_URL_MAX_LENGTH = 2048;
++  /** Maximum accepted length of {@code long_url}. */
++  public static final int MAX_LONG_URL_LENGTH = 2048;
 +
-+  /** {@code long_url} must be an absolute http or https URL (AC-2). */
-+  public static final String LONG_URL_PATTERN = "^https?://\\S+$";
++  /** {@code long_url} must be an absolute http/https URL. */
++  public static final String LONG_URL_PATTERN = "^https?://.+";
 +
-+  /** {@code custom_alias} charset and length (AC-5); matches {@code urls_short_code_format_chk}. */
-+  public static final String ALIAS_PATTERN = "^[0-9a-zA-Z]{3,32}$";
++  /** {@code custom_alias} charset and length. */
++  public static final String CUSTOM_ALIAS_PATTERN = "^[0-9a-zA-Z]{3,32}$";
 +}
 diff --git a/src/main/java/com/example/shortener/api/dto/CreateUrlResponse.java b/src/main/java/com/example/shortener/api/dto/CreateUrlResponse.java
 new file mode 100644
-index 0000000..af67cc9
+index 0000000..465f5a5
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/api/dto/CreateUrlResponse.java
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,23 @@
 +package com.example.shortener.api.dto;
 +
 +import com.fasterxml.jackson.annotation.JsonProperty;
-+import java.time.OffsetDateTime;
++import java.time.Instant;
 +
 +/**
-+ * Body of the 201 response of {@code POST /api/v1/urls} ({@code createShortUrl}), serialised with
-+ * snake_case names.
++ * Response body of {@code POST /api/v1/urls} (201 Created), serialised in snake_case.
++ *
++ * <p>This DTO depends on nothing inside the application: {@code code_source} carries the wire value
++ * of the domain enum ({@code "redis"} or {@code "db_sequence"}) as a plain string.
 + *
 + * @param shortUrl configured base URL plus the short code
-+ * @param shortCode generated base62 code or the custom alias
++ * @param shortCode the generated base62 code or the custom alias
 + * @param longUrl the stored target URL
-+ * @param expiresAt expiry instant, or {@code null} when the mapping never expires
-+ * @param codeSource which counter produced the code: the wire value {@code redis} or {@code
-+ *     db_sequence} (kept as a string so this DTO depends on nothing inside the application)
++ * @param expiresAt expiry instant, or {@code null} when the link never expires
++ * @param codeSource which counter produced the code: {@code "redis"} or {@code "db_sequence"}
 + */
 +public record CreateUrlResponse(
 +    @JsonProperty("short_url") String shortUrl,
 +    @JsonProperty("short_code") String shortCode,
 +    @JsonProperty("long_url") String longUrl,
-+    @JsonProperty("expires_at") OffsetDateTime expiresAt,
++    @JsonProperty("expires_at") Instant expiresAt,
 +    @JsonProperty("code_source") String codeSource) {}
 diff --git a/src/main/java/com/example/shortener/api/error/AliasAlreadyExistsException.java b/src/main/java/com/example/shortener/api/error/AliasAlreadyExistsException.java
 new file mode 100644
-index 0000000..982a36a
+index 0000000..ddbf14a
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/api/error/AliasAlreadyExistsException.java
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,27 @@
 +package com.example.shortener.api.error;
 +
 +import java.util.Objects;
 +
 +/**
-+ * Thrown when a custom alias / short code is already present in the {@code urls} table; rendered as
-+ * 409 by {@link GlobalExceptionHandler}. The existing mapping is left unchanged (AC-3).
++ * Thrown when a custom alias / short code is already present in the {@code urls} table. Rendered as
++ * {@code 409 Conflict} by {@link GlobalExceptionHandler}; the existing mapping is left unchanged.
++ *
++ * <p>The message is client-facing and must not contain internal details.
 + */
 +public class AliasAlreadyExistsException extends RuntimeException {
 +
@@ -95,7 +101,7 @@ index 0000000..982a36a
 +   * @param alias the alias or short code that is already taken
 +   */
 +  public AliasAlreadyExistsException(String alias) {
-+    super("Alias '" + Objects.requireNonNull(alias, "alias") + "' already exists");
++    super("Alias '" + Objects.requireNonNull(alias, "alias") + "' is already taken");
 +    this.alias = alias;
 +  }
 +
@@ -106,21 +112,18 @@ index 0000000..982a36a
 +}
 diff --git a/src/main/java/com/example/shortener/api/error/GlobalExceptionHandler.java b/src/main/java/com/example/shortener/api/error/GlobalExceptionHandler.java
 new file mode 100644
-index 0000000..c0d60ba
+index 0000000..c76c72d
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/api/error/GlobalExceptionHandler.java
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,226 @@
 +package com.example.shortener.api.error;
 +
-+import io.swagger.v3.oas.annotations.Hidden;
 +import java.net.URI;
++import java.util.Comparator;
 +import java.util.Locale;
-+import java.util.Objects;
 +import java.util.stream.Collectors;
 +import org.slf4j.Logger;
 +import org.slf4j.LoggerFactory;
-+import org.springframework.context.MessageSourceResolvable;
-+import org.springframework.context.i18n.LocaleContextHolder;
 +import org.springframework.http.HttpHeaders;
 +import org.springframework.http.HttpStatus;
 +import org.springframework.http.HttpStatusCode;
@@ -129,124 +132,49 @@ index 0000000..c0d60ba
 +import org.springframework.http.ResponseEntity;
 +import org.springframework.http.converter.HttpMessageNotReadableException;
 +import org.springframework.validation.FieldError;
-+import org.springframework.web.ErrorResponse;
 +import org.springframework.web.bind.MethodArgumentNotValidException;
 +import org.springframework.web.bind.annotation.ExceptionHandler;
 +import org.springframework.web.bind.annotation.RestControllerAdvice;
 +import org.springframework.web.context.request.ServletWebRequest;
 +import org.springframework.web.context.request.WebRequest;
-+import org.springframework.web.method.annotation.HandlerMethodValidationException;
 +import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 +
 +/**
-+ * Single source of every non-2xx response (ADR-008, AC-16): renders RFC 9457 {@link ProblemDetail}
-+ * bodies as {@code application/problem+json} with a consistent {@code type}, {@code title}, {@code
-+ * status}, {@code detail} and {@code instance}.
++ * Single producer of every non-2xx response of the API (AC-16).
 + *
-+ * <ul>
-+ *   <li>400: Bean Validation failures, unreadable or mistyped bodies (malformed ISO-8601 {@code
-+ *       expiration_date}) and {@link InvalidUrlException}
-+ *   <li>404: {@link ShortCodeNotFoundException}
-+ *   <li>409: {@link AliasAlreadyExistsException}
-+ *   <li>410: {@link ShortCodeExpiredException}
-+ *   <li>500: anything else; the body never carries the exception class, message or stack trace
-+ * </ul>
-+ *
-+ * <p>Exceptions Spring MVC raises itself (405, 415, ...) go through {@link
-+ * ResponseEntityExceptionHandler} and are normalised in {@link #handleExceptionInternal} so they
-+ * share the same body shape. Controllers never build error bodies.
-+ *
-+ * <p>{@code @Hidden} keeps springdoc from advertising these handlers as generic responses on every
-+ * operation; the per-operation error responses are declared in the committed OpenAPI document.
++ * <p>Every error, whether raised by Spring MVC (validation, unreadable body, unsupported media
++ * type...), by the application ({@link InvalidUrlException}, {@link ShortCodeNotFoundException},
++ * {@link AliasAlreadyExistsException}, {@link ShortCodeExpiredException}) or unexpectedly (any
++ * other {@link Throwable}), is rendered as an RFC 9457 {@link ProblemDetail} with {@code
++ * Content-Type: application/problem+json} and the fields {@code type}, {@code title}, {@code
++ * status}, {@code detail} and {@code instance}. Stack traces, exception class names and other
++ * internal identifiers never reach the client; unexpected errors are logged server-side instead.
 + */
-+@Hidden
 +@RestControllerAdvice
 +public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 +
-+  /** Prefix of every problem {@code type} URI; the path segment identifies the problem kind. */
-+  public static final String TYPE_BASE = "https://example.com/problems/";
++  /** Base URI of the problem {@code type} identifiers. */
++  static final String PROBLEM_TYPE_BASE = "https://example.com/problems/";
 +
-+  /** Problem kind for Bean Validation failures (AC-2, AC-5, AC-6). */
-+  public static final String VALIDATION_FAILED = "validation-failed";
++  static final URI TYPE_VALIDATION_ERROR = problemType("validation-error");
++  static final URI TYPE_MALFORMED_REQUEST = problemType("malformed-request");
++  static final URI TYPE_INVALID_URL = problemType("invalid-url");
++  static final URI TYPE_SHORT_CODE_NOT_FOUND = problemType("short-code-not-found");
++  static final URI TYPE_ALIAS_ALREADY_EXISTS = problemType("alias-already-exists");
++  static final URI TYPE_SHORT_CODE_EXPIRED = problemType("short-code-expired");
++  static final URI TYPE_INTERNAL_ERROR = problemType("internal-error");
 +
-+  /** Problem kind for unreadable JSON or mistyped fields such as a malformed ISO-8601 date. */
-+  public static final String MALFORMED_REQUEST = "malformed-request";
-+
-+  /** Problem kind for {@link InvalidUrlException}. */
-+  public static final String INVALID_URL = "invalid-url";
-+
-+  /** Problem kind for {@link ShortCodeNotFoundException}. */
-+  public static final String SHORT_CODE_NOT_FOUND = "short-code-not-found";
-+
-+  /** Problem kind for {@link AliasAlreadyExistsException}. */
-+  public static final String ALIAS_ALREADY_EXISTS = "alias-already-exists";
-+
-+  /** Problem kind for {@link ShortCodeExpiredException}. */
-+  public static final String SHORT_CODE_EXPIRED = "short-code-expired";
-+
-+  /** Problem kind for unhandled server errors. */
-+  public static final String INTERNAL_ERROR = "internal-error";
-+
-+  private static final String INTERNAL_ERROR_DETAIL =
-+      "An unexpected error occurred. Please retry later.";
-+  private static final String MALFORMED_REQUEST_DETAIL =
-+      "Request body is not valid JSON or a field has the wrong format"
-+          + " (dates must be ISO-8601 date-times, e.g. 2030-01-01T00:00:00Z).";
++  static final String DETAIL_INTERNAL_ERROR =
++      "An unexpected error occurred while processing the request";
++  static final String DETAIL_MALFORMED_REQUEST =
++      "Request body is missing, malformed or contains a value of the wrong type";
 +
 +  private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 +
-+  /** Semantic URL / expiry rejections raised by services: 400. */
-+  @ExceptionHandler(InvalidUrlException.class)
-+  public ResponseEntity<ProblemDetail> handleInvalidUrl(
-+      InvalidUrlException ex, WebRequest request) {
-+    return respond(HttpStatus.BAD_REQUEST, INVALID_URL, "Invalid URL", ex.getMessage(), request);
-+  }
++  // ---------------------------------------------------------------------------------------------
++  // 400: Bean Validation failures (@Valid on the request body) and unreadable bodies
++  // ---------------------------------------------------------------------------------------------
 +
-+  /** Unknown short code: 404. */
-+  @ExceptionHandler(ShortCodeNotFoundException.class)
-+  public ResponseEntity<ProblemDetail> handleShortCodeNotFound(
-+      ShortCodeNotFoundException ex, WebRequest request) {
-+    return respond(
-+        HttpStatus.NOT_FOUND,
-+        SHORT_CODE_NOT_FOUND,
-+        "Short code not found",
-+        ex.getMessage(),
-+        request);
-+  }
-+
-+  /** Alias / short code already taken: 409. */
-+  @ExceptionHandler(AliasAlreadyExistsException.class)
-+  public ResponseEntity<ProblemDetail> handleAliasAlreadyExists(
-+      AliasAlreadyExistsException ex, WebRequest request) {
-+    return respond(
-+        HttpStatus.CONFLICT,
-+        ALIAS_ALREADY_EXISTS,
-+        "Alias already exists",
-+        ex.getMessage(),
-+        request);
-+  }
-+
-+  /** Expired mapping: 410. */
-+  @ExceptionHandler(ShortCodeExpiredException.class)
-+  public ResponseEntity<ProblemDetail> handleShortCodeExpired(
-+      ShortCodeExpiredException ex, WebRequest request) {
-+    return respond(
-+        HttpStatus.GONE, SHORT_CODE_EXPIRED, "Short code expired", ex.getMessage(), request);
-+  }
-+
-+  /** Anything not mapped above: 500 with a fixed, non-revealing detail. */
-+  @ExceptionHandler(Throwable.class)
-+  public ResponseEntity<ProblemDetail> handleUnexpected(Throwable ex, WebRequest request) {
-+    log.error("Unhandled exception while serving {}", request.getDescription(false), ex);
-+    return respond(
-+        HttpStatus.INTERNAL_SERVER_ERROR,
-+        INTERNAL_ERROR,
-+        "Internal server error",
-+        INTERNAL_ERROR_DETAIL,
-+        request);
-+  }
-+
-+  /** Bean Validation failure of a {@code @Valid @RequestBody}: 400 listing every field error. */
 +  @Override
 +  protected ResponseEntity<Object> handleMethodArgumentNotValid(
 +      MethodArgumentNotValidException ex,
@@ -255,110 +183,136 @@ index 0000000..c0d60ba
 +      WebRequest request) {
 +    String detail =
 +        ex.getBindingResult().getFieldErrors().stream()
-+            .map(GlobalExceptionHandler::describe)
-+            .sorted()
++            .sorted(Comparator.comparing(FieldError::getField))
++            .map(error -> jsonName(error.getField()) + ": " + error.getDefaultMessage())
 +            .collect(Collectors.joining("; "));
++    if (detail.isEmpty()) {
++      detail = "Request validation failed";
++    }
 +    ProblemDetail problem =
-+        problem(HttpStatus.BAD_REQUEST, VALIDATION_FAILED, "Validation failed", detail, request);
++        problem(HttpStatus.BAD_REQUEST, TYPE_VALIDATION_ERROR, "Validation failed", detail);
 +    return handleExceptionInternal(ex, problem, headers, HttpStatus.BAD_REQUEST, request);
 +  }
 +
-+  /** Constraint violations on handler method parameters (path variables, params): 400. */
-+  @Override
-+  protected ResponseEntity<Object> handleHandlerMethodValidationException(
-+      HandlerMethodValidationException ex,
-+      HttpHeaders headers,
-+      HttpStatusCode status,
-+      WebRequest request) {
-+    String detail =
-+        ex.getAllErrors().stream()
-+            .map(MessageSourceResolvable::getDefaultMessage)
-+            .filter(Objects::nonNull)
-+            .sorted()
-+            .collect(Collectors.joining("; "));
-+    ProblemDetail problem =
-+        problem(HttpStatus.BAD_REQUEST, VALIDATION_FAILED, "Validation failed", detail, request);
-+    return handleExceptionInternal(ex, problem, headers, HttpStatus.BAD_REQUEST, request);
-+  }
-+
-+  /** Unreadable JSON or a value of the wrong type (e.g. malformed {@code expiration_date}): 400. */
 +  @Override
 +  protected ResponseEntity<Object> handleHttpMessageNotReadable(
 +      HttpMessageNotReadableException ex,
 +      HttpHeaders headers,
 +      HttpStatusCode status,
 +      WebRequest request) {
++    // The exception message names Jackson classes and JSON locations; never forward it.
 +    ProblemDetail problem =
 +        problem(
 +            HttpStatus.BAD_REQUEST,
-+            MALFORMED_REQUEST,
-+            "Malformed request body",
-+            MALFORMED_REQUEST_DETAIL,
-+            request);
++            TYPE_MALFORMED_REQUEST,
++            "Malformed request",
++            DETAIL_MALFORMED_REQUEST);
 +    return handleExceptionInternal(ex, problem, headers, HttpStatus.BAD_REQUEST, request);
 +  }
 +
++  // ---------------------------------------------------------------------------------------------
++  // Application exceptions
++  // ---------------------------------------------------------------------------------------------
++
++  @ExceptionHandler(InvalidUrlException.class)
++  public ResponseEntity<Object> handleInvalidUrl(InvalidUrlException ex, WebRequest request) {
++    return respond(
++        problem(HttpStatus.BAD_REQUEST, TYPE_INVALID_URL, "Invalid URL", ex.getMessage()), request);
++  }
++
++  @ExceptionHandler(ShortCodeNotFoundException.class)
++  public ResponseEntity<Object> handleShortCodeNotFound(
++      ShortCodeNotFoundException ex, WebRequest request) {
++    return respond(
++        problem(
++            HttpStatus.NOT_FOUND,
++            TYPE_SHORT_CODE_NOT_FOUND,
++            "Short code not found",
++            ex.getMessage()),
++        request);
++  }
++
++  @ExceptionHandler(AliasAlreadyExistsException.class)
++  public ResponseEntity<Object> handleAliasAlreadyExists(
++      AliasAlreadyExistsException ex, WebRequest request) {
++    return respond(
++        problem(
++            HttpStatus.CONFLICT,
++            TYPE_ALIAS_ALREADY_EXISTS,
++            "Alias already exists",
++            ex.getMessage()),
++        request);
++  }
++
++  @ExceptionHandler(ShortCodeExpiredException.class)
++  public ResponseEntity<Object> handleShortCodeExpired(
++      ShortCodeExpiredException ex, WebRequest request) {
++    return respond(
++        problem(HttpStatus.GONE, TYPE_SHORT_CODE_EXPIRED, "Short code expired", ex.getMessage()),
++        request);
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // 500: anything else
++  // ---------------------------------------------------------------------------------------------
++
++  @ExceptionHandler(Throwable.class)
++  public ResponseEntity<Object> handleUnexpected(Throwable ex, WebRequest request) {
++    log.error("Unhandled error while processing {}", request.getDescription(false), ex);
++    return respond(
++        problem(
++            HttpStatus.INTERNAL_SERVER_ERROR,
++            TYPE_INTERNAL_ERROR,
++            "Internal server error",
++            DETAIL_INTERNAL_ERROR),
++        request);
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // Common rendering: every ResponseEntity produced by this class goes through here
++  // ---------------------------------------------------------------------------------------------
++
 +  /**
-+   * Common exit of every exception the base class handles: guarantees a {@link ProblemDetail} body
-+   * whose {@code type}, {@code detail} and {@code instance} are populated, so 405/415/... share the
-+   * shape of the explicitly mapped problems.
++   * Final step for every response, including the ones produced by the superclass for Spring MVC
++   * exceptions: forces {@code application/problem+json}, fills {@code instance} with the request
++   * path and replaces the default {@code about:blank} type with a stable identifier.
 +   */
 +  @Override
-+  protected ResponseEntity<Object> handleExceptionInternal(
-+      Exception ex,
-+      Object body,
-+      HttpHeaders headers,
-+      HttpStatusCode statusCode,
-+      WebRequest request) {
-+    if (statusCode.is5xxServerError()) {
-+      log.error("Unhandled exception while serving {}", request.getDescription(false), ex);
-+    } else {
-+      log.debug("Rejected request {}: {}", request.getDescription(false), ex.toString());
++  protected ResponseEntity<Object> createResponseEntity(
++      Object body, HttpHeaders headers, HttpStatusCode statusCode, WebRequest request) {
++    if (body instanceof ProblemDetail problem) {
++      if (problem.getInstance() == null) {
++        problem.setInstance(instanceOf(request));
++      }
++      if (problem.getType() == null || "about:blank".equals(problem.getType().toString())) {
++        problem.setType(problemType(slugOf(statusCode)));
++      }
++      if (problem.getTitle() == null) {
++        problem.setTitle(titleOf(statusCode));
++      }
 +    }
-+    ProblemDetail problem;
-+    if (body instanceof ProblemDetail detail) {
-+      problem = detail;
-+    } else if (ex instanceof ErrorResponse errorResponse) {
-+      problem = errorResponse.updateAndGetBody(getMessageSource(), LocaleContextHolder.getLocale());
-+    } else {
-+      problem = ProblemDetail.forStatus(statusCode);
-+    }
-+    HttpStatus status = HttpStatus.resolve(statusCode.value());
-+    String title =
-+        problem.getTitle() != null
-+            ? problem.getTitle()
-+            : status != null ? status.getReasonPhrase() : "Error";
-+    String kind = slug(title);
-+    if (problem.getType() == null || "about:blank".equals(problem.getType().toString())) {
-+      problem.setType(URI.create(TYPE_BASE + kind));
-+    }
-+    problem.setTitle(title);
-+    if (problem.getDetail() == null || problem.getDetail().isBlank()) {
-+      problem.setDetail(statusCode.is5xxServerError() ? INTERNAL_ERROR_DETAIL : title);
-+    }
-+    if (problem.getInstance() == null) {
-+      problem.setInstance(instanceOf(request));
-+    }
-+    return super.handleExceptionInternal(ex, problem, headers, statusCode, request);
-+  }
-+
-+  private static ResponseEntity<ProblemDetail> respond(
-+      HttpStatus status, String kind, String title, String detail, WebRequest request) {
-+    return ResponseEntity.status(status)
++    return ResponseEntity.status(statusCode)
++        .headers(headers)
 +        .contentType(MediaType.APPLICATION_PROBLEM_JSON)
-+        .body(problem(status, kind, title, detail, request));
++        .body(body);
 +  }
 +
-+  private static ProblemDetail problem(
-+      HttpStatus status, String kind, String title, String detail, WebRequest request) {
++  private ResponseEntity<Object> respond(ProblemDetail problem, WebRequest request) {
++    return createResponseEntity(
++        problem, new HttpHeaders(), HttpStatusCode.valueOf(problem.getStatus()), request);
++  }
++
++  private static ProblemDetail problem(HttpStatus status, URI type, String title, String detail) {
 +    ProblemDetail problem = ProblemDetail.forStatusAndDetail(status, detail);
-+    problem.setType(URI.create(TYPE_BASE + kind));
++    problem.setType(type);
 +    problem.setTitle(title);
-+    problem.setInstance(instanceOf(request));
 +    return problem;
 +  }
 +
-+  /** The request path as the problem {@code instance}; never includes the query string. */
++  private static URI problemType(String slug) {
++    return URI.create(PROBLEM_TYPE_BASE + slug);
++  }
++
 +  private static URI instanceOf(WebRequest request) {
 +    if (request instanceof ServletWebRequest servletRequest) {
 +      return URI.create(servletRequest.getRequest().getRequestURI());
@@ -366,90 +320,132 @@ index 0000000..c0d60ba
 +    return null;
 +  }
 +
-+  /** {@code long_url: must be an absolute http or https URL} using the JSON (snake_case) name. */
-+  private static String describe(FieldError error) {
-+    return snakeCase(error.getField()) + ": " + error.getDefaultMessage();
++  private static String titleOf(HttpStatusCode statusCode) {
++    HttpStatus status = HttpStatus.resolve(statusCode.value());
++    return status != null ? status.getReasonPhrase() : "HTTP " + statusCode.value();
 +  }
 +
-+  private static String snakeCase(String field) {
-+    return field.replaceAll("([a-z0-9])([A-Z])", "$1_$2").toLowerCase(Locale.ROOT);
++  private static String slugOf(HttpStatusCode statusCode) {
++    return titleOf(statusCode).toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "-");
 +  }
 +
-+  private static String slug(String title) {
-+    return title.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "");
++  /** Renders a Java property name such as {@code longUrl} as its JSON name {@code long_url}. */
++  static String jsonName(String property) {
++    StringBuilder out = new StringBuilder(property.length() + 4);
++    for (char c : property.toCharArray()) {
++      if (Character.isUpperCase(c)) {
++        out.append('_').append(Character.toLowerCase(c));
++      } else {
++        out.append(c);
++      }
++    }
++    return out.toString();
 +  }
 +}
 diff --git a/src/main/java/com/example/shortener/api/error/InvalidUrlException.java b/src/main/java/com/example/shortener/api/error/InvalidUrlException.java
 new file mode 100644
-index 0000000..052a672
+index 0000000..cc8596f
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/api/error/InvalidUrlException.java
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,29 @@
 +package com.example.shortener.api.error;
 +
 +import java.util.Objects;
 +
 +/**
-+ * Thrown for semantic URL or expiry rejections detected outside Bean Validation (for example a
-+ * syntactically valid-looking {@code long_url} that cannot be parsed as a URI); rendered as 400 by
-+ * {@link GlobalExceptionHandler} (AC-2, AC-6).
++ * Thrown for semantic URL or expiry rejections that are detected outside Bean Validation (for
++ * example by a service that inspects the parsed URL). Rendered as {@code 400 Bad Request} by {@link
++ * GlobalExceptionHandler}.
 + *
-+ * <p>The message becomes the problem {@code detail}, so it must be safe to show to a client: no
-+ * stack traces, internal identifiers or secrets.
++ * <p>The message is client-facing and becomes the problem {@code detail}; it must describe the
++ * rejected input rule, never internal state.
 + */
 +public class InvalidUrlException extends RuntimeException {
 +
 +  /**
-+   * @param detail client-safe description of why the value was rejected
++   * @param message client-facing description of why the URL or expiry was rejected
 +   */
-+  public InvalidUrlException(String detail) {
-+    super(Objects.requireNonNull(detail, "detail"));
++  public InvalidUrlException(String message) {
++    super(Objects.requireNonNull(message, "message"));
++  }
++
++  /**
++   * @param message client-facing description of why the URL or expiry was rejected
++   * @param cause the underlying parse failure; never exposed to the client
++   */
++  public InvalidUrlException(String message, Throwable cause) {
++    super(Objects.requireNonNull(message, "message"), cause);
 +  }
 +}
 diff --git a/src/main/java/com/example/shortener/api/error/ShortCodeExpiredException.java b/src/main/java/com/example/shortener/api/error/ShortCodeExpiredException.java
 new file mode 100644
-index 0000000..f877c31
+index 0000000..6611ade
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/api/error/ShortCodeExpiredException.java
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,48 @@
 +package com.example.shortener.api.error;
 +
++import java.time.Instant;
 +import java.util.Objects;
 +
 +/**
-+ * Thrown when a resolved mapping's {@code expires_at} is in the past; rendered as 410 by {@link
-+ * GlobalExceptionHandler} (AC-9).
++ * Thrown when a short code resolves to a mapping whose {@code expires_at} lies in the past.
++ * Rendered as {@code 410 Gone} by {@link GlobalExceptionHandler}.
++ *
++ * <p>The message is client-facing and must not contain internal details.
 + */
 +public class ShortCodeExpiredException extends RuntimeException {
 +
 +  private final String shortCode;
++  private final Instant expiredAt;
 +
 +  /**
 +   * @param shortCode the expired short code
 +   */
 +  public ShortCodeExpiredException(String shortCode) {
-+    super("Short code '" + Objects.requireNonNull(shortCode, "shortCode") + "' has expired");
++    this(shortCode, null);
++  }
++
++  /**
++   * @param shortCode the expired short code
++   * @param expiredAt the instant at which the mapping expired, or {@code null} when unknown
++   */
++  public ShortCodeExpiredException(String shortCode, Instant expiredAt) {
++    super(buildMessage(Objects.requireNonNull(shortCode, "shortCode"), expiredAt));
 +    this.shortCode = shortCode;
++    this.expiredAt = expiredAt;
 +  }
 +
 +  /** The short code whose mapping has expired. */
 +  public String getShortCode() {
 +    return shortCode;
 +  }
++
++  /** The expiry instant, or {@code null} when it was not supplied. */
++  public Instant getExpiredAt() {
++    return expiredAt;
++  }
++
++  private static String buildMessage(String shortCode, Instant expiredAt) {
++    String base = "Short code '" + shortCode + "' has expired";
++    return expiredAt == null ? base : base + " at " + expiredAt;
++  }
 +}
 diff --git a/src/main/java/com/example/shortener/api/error/ShortCodeNotFoundException.java b/src/main/java/com/example/shortener/api/error/ShortCodeNotFoundException.java
 new file mode 100644
-index 0000000..9a351e2
+index 0000000..438e9c5
 --- /dev/null
 +++ b/src/main/java/com/example/shortener/api/error/ShortCodeNotFoundException.java
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,27 @@
 +package com.example.shortener.api.error;
 +
 +import java.util.Objects;
 +
 +/**
-+ * Thrown when a short code exists in neither the cache nor the database; rendered as 404 by {@link
-+ * GlobalExceptionHandler} (AC-8).
++ * Thrown when a short code exists in neither the cache nor the database. Rendered as {@code 404 Not
++ * Found} by {@link GlobalExceptionHandler}.
++ *
++ * <p>The message is client-facing and must not contain internal details.
 + */
 +public class ShortCodeNotFoundException extends RuntimeException {
 +
@@ -470,10 +466,10 @@ index 0000000..9a351e2
 +}
 diff --git a/src/test/java/com/example/shortener/api/dto/CreateUrlRequestValidationTest.java b/src/test/java/com/example/shortener/api/dto/CreateUrlRequestValidationTest.java
 new file mode 100644
-index 0000000..21143c8
+index 0000000..9a553bc
 --- /dev/null
 +++ b/src/test/java/com/example/shortener/api/dto/CreateUrlRequestValidationTest.java
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,210 @@
 +package com.example.shortener.api.dto;
 +
 +import static org.assertj.core.api.Assertions.assertThat;
@@ -482,31 +478,33 @@ index 0000000..21143c8
 +import jakarta.validation.ConstraintViolation;
 +import jakarta.validation.Validation;
 +import jakarta.validation.Validator;
-+import jakarta.validation.ValidatorFactory;
 +import java.time.OffsetDateTime;
 +import java.time.ZoneOffset;
 +import java.util.Set;
 +import org.junit.jupiter.api.AfterAll;
 +import org.junit.jupiter.api.BeforeAll;
 +import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.ValueSource;
 +import tools.jackson.core.JacksonException;
 +import tools.jackson.databind.json.JsonMapper;
 +
 +/**
-+ * Bean Validation and JSON binding rules of {@link CreateUrlRequest} / {@link CreateUrlResponse}
-+ * (AC-2, AC-5, AC-6); no Spring context.
++ * Bean Validation and JSON binding rules of {@link CreateUrlRequest} (AC-2, AC-5, AC-6), verified
++ * without a Spring context.
 + */
 +class CreateUrlRequestValidationTest {
 +
++  private static final String VALID_URL = "https://example.com/some/path?q=1";
 +  private static final OffsetDateTime FUTURE = OffsetDateTime.now(ZoneOffset.UTC).plusDays(30);
-+  private static final OffsetDateTime PAST = OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(1);
++  private static final OffsetDateTime PAST = OffsetDateTime.now(ZoneOffset.UTC).minusDays(1);
 +
-+  private static ValidatorFactory factory;
++  private static jakarta.validation.ValidatorFactory factory;
 +  private static Validator validator;
-+  private static final JsonMapper json = JsonMapper.builder().build();
++  private final JsonMapper json = JsonMapper.builder().build();
 +
 +  @BeforeAll
-+  static void createValidator() {
++  static void openValidator() {
 +    factory = Validation.buildDefaultValidatorFactory();
 +    validator = factory.getValidator();
 +  }
@@ -516,530 +514,481 @@ index 0000000..21143c8
 +    factory.close();
 +  }
 +
-+  private static Set<ConstraintViolation<CreateUrlRequest>> validate(CreateUrlRequest request) {
-+    return validator.validate(request);
-+  }
++  // --- valid input -----------------------------------------------------------------------------
 +
-+  private static Set<String> violatedFields(CreateUrlRequest request) {
-+    return validate(request).stream()
-+        .map(v -> v.getPropertyPath().toString())
-+        .collect(java.util.stream.Collectors.toSet());
++  @Test
++  void minimalValidRequestHasNoViolations() {
++    assertThat(validate(new CreateUrlRequest(VALID_URL, null, null))).isEmpty();
 +  }
-+
-+  // --- valid input ---
 +
 +  @Test
 +  void fullValidRequestHasNoViolations() {
-+    CreateUrlRequest request =
-+        new CreateUrlRequest("https://example.com/some/path?q=1", "promo2024", FUTURE);
-+
-+    assertThat(validate(request)).isEmpty();
++    assertThat(validate(new CreateUrlRequest("http://example.org", "promo2024", FUTURE))).isEmpty();
 +  }
 +
-+  @Test
-+  void optionalFieldsMayBeNull() {
-+    assertThat(validate(new CreateUrlRequest("http://example.com", null, null))).isEmpty();
++  @ParameterizedTest
++  @ValueSource(strings = {"abc", "ABC123", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6"})
++  void aliasBoundariesThreeAndThirtyTwoCharactersAreAccepted(String alias) {
++    assertThat(alias.length()).isBetween(3, 32);
++    assertThat(validate(new CreateUrlRequest(VALID_URL, alias, null))).isEmpty();
 +  }
 +
 +  @Test
 +  void longUrlOfExactlyMaxLengthIsAccepted() {
-+    String url = "https://example.com/" + "a".repeat(CreateUrlRequest.LONG_URL_MAX_LENGTH - 20);
++    String url = padUrl(CreateUrlRequest.MAX_LONG_URL_LENGTH);
 +    assertThat(url).hasSize(2048);
-+
 +    assertThat(validate(new CreateUrlRequest(url, null, null))).isEmpty();
 +  }
 +
-+  // --- long_url (AC-2) ---
++  // --- long_url (AC-2) -------------------------------------------------------------------------
 +
-+  @Test
-+  void ftpSchemeIsRejected() {
-+    assertThat(violatedFields(new CreateUrlRequest("ftp://example.com/file", null, null)))
++  @ParameterizedTest
++  @ValueSource(strings = {"ftp://example.com/file", "mailto:someone@example.com", "example.com"})
++  void nonHttpSchemesAreRejected(String url) {
++    assertThat(violatedProperties(new CreateUrlRequest(url, null, null)))
++        .containsExactly("longUrl");
++  }
++
++  @ParameterizedTest
++  @ValueSource(strings = {"", "   "})
++  void blankLongUrlIsRejected(String url) {
++    assertThat(violatedProperties(new CreateUrlRequest(url, null, null)))
 +        .containsExactly("longUrl");
 +  }
 +
 +  @Test
-+  void otherNonHttpSchemesAndRelativeUrlsAreRejected() {
-+    for (String bad :
-+        new String[] {"javascript:alert(1)", "mailto:a@b.c", "example.com", "//example.com"}) {
-+      assertThat(violatedFields(new CreateUrlRequest(bad, null, null)))
-+          .as(bad)
-+          .containsExactly("longUrl");
-+    }
++  void nullLongUrlIsRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest(null, null, null)))
++        .containsExactly("longUrl");
 +  }
 +
 +  @Test
-+  void blankAndNullLongUrlAreRejected() {
-+    assertThat(violatedFields(new CreateUrlRequest(null, null, null))).containsExactly("longUrl");
-+    assertThat(violatedFields(new CreateUrlRequest("", null, null))).containsExactly("longUrl");
-+    assertThat(violatedFields(new CreateUrlRequest("   ", null, null))).containsExactly("longUrl");
-+  }
-+
-+  @Test
-+  void longUrlOverMaxLengthIsRejected() {
-+    String url = "https://example.com/" + "a".repeat(CreateUrlRequest.LONG_URL_MAX_LENGTH - 19);
++  void longUrlLongerThan2048CharactersIsRejected() {
++    String url = padUrl(CreateUrlRequest.MAX_LONG_URL_LENGTH + 1);
 +    assertThat(url).hasSize(2049);
-+
 +    Set<ConstraintViolation<CreateUrlRequest>> violations =
 +        validate(new CreateUrlRequest(url, null, null));
-+
 +    assertThat(violations).hasSize(1);
-+    assertThat(violations.iterator().next().getMessage()).contains("2048");
++    ConstraintViolation<CreateUrlRequest> violation = violations.iterator().next();
++    assertThat(violation.getPropertyPath()).hasToString("longUrl");
++    assertThat(violation.getMessage()).contains("2048");
 +  }
 +
-+  // --- custom_alias (AC-5) ---
++  // --- custom_alias (AC-5) ---------------------------------------------------------------------
 +
-+  @Test
-+  void aliasWithCharactersOutsideAlphanumericIsRejected() {
-+    for (String bad : new String[] {"promo-2024", "promo_2024", "prömo", "pro mo", "a/b/c"}) {
-+      assertThat(violatedFields(new CreateUrlRequest("https://example.com", bad, null)))
-+          .as(bad)
-+          .containsExactly("customAlias");
-+    }
++  @ParameterizedTest
++  @ValueSource(
++      strings = {"bad-alias", "under_score", "with space", "ünïcode", "dots.here", "a/b/c"})
++  void aliasWithCharactersOutsideAlphanumericIsRejected(String alias) {
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, alias, null)))
++        .containsExactly("customAlias");
 +  }
 +
 +  @Test
 +  void aliasOfLengthTwoIsRejected() {
-+    assertThat(violatedFields(new CreateUrlRequest("https://example.com", "ab", null)))
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, "ab", null)))
 +        .containsExactly("customAlias");
 +  }
 +
 +  @Test
 +  void aliasOfLengthThirtyThreeIsRejected() {
-+    assertThat(violatedFields(new CreateUrlRequest("https://example.com", "a".repeat(33), null)))
++    String alias = "a".repeat(33);
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, alias, null)))
 +        .containsExactly("customAlias");
 +  }
 +
 +  @Test
-+  void aliasBoundaryLengthsAreAccepted() {
-+    assertThat(validate(new CreateUrlRequest("https://example.com", "abc", null))).isEmpty();
-+    assertThat(validate(new CreateUrlRequest("https://example.com", "Z9".repeat(16), null)))
-+        .isEmpty();
++  void emptyAliasIsRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, "", null)))
++        .containsExactly("customAlias");
 +  }
 +
-+  // --- expiration_date (AC-6) ---
++  // --- expiration_date (AC-6) ------------------------------------------------------------------
 +
 +  @Test
 +  void pastExpirationDateIsRejected() {
-+    assertThat(violatedFields(new CreateUrlRequest("https://example.com", null, PAST)))
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, null, PAST)))
 +        .containsExactly("expirationDate");
 +  }
 +
 +  @Test
-+  void malformedExpirationDateIsRejectedWhileReadingJson() {
-+    String body = "{\"long_url\":\"https://example.com\",\"expiration_date\":\"next tuesday\"}";
-+
++  void malformedExpirationDateFailsJsonBinding() {
++    String body = "{\"long_url\":\"https://example.com\",\"expiration_date\":\"tomorrow\"}";
 +    assertThatThrownBy(() -> json.readValue(body, CreateUrlRequest.class))
 +        .isInstanceOf(JacksonException.class);
 +  }
 +
 +  @Test
-+  void dateOnlyExpirationDateIsRejectedWhileReadingJson() {
++  void dateWithoutOffsetFailsJsonBinding() {
 +    String body = "{\"long_url\":\"https://example.com\",\"expiration_date\":\"2030-01-01\"}";
-+
 +    assertThatThrownBy(() -> json.readValue(body, CreateUrlRequest.class))
 +        .isInstanceOf(JacksonException.class);
 +  }
 +
-+  @Test
-+  void everyInvalidFieldIsReportedTogether() {
-+    assertThat(violatedFields(new CreateUrlRequest("ftp://x", "a!", PAST)))
-+        .containsExactlyInAnyOrder("longUrl", "customAlias", "expirationDate");
-+  }
-+
-+  // --- JSON names are snake_case ---
++  // --- JSON names ------------------------------------------------------------------------------
 +
 +  @Test
-+  void requestBindsFromSnakeCaseJson() {
++  void bindsSnakeCaseJsonNames() {
 +    String body =
-+        "{\"long_url\":\"https://example.com/p\",\"custom_alias\":\"promo2024\","
++        "{\"long_url\":\"https://example.com/x\","
++            + "\"custom_alias\":\"promo2024\","
 +            + "\"expiration_date\":\"2030-01-01T00:00:00Z\"}";
 +
 +    CreateUrlRequest request = json.readValue(body, CreateUrlRequest.class);
 +
-+    assertThat(request.longUrl()).isEqualTo("https://example.com/p");
++    assertThat(request.longUrl()).isEqualTo("https://example.com/x");
 +    assertThat(request.customAlias()).isEqualTo("promo2024");
-+    assertThat(request.expirationDate().toInstant())
-+        .isEqualTo(OffsetDateTime.parse("2030-01-01T00:00:00Z").toInstant());
++    assertThat(request.expirationDate())
++        .isEqualTo(OffsetDateTime.of(2030, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC));
 +    assertThat(validate(request)).isEmpty();
 +  }
 +
 +  @Test
 +  void camelCaseJsonNamesAreNotBound() {
++    String body = "{\"longUrl\":\"https://example.com/x\"}";
++    // Unknown properties are ignored by the default mapper; the snake_case field stays unset.
 +    CreateUrlRequest request =
-+        json.readValue("{\"longUrl\":\"https://example.com/p\"}", CreateUrlRequest.class);
-+
++        JsonMapper.builder()
++            .disable(tools.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
++            .build()
++            .readValue(body, CreateUrlRequest.class);
 +    assertThat(request.longUrl()).isNull();
++    assertThat(violatedProperties(request)).containsExactly("longUrl");
 +  }
 +
 +  @Test
-+  void responseSerialisesWithSnakeCaseNames() {
-+    CreateUrlResponse response =
-+        new CreateUrlResponse(
-+            "http://localhost:8080/aB3x9",
-+            "aB3x9",
-+            "https://example.com/p",
-+            OffsetDateTime.parse("2030-01-01T00:00:00Z"),
-+            "redis");
++  void aggregatesAllViolationsInOnePass() {
++    CreateUrlRequest request = new CreateUrlRequest("ftp://x", "!!", PAST);
++    assertThat(violatedProperties(request))
++        .containsExactlyInAnyOrder("longUrl", "customAlias", "expirationDate");
++  }
 +
-+    String body = json.writeValueAsString(response);
++  // --- helpers ---------------------------------------------------------------------------------
 +
-+    assertThat(body)
-+        .contains("\"short_url\":\"http://localhost:8080/aB3x9\"")
-+        .contains("\"short_code\":\"aB3x9\"")
-+        .contains("\"long_url\":\"https://example.com/p\"")
-+        .contains("\"expires_at\":")
-+        .contains("\"code_source\":\"redis\"")
-+        .doesNotContain("shortUrl")
-+        .doesNotContain("codeSource");
++  private static Set<ConstraintViolation<CreateUrlRequest>> validate(CreateUrlRequest request) {
++    return validator.validate(request);
++  }
++
++  private static Set<String> violatedProperties(CreateUrlRequest request) {
++    return validate(request).stream()
++        .map(v -> v.getPropertyPath().toString())
++        .collect(java.util.stream.Collectors.toSet());
++  }
++
++  private static String padUrl(int totalLength) {
++    String prefix = "https://example.com/";
++    return prefix + "a".repeat(totalLength - prefix.length());
 +  }
 +}
 diff --git a/src/test/java/com/example/shortener/api/error/GlobalExceptionHandlerTest.java b/src/test/java/com/example/shortener/api/error/GlobalExceptionHandlerTest.java
 new file mode 100644
-index 0000000..a44cb44
+index 0000000..52e5bbb
 --- /dev/null
 +++ b/src/test/java/com/example/shortener/api/error/GlobalExceptionHandlerTest.java
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,306 @@
 +package com.example.shortener.api.error;
 +
 +import static org.assertj.core.api.Assertions.assertThat;
-+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
-+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
-+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
-+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
-+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
-+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
-+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 +
 +import com.example.shortener.api.dto.CreateUrlRequest;
-+import com.example.shortener.api.dto.CreateUrlResponse;
 +import jakarta.validation.Valid;
-+import java.time.OffsetDateTime;
-+import java.time.ZoneOffset;
-+import org.hamcrest.Matchers;
-+import org.junit.jupiter.api.BeforeEach;
++import java.time.Instant;
++import java.util.List;
 +import org.junit.jupiter.api.Test;
 +import org.springframework.http.HttpStatus;
 +import org.springframework.http.MediaType;
-+import org.springframework.http.ResponseEntity;
-+import org.springframework.test.web.servlet.MockMvc;
-+import org.springframework.test.web.servlet.MvcResult;
-+import org.springframework.test.web.servlet.ResultActions;
-+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++import org.springframework.test.web.servlet.assertj.MockMvcTester;
++import org.springframework.test.web.servlet.assertj.MvcTestResult;
 +import org.springframework.web.bind.annotation.GetMapping;
-+import org.springframework.web.bind.annotation.PathVariable;
 +import org.springframework.web.bind.annotation.PostMapping;
 +import org.springframework.web.bind.annotation.RequestBody;
 +import org.springframework.web.bind.annotation.RestController;
 +
 +/**
-+ * Every error the API can produce is rendered by {@link GlobalExceptionHandler} as {@code
-+ * application/problem+json} with type/title/status/detail/instance (AC-2, AC-5, AC-6, AC-16). Uses
-+ * a stub controller in a standalone MockMvc so no real controller, database or Redis is involved.
++ * Every mapped exception is rendered by {@link GlobalExceptionHandler} as {@code
++ * application/problem+json} with a consistent body and no internal details (AC-2, AC-5, AC-6,
++ * AC-16). Uses a standalone MockMvc with a throwing test controller; no Spring Boot context.
 + */
 +class GlobalExceptionHandlerTest {
 +
-+  private static final String PROBLEM_JSON = MediaType.APPLICATION_PROBLEM_JSON_VALUE;
-+  private static final String INTERNAL_MARKER = "connection to db-primary-01 refused";
++  private static final String SECRET = "internal-detail-that-must-not-leak";
 +
-+  private MockMvc mvc;
-+
-+  @BeforeEach
-+  void setUp() {
-+    mvc =
-+        MockMvcBuilders.standaloneSetup(new StubController())
-+            .setControllerAdvice(new GlobalExceptionHandler())
-+            .build();
-+  }
-+
-+  // --- happy path proves the stub itself is wired ---
-+
-+  @Test
-+  void validBodyReachesTheController() throws Exception {
-+    mvc.perform(
-+            post("/api/v1/urls")
-+                .contentType(MediaType.APPLICATION_JSON)
-+                .content(
-+                    "{\"long_url\":\"https://example.com/p\",\"custom_alias\":\"promo2024\","
-+                        + "\"expiration_date\":\"2030-01-01T00:00:00Z\"}"))
-+        .andExpect(status().isCreated())
-+        .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
-+        .andExpect(jsonPath("$.short_code").value("promo2024"))
-+        .andExpect(jsonPath("$.code_source").value("redis"))
-+        .andExpect(jsonPath("$.expires_at").value(Matchers.startsWith("2030-01-01T00:00")));
-+  }
-+
-+  // --- 400: Bean Validation (AC-2, AC-5, AC-6) ---
-+
-+  @Test
-+  void ftpLongUrlIsA400ValidationProblem() throws Exception {
-+    expectProblem(
-+            postJson("{\"long_url\":\"ftp://example.com/file\"}"),
-+            HttpStatus.BAD_REQUEST,
-+            GlobalExceptionHandler.VALIDATION_FAILED,
-+            "Validation failed",
-+            "/api/v1/urls")
-+        .andExpect(jsonPath("$.detail").value("long_url: must be an absolute http or https URL"));
-+  }
-+
-+  @Test
-+  void overlongLongUrlIsA400ValidationProblem() throws Exception {
-+    String url = "https://example.com/" + "a".repeat(2029);
-+
-+    expectProblem(
-+            postJson("{\"long_url\":\"" + url + "\"}"),
-+            HttpStatus.BAD_REQUEST,
-+            GlobalExceptionHandler.VALIDATION_FAILED,
-+            "Validation failed",
-+            "/api/v1/urls")
-+        .andExpect(jsonPath("$.detail").value(Matchers.containsString("long_url")))
-+        .andExpect(jsonPath("$.detail").value(Matchers.containsString("2048")));
-+  }
-+
-+  @Test
-+  void badAliasIsA400ValidationProblemNamingTheSnakeCaseField() throws Exception {
-+    expectProblem(
-+            postJson("{\"long_url\":\"https://example.com\",\"custom_alias\":\"ab\"}"),
-+            HttpStatus.BAD_REQUEST,
-+            GlobalExceptionHandler.VALIDATION_FAILED,
-+            "Validation failed",
-+            "/api/v1/urls")
-+        .andExpect(jsonPath("$.detail").value(Matchers.startsWith("custom_alias: ")))
-+        .andExpect(
-+            jsonPath("$.detail").value(Matchers.not(Matchers.containsString("customAlias"))));
-+  }
-+
-+  @Test
-+  void pastExpirationDateIsA400ValidationProblem() throws Exception {
-+    String past = OffsetDateTime.now(ZoneOffset.UTC).minusHours(1).toString();
-+
-+    expectProblem(
-+            postJson("{\"long_url\":\"https://example.com\",\"expiration_date\":\"" + past + "\"}"),
-+            HttpStatus.BAD_REQUEST,
-+            GlobalExceptionHandler.VALIDATION_FAILED,
-+            "Validation failed",
-+            "/api/v1/urls")
-+        .andExpect(jsonPath("$.detail").value("expiration_date: must be in the future"));
-+  }
-+
-+  @Test
-+  void multipleViolationsAreListedInOneDetail() throws Exception {
-+    expectProblem(
-+            postJson("{\"long_url\":\"\",\"custom_alias\":\"a-b\"}"),
-+            HttpStatus.BAD_REQUEST,
-+            GlobalExceptionHandler.VALIDATION_FAILED,
-+            "Validation failed",
-+            "/api/v1/urls")
-+        .andExpect(jsonPath("$.detail").value(Matchers.containsString("custom_alias: ")))
-+        .andExpect(jsonPath("$.detail").value(Matchers.containsString("long_url: ")))
-+        .andExpect(jsonPath("$.detail").value(Matchers.containsString("; ")));
-+  }
-+
-+  // --- 400: unreadable body / malformed ISO-8601 (AC-6) ---
-+
-+  @Test
-+  void malformedExpirationDateIsA400MalformedRequestProblem() throws Exception {
-+    MvcResult result =
-+        expectProblem(
-+                postJson(
-+                    "{\"long_url\":\"https://example.com\",\"expiration_date\":\"next tuesday\"}"),
-+                HttpStatus.BAD_REQUEST,
-+                GlobalExceptionHandler.MALFORMED_REQUEST,
-+                "Malformed request body",
-+                "/api/v1/urls")
-+            .andExpect(jsonPath("$.detail").value(Matchers.containsString("ISO-8601")))
-+            .andReturn();
-+
-+    assertNoInternalsLeaked(result);
-+  }
-+
-+  @Test
-+  void unreadableJsonIsA400MalformedRequestProblem() throws Exception {
-+    MvcResult result =
-+        expectProblem(
-+                postJson("{\"long_url\": \"https://example.com\""),
-+                HttpStatus.BAD_REQUEST,
-+                GlobalExceptionHandler.MALFORMED_REQUEST,
-+                "Malformed request body",
-+                "/api/v1/urls")
-+            .andReturn();
-+
-+    assertNoInternalsLeaked(result);
-+  }
-+
-+  @Test
-+  void emptyBodyIsA400MalformedRequestProblem() throws Exception {
-+    expectProblem(
-+        postJson(""),
-+        HttpStatus.BAD_REQUEST,
-+        GlobalExceptionHandler.MALFORMED_REQUEST,
-+        "Malformed request body",
-+        "/api/v1/urls");
-+  }
-+
-+  // --- explicit domain exceptions ---
-+
-+  @Test
-+  void invalidUrlExceptionIsA400WithItsMessageAsDetail() throws Exception {
-+    expectProblem(
-+            mvc.perform(get("/throw/invalid-url")),
-+            HttpStatus.BAD_REQUEST,
-+            GlobalExceptionHandler.INVALID_URL,
-+            "Invalid URL",
-+            "/throw/invalid-url")
-+        .andExpect(jsonPath("$.detail").value("long_url host must not be empty"));
-+  }
-+
-+  @Test
-+  void shortCodeNotFoundIsA404() throws Exception {
-+    expectProblem(
-+            mvc.perform(get("/throw/not-found")),
-+            HttpStatus.NOT_FOUND,
-+            GlobalExceptionHandler.SHORT_CODE_NOT_FOUND,
-+            "Short code not found",
-+            "/throw/not-found")
-+        .andExpect(jsonPath("$.detail").value("Short code 'nope42' was not found"));
-+  }
-+
-+  @Test
-+  void aliasAlreadyExistsIsA409() throws Exception {
-+    expectProblem(
-+            mvc.perform(get("/throw/alias-taken")),
-+            HttpStatus.CONFLICT,
-+            GlobalExceptionHandler.ALIAS_ALREADY_EXISTS,
-+            "Alias already exists",
-+            "/throw/alias-taken")
-+        .andExpect(jsonPath("$.detail").value("Alias 'promo2024' already exists"));
-+  }
-+
-+  @Test
-+  void shortCodeExpiredIsA410() throws Exception {
-+    expectProblem(
-+            mvc.perform(get("/throw/expired")),
-+            HttpStatus.GONE,
-+            GlobalExceptionHandler.SHORT_CODE_EXPIRED,
-+            "Short code expired",
-+            "/throw/expired")
-+        .andExpect(jsonPath("$.detail").value("Short code 'old123' has expired"));
-+  }
-+
-+  // --- 500 (AC-16): consistent body, nothing internal leaked ---
-+
-+  @Test
-+  void unhandledExceptionIsA500WithoutLeakingInternals() throws Exception {
-+    MvcResult result =
-+        expectProblem(
-+                mvc.perform(get("/throw/boom")),
-+                HttpStatus.INTERNAL_SERVER_ERROR,
-+                GlobalExceptionHandler.INTERNAL_ERROR,
-+                "Internal server error",
-+                "/throw/boom")
-+            .andExpect(jsonPath("$.detail").value(Matchers.not(Matchers.containsString("refused"))))
-+            .andReturn();
-+
-+    assertNoInternalsLeaked(result);
-+  }
-+
-+  @Test
-+  void unhandledErrorSubclassIsAlsoA500() throws Exception {
-+    MvcResult result =
-+        expectProblem(
-+                mvc.perform(get("/throw/error")),
-+                HttpStatus.INTERNAL_SERVER_ERROR,
-+                GlobalExceptionHandler.INTERNAL_ERROR,
-+                "Internal server error",
-+                "/throw/error")
-+            .andReturn();
-+
-+    assertNoInternalsLeaked(result);
-+  }
-+
-+  // --- exceptions raised by Spring MVC itself share the same shape ---
-+
-+  @Test
-+  void methodNotAllowedFromSpringIsRenderedWithTheSameShape() throws Exception {
-+    expectProblem(
-+        mvc.perform(delete("/api/v1/urls")),
-+        HttpStatus.METHOD_NOT_ALLOWED,
-+        "method-not-allowed",
-+        "Method Not Allowed",
-+        "/api/v1/urls");
-+  }
-+
-+  @Test
-+  void unsupportedMediaTypeFromSpringIsRenderedWithTheSameShape() throws Exception {
-+    expectProblem(
-+        mvc.perform(post("/api/v1/urls").contentType(MediaType.TEXT_PLAIN).content("long_url=x")),
-+        HttpStatus.UNSUPPORTED_MEDIA_TYPE,
-+        "unsupported-media-type",
-+        "Unsupported Media Type",
-+        "/api/v1/urls");
-+  }
-+
-+  // --- helpers ---
-+
-+  private ResultActions postJson(String body) throws Exception {
-+    return mvc.perform(post("/api/v1/urls").contentType(MediaType.APPLICATION_JSON).content(body));
-+  }
-+
-+  private static ResultActions expectProblem(
-+      ResultActions actions, HttpStatus status, String kind, String title, String instance)
-+      throws Exception {
-+    return actions
-+        .andExpect(status().is(status.value()))
-+        .andExpect(header().string("Content-Type", Matchers.startsWith(PROBLEM_JSON)))
-+        .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
-+        .andExpect(jsonPath("$.type").value(GlobalExceptionHandler.TYPE_BASE + kind))
-+        .andExpect(jsonPath("$.title").value(title))
-+        .andExpect(jsonPath("$.status").value(status.value()))
-+        .andExpect(jsonPath("$.detail").isString())
-+        .andExpect(jsonPath("$.detail").value(Matchers.not(Matchers.emptyString())))
-+        .andExpect(jsonPath("$.instance").value(instance));
-+  }
-+
-+  private static void assertNoInternalsLeaked(MvcResult result) throws Exception {
-+    String body = result.getResponse().getContentAsString();
-+
-+    assertThat(body)
-+        .doesNotContain(INTERNAL_MARKER)
-+        .doesNotContain("Exception")
-+        .doesNotContain("stackTrace")
-+        .doesNotContain("trace")
-+        .doesNotContain("com.example")
-+        .doesNotContain("tools.jackson")
-+        .doesNotContain("org.springframework")
-+        .doesNotContainPattern("\\bat \\w");
-+  }
-+
-+  /** Minimal stand-in for the real write/read controllers; only raises what the handler maps. */
 +  @RestController
-+  static class StubController {
++  static class ThrowingController {
 +
 +    @PostMapping(path = "/api/v1/urls", consumes = MediaType.APPLICATION_JSON_VALUE)
-+    ResponseEntity<CreateUrlResponse> create(@Valid @RequestBody CreateUrlRequest request) {
-+      String code = request.customAlias() == null ? "aB3x9" : request.customAlias();
-+      return ResponseEntity.status(HttpStatus.CREATED)
-+          .body(
-+              new CreateUrlResponse(
-+                  "http://localhost:8080/" + code,
-+                  code,
-+                  request.longUrl(),
-+                  request.expirationDate(),
-+                  "redis"));
++    String create(@Valid @RequestBody CreateUrlRequest request) {
++      return "created";
 +    }
 +
-+    @GetMapping("/throw/{kind}")
-+    String raise(@PathVariable String kind) {
-+      switch (kind) {
-+        case "invalid-url" -> throw new InvalidUrlException("long_url host must not be empty");
-+        case "not-found" -> throw new ShortCodeNotFoundException("nope42");
-+        case "alias-taken" -> throw new AliasAlreadyExistsException("promo2024");
-+        case "expired" -> throw new ShortCodeExpiredException("old123");
-+        case "boom" -> throw new IllegalStateException(INTERNAL_MARKER);
-+        case "error" -> throw new AssertionError(INTERNAL_MARKER);
-+        default -> {
-+          return "ok";
-+        }
-+      }
++    @GetMapping("/throw/invalid-url")
++    String invalidUrl() {
++      throw new InvalidUrlException("URL host must not be empty");
 +    }
++
++    @GetMapping("/throw/not-found")
++    String notFound() {
++      throw new ShortCodeNotFoundException("nope123");
++    }
++
++    @GetMapping("/throw/conflict")
++    String conflict() {
++      throw new AliasAlreadyExistsException("promo2024");
++    }
++
++    @GetMapping("/throw/expired")
++    String expired() {
++      throw new ShortCodeExpiredException("old456", Instant.parse("2020-01-01T00:00:00Z"));
++    }
++
++    @GetMapping("/throw/boom")
++    String boom() {
++      throw new IllegalStateException(SECRET);
++    }
++
++    @GetMapping("/throw/error")
++    String error() {
++      throw new StackOverflowError(SECRET);
++    }
++  }
++
++  private final MockMvcTester mvc =
++      MockMvcTester.of(
++          List.of(new ThrowingController()),
++          builder -> builder.setControllerAdvice(new GlobalExceptionHandler()).build());
++
++  // --- 400 -------------------------------------------------------------------------------------
++
++  @Test
++  void invalidLongUrlSchemeIsBadRequestProblem() {
++    MvcTestResult result = post("{\"long_url\":\"ftp://example.com/file\"}");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error", "Validation failed");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("long_url");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().doesNotContain("longUrl");
++  }
++
++  @Test
++  void tooLongUrlIsBadRequestProblem() {
++    String url = "https://example.com/" + "a".repeat(2048);
++    MvcTestResult result = post("{\"long_url\":\"" + url + "\"}");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error", "Validation failed");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("long_url");
++  }
++
++  @Test
++  void invalidAliasIsBadRequestProblem() {
++    MvcTestResult result =
++        post("{\"long_url\":\"https://example.com\",\"custom_alias\":\"bad-alias\"}");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error", "Validation failed");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("custom_alias");
++  }
++
++  @Test
++  void pastExpirationDateIsBadRequestProblem() {
++    MvcTestResult result =
++        post("{\"long_url\":\"https://example.com\",\"expiration_date\":\"2001-01-01T00:00:00Z\"}");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error", "Validation failed");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("expiration_date");
++  }
++
++  @Test
++  void multipleViolationsAreListedInDetail() {
++    MvcTestResult result =
++        post(
++            "{\"long_url\":\"ftp://x\",\"custom_alias\":\"!!\","
++                + "\"expiration_date\":\"2001-01-01T00:00:00Z\"}");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error", "Validation failed");
++    assertThat(result)
++        .bodyJson()
++        .extractingPath("$.detail")
++        .asString()
++        .contains("custom_alias: ", "expiration_date: ", "long_url: ");
++  }
++
++  @Test
++  void malformedIso8601ExpirationDateIsBadRequestProblem() {
++    MvcTestResult result =
++        post("{\"long_url\":\"https://example.com\",\"expiration_date\":\"tomorrow\"}");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "malformed-request", "Malformed request");
++    assertThat(result)
++        .bodyJson()
++        .extractingPath("$.detail")
++        .isEqualTo(GlobalExceptionHandler.DETAIL_MALFORMED_REQUEST);
++    // Jackson's own message (class names, line/column) must not be forwarded.
++    assertThat(body(result))
++        .doesNotContainIgnoringCase("jackson")
++        .doesNotContain("OffsetDateTime")
++        .doesNotContain("line:");
++  }
++
++  @Test
++  void unreadableJsonBodyIsBadRequestProblem() {
++    MvcTestResult result = post("{ this is not json");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "malformed-request", "Malformed request");
++    assertThat(body(result)).doesNotContainIgnoringCase("jackson");
++  }
++
++  @Test
++  void emptyBodyIsBadRequestProblem() {
++    MvcTestResult result = post("");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "malformed-request", "Malformed request");
++  }
++
++  @Test
++  void invalidUrlExceptionIsBadRequestProblem() {
++    MvcTestResult result = mvc.get().uri("/throw/invalid-url").exchange();
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "invalid-url", "Invalid URL");
++    assertThat(result)
++        .bodyJson()
++        .extractingPath("$.detail")
++        .isEqualTo("URL host must not be empty");
++    assertThat(result).bodyJson().extractingPath("$.instance").isEqualTo("/throw/invalid-url");
++  }
++
++  // --- 404 / 409 / 410 -------------------------------------------------------------------------
++
++  @Test
++  void shortCodeNotFoundIsNotFoundProblem() {
++    MvcTestResult result = mvc.get().uri("/throw/not-found").exchange();
++
++    assertProblem(result, HttpStatus.NOT_FOUND, "short-code-not-found", "Short code not found");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("nope123");
++    assertThat(result).bodyJson().extractingPath("$.instance").isEqualTo("/throw/not-found");
++  }
++
++  @Test
++  void aliasAlreadyExistsIsConflictProblem() {
++    MvcTestResult result = mvc.get().uri("/throw/conflict").exchange();
++
++    assertProblem(result, HttpStatus.CONFLICT, "alias-already-exists", "Alias already exists");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("promo2024");
++    assertThat(result).bodyJson().extractingPath("$.instance").isEqualTo("/throw/conflict");
++  }
++
++  @Test
++  void shortCodeExpiredIsGoneProblem() {
++    MvcTestResult result = mvc.get().uri("/throw/expired").exchange();
++
++    assertProblem(result, HttpStatus.GONE, "short-code-expired", "Short code expired");
++    assertThat(result)
++        .bodyJson()
++        .extractingPath("$.detail")
++        .asString()
++        .contains("old456", "2020-01-01T00:00:00Z");
++    assertThat(result).bodyJson().extractingPath("$.instance").isEqualTo("/throw/expired");
++  }
++
++  // --- 500 -------------------------------------------------------------------------------------
++
++  @Test
++  void unhandledExceptionIsInternalServerErrorProblemWithoutLeak() {
++    MvcTestResult result = mvc.get().uri("/throw/boom").exchange();
++
++    assertProblem(
++        result, HttpStatus.INTERNAL_SERVER_ERROR, "internal-error", "Internal server error");
++    assertThat(result)
++        .bodyJson()
++        .extractingPath("$.detail")
++        .isEqualTo(GlobalExceptionHandler.DETAIL_INTERNAL_ERROR);
++    assertThat(result).bodyJson().extractingPath("$.instance").isEqualTo("/throw/boom");
++    assertNoLeak(result);
++  }
++
++  @Test
++  void unhandledErrorIsInternalServerErrorProblemWithoutLeak() {
++    MvcTestResult result = mvc.get().uri("/throw/error").exchange();
++
++    assertProblem(
++        result, HttpStatus.INTERNAL_SERVER_ERROR, "internal-error", "Internal server error");
++    assertNoLeak(result);
++  }
++
++  // --- Spring MVC exceptions handled by the superclass keep the same shape --------------------
++
++  @Test
++  void unsupportedMediaTypeIsProblemJsonToo() {
++    MvcTestResult result =
++        mvc.post()
++            .uri("/api/v1/urls")
++            .contentType(MediaType.TEXT_PLAIN)
++            .content("long_url=https://example.com")
++            .exchange();
++
++    assertProblem(
++        result,
++        HttpStatus.UNSUPPORTED_MEDIA_TYPE,
++        "unsupported-media-type",
++        "Unsupported Media Type");
++    assertThat(result).bodyJson().extractingPath("$.instance").isEqualTo("/api/v1/urls");
++  }
++
++  @Test
++  void methodNotAllowedIsProblemJsonToo() {
++    MvcTestResult result = mvc.delete().uri("/api/v1/urls").exchange();
++
++    assertProblem(
++        result, HttpStatus.METHOD_NOT_ALLOWED, "method-not-allowed", "Method Not Allowed");
++  }
++
++  // --- helpers ---------------------------------------------------------------------------------
++
++  @Test
++  void jsonNameConvertsCamelCaseToSnakeCase() {
++    assertThat(GlobalExceptionHandler.jsonName("longUrl")).isEqualTo("long_url");
++    assertThat(GlobalExceptionHandler.jsonName("customAlias")).isEqualTo("custom_alias");
++    assertThat(GlobalExceptionHandler.jsonName("expirationDate")).isEqualTo("expiration_date");
++    assertThat(GlobalExceptionHandler.jsonName("plain")).isEqualTo("plain");
++  }
++
++  private MvcTestResult post(String body) {
++    return mvc.post()
++        .uri("/api/v1/urls")
++        .contentType(MediaType.APPLICATION_JSON)
++        .content(body)
++        .exchange();
++  }
++
++  private static void assertProblem(
++      MvcTestResult result, HttpStatus status, String typeSlug, String title) {
++    assertThat(result).hasStatus(status).hasContentType(MediaType.APPLICATION_PROBLEM_JSON);
++    assertThat(result).bodyJson().extractingPath("$.status").isEqualTo(status.value());
++    assertThat(result)
++        .bodyJson()
++        .extractingPath("$.type")
++        .isEqualTo(GlobalExceptionHandler.PROBLEM_TYPE_BASE + typeSlug);
++    assertThat(result).bodyJson().extractingPath("$.title").isEqualTo(title);
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().isNotBlank();
++    assertThat(result).bodyJson().extractingPath("$.instance").asString().isNotBlank();
++    assertThat(result).bodyJson().doesNotHavePath("$.stackTrace");
++    assertThat(result).bodyJson().doesNotHavePath("$.trace");
++    assertThat(result).bodyJson().doesNotHavePath("$.exception");
++    assertThat(result).bodyJson().doesNotHavePath("$.message");
++  }
++
++  private static String body(MvcTestResult result) {
++    try {
++      return result.getResponse().getContentAsString();
++    } catch (java.io.UnsupportedEncodingException e) {
++      throw new IllegalStateException(e);
++    }
++  }
++
++  private static void assertNoLeak(MvcTestResult result) {
++    assertThat(body(result))
++        .doesNotContain(SECRET)
++        .doesNotContain("IllegalStateException")
++        .doesNotContain("StackOverflowError")
++        .doesNotContain("ThrowingController")
++        .doesNotContain("java.lang")
++        .doesNotContain("com.example");
 +  }
 +}

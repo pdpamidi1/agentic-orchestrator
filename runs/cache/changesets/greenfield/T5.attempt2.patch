@@ -1,0 +1,971 @@
+diff --git a/src/main/java/com/example/shortener/write/UrlWriteController.java b/src/main/java/com/example/shortener/write/UrlWriteController.java
+new file mode 100644
+index 0000000..2c3cf9f
+--- /dev/null
++++ b/src/main/java/com/example/shortener/write/UrlWriteController.java
+@@ -0,0 +1,102 @@
++package com.example.shortener.write;
++
++import com.example.shortener.api.dto.CreateUrlRequest;
++import com.example.shortener.api.dto.CreateUrlResponse;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.media.Content;
++import io.swagger.v3.oas.annotations.media.Schema;
++import io.swagger.v3.oas.annotations.responses.ApiResponse;
++import io.swagger.v3.oas.annotations.responses.ApiResponses;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import java.net.URI;
++import java.util.Objects;
++import org.springframework.context.annotation.Profile;
++import org.springframework.http.MediaType;
++import org.springframework.http.ProblemDetail;
++import org.springframework.http.ResponseEntity;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * {@code POST /api/v1/urls} (operationId {@code createShortUrl}): the only write endpoint.
++ *
++ * <p>Registered under the default and {@code write} profiles and absent under the {@code read}
++ * profile, so a read-only instance answers 404 to this route (AC-14). The body is validated with
++ * {@code @Valid}; every non-2xx outcome (400 validation / malformed body, 409 taken alias, 500
++ * unexpected) is rendered by {@code GlobalExceptionHandler} as {@code application/problem+json}.
++ * This class never builds an error body itself.
++ */
++@RestController
++@Profile(UrlWriteController.PROFILE_EXPRESSION)
++@RequestMapping(path = UrlWriteController.PATH)
++@Tag(name = "urls", description = "Short link creation")
++public class UrlWriteController {
++
++  /** Profile expression: registered everywhere except on read-only instances. */
++  public static final String PROFILE_EXPRESSION = "!read";
++
++  /** Route of the write endpoint. */
++  public static final String PATH = "/api/v1/urls";
++
++  private final UrlWriteService service;
++
++  public UrlWriteController(UrlWriteService service) {
++    this.service = Objects.requireNonNull(service, "service");
++  }
++
++  /**
++   * Creates a short link for {@code long_url}, optionally with a custom alias and an expiry.
++   *
++   * @param request the validated request body
++   * @return 201 Created with the mapping and a {@code Location} header pointing at the short URL
++   */
++  @Operation(
++      operationId = "createShortUrl",
++      summary = "Create a short URL",
++      description =
++          "Shortens an absolute http/https URL. Uses custom_alias as the short code when supplied,"
++              + " otherwise allocates a base62 code. Identical long_urls are never deduplicated.")
++  @ApiResponses({
++    @ApiResponse(
++        responseCode = "201",
++        description = "Short URL created",
++        content =
++            @Content(
++                mediaType = MediaType.APPLICATION_JSON_VALUE,
++                schema = @Schema(implementation = CreateUrlResponse.class))),
++    @ApiResponse(
++        responseCode = "400",
++        description =
++            "Invalid long_url, custom_alias or expiration_date, or unreadable JSON body;"
++                + " nothing persisted",
++        content =
++            @Content(
++                mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
++                schema = @Schema(implementation = ProblemDetail.class))),
++    @ApiResponse(
++        responseCode = "409",
++        description = "custom_alias / short_code already taken; existing mapping unchanged",
++        content =
++            @Content(
++                mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
++                schema = @Schema(implementation = ProblemDetail.class))),
++    @ApiResponse(
++        responseCode = "500",
++        description = "Unhandled server error",
++        content =
++            @Content(
++                mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
++                schema = @Schema(implementation = ProblemDetail.class)))
++  })
++  @PostMapping(
++      consumes = MediaType.APPLICATION_JSON_VALUE,
++      produces = MediaType.APPLICATION_JSON_VALUE)
++  public ResponseEntity<CreateUrlResponse> createShortUrl(
++      @Valid @RequestBody CreateUrlRequest request) {
++    CreateUrlResponse response = service.create(request);
++    return ResponseEntity.created(URI.create(response.shortUrl())).body(response);
++  }
++}
+diff --git a/src/main/java/com/example/shortener/write/UrlWriteService.java b/src/main/java/com/example/shortener/write/UrlWriteService.java
+new file mode 100644
+index 0000000..56c2d80
+--- /dev/null
++++ b/src/main/java/com/example/shortener/write/UrlWriteService.java
+@@ -0,0 +1,212 @@
++package com.example.shortener.write;
++
++import com.example.shortener.api.dto.CreateUrlRequest;
++import com.example.shortener.api.dto.CreateUrlResponse;
++import com.example.shortener.api.error.AliasAlreadyExistsException;
++import com.example.shortener.api.error.InvalidUrlException;
++import com.example.shortener.codegen.AllocatedCode;
++import com.example.shortener.codegen.ShortCodeAllocator;
++import com.example.shortener.config.ShortenerProperties;
++import com.example.shortener.domain.CodeSource;
++import com.example.shortener.domain.UrlMapping;
++import com.example.shortener.domain.UrlMappingRepository;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.time.Clock;
++import java.time.Instant;
++import java.time.OffsetDateTime;
++import java.util.Locale;
++import java.util.Objects;
++import java.util.regex.Pattern;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DataIntegrityViolationException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++/**
++ * Write path of the shortener: turns a validated {@link CreateUrlRequest} into a persisted {@code
++ * urls} row and the {@link CreateUrlResponse} describing it (AC-1, AC-3, AC-4, AC-10, AC-11).
++ *
++ * <ul>
++ *   <li>When {@code custom_alias} is supplied it becomes the {@code short_code}; otherwise a base62
++ *       code is drawn from {@link ShortCodeAllocator}, which decides between the Redis counter and
++ *       the database sequence and reports the {@link CodeSource} that is persisted.
++ *   <li>A taken alias / short code is rejected twice: by a pre-check on the repository and, should
++ *       a concurrent writer win the race, by the primary-key violation raised while flushing the
++ *       insert. Both surface as {@link AliasAlreadyExistsException} (409) and the existing mapping
++ *       is left untouched.
++ *   <li>Identical {@code long_url}s are never deduplicated: every request without an alias
++ *       allocates a fresh, distinct code (AC-4).
++ *   <li>{@code created_by} is always left {@code null} (non-goal: no user attribution).
++ *   <li>{@code short_url} is the configured {@code shortener.base-url} plus {@code /} plus the
++ *       code.
++ * </ul>
++ *
++ * <p>A mapping created from a custom alias consumed no counter value. Because {@code
++ * urls.code_source} is constrained to the two counter names, such rows record {@link
++ * CodeSource#REDIS}, the primary source, as their nominal origin.
++ *
++ * <p>This class carries no web annotations; every non-2xx outcome is expressed as an exception that
++ * {@code GlobalExceptionHandler} renders as {@code application/problem+json}.
++ */
++@Service
++public class UrlWriteService {
++
++  /** {@code code_source} recorded for rows whose short code is a caller-supplied alias. */
++  static final CodeSource CUSTOM_ALIAS_CODE_SOURCE = CodeSource.REDIS;
++
++  static final String DETAIL_INVALID_LONG_URL =
++      "long_url must be an absolute http or https URL with a host";
++  static final String DETAIL_LONG_URL_TOO_LONG =
++      "long_url must be at most " + CreateUrlRequest.MAX_LONG_URL_LENGTH + " characters";
++  static final String DETAIL_INVALID_ALIAS =
++      "custom_alias must be 3 to 32 characters from [0-9a-zA-Z]";
++  static final String DETAIL_EXPIRY_NOT_IN_FUTURE = "expiration_date must be in the future";
++
++  private static final Pattern ALIAS = Pattern.compile(CreateUrlRequest.CUSTOM_ALIAS_PATTERN);
++
++  private static final Logger log = LoggerFactory.getLogger(UrlWriteService.class);
++
++  private final UrlMappingRepository repository;
++  private final ShortCodeAllocator allocator;
++  private final String baseUrl;
++  private final Clock clock;
++
++  /** Creates the service from the bound {@code shortener.*} properties and the system UTC clock. */
++  @Autowired
++  public UrlWriteService(
++      UrlMappingRepository repository,
++      ShortCodeAllocator allocator,
++      ShortenerProperties properties) {
++    this(
++        repository,
++        allocator,
++        Objects.requireNonNull(properties, "properties").baseUrl(),
++        Clock.systemUTC());
++  }
++
++  /**
++   * Creates the service with an explicit base URL and clock.
++   *
++   * @param repository the {@code urls} repository
++   * @param allocator the short-code allocator (Redis counter with DB-sequence fallback)
++   * @param baseUrl public base URL used to render {@code short_url}; trailing slashes are removed
++   * @param clock source of {@code created_at} and of the "now" used to check expiry
++   */
++  public UrlWriteService(
++      UrlMappingRepository repository, ShortCodeAllocator allocator, String baseUrl, Clock clock) {
++    this.repository = Objects.requireNonNull(repository, "repository");
++    this.allocator = Objects.requireNonNull(allocator, "allocator");
++    this.baseUrl = stripTrailingSlashes(Objects.requireNonNull(baseUrl, "baseUrl"));
++    this.clock = Objects.requireNonNull(clock, "clock");
++    if (this.baseUrl.isBlank()) {
++      throw new IllegalArgumentException("baseUrl must not be blank");
++    }
++  }
++
++  /** The base URL (without trailing slash) that short links are built from. */
++  public String baseUrl() {
++    return baseUrl;
++  }
++
++  /**
++   * Creates a new short link.
++   *
++   * @param request the validated request body
++   * @return the persisted mapping rendered as the 201 response body
++   * @throws InvalidUrlException when a semantic rule not covered by Bean Validation fails (400)
++   * @throws AliasAlreadyExistsException when the alias / short code is already taken (409)
++   */
++  @Transactional
++  public CreateUrlResponse create(CreateUrlRequest request) {
++    Objects.requireNonNull(request, "request");
++    String longUrl = requireValidLongUrl(request.longUrl());
++    Instant now = clock.instant();
++    Instant expiresAt = requireFutureExpiry(request.expirationDate(), now);
++
++    String shortCode;
++    CodeSource codeSource;
++    if (request.customAlias() != null) {
++      shortCode = requireAvailableAlias(request.customAlias());
++      codeSource = CUSTOM_ALIAS_CODE_SOURCE;
++    } else {
++      AllocatedCode allocated = allocator.allocate();
++      shortCode = allocated.code();
++      codeSource = allocated.codeSource();
++    }
++
++    UrlMapping mapping = new UrlMapping(shortCode, longUrl, now, expiresAt, codeSource);
++    try {
++      repository.saveAndFlush(mapping);
++    } catch (DataIntegrityViolationException raceLost) {
++      // A concurrent writer inserted the same short code between the pre-check and the flush; the
++      // transaction rolls back and the existing row is left untouched (AC-3).
++      log.info("Short code '{}' was taken concurrently; rejecting as conflict", shortCode);
++      throw new AliasAlreadyExistsException(shortCode);
++    }
++    log.debug("Created short code '{}' from {}", shortCode, codeSource.wireValue());
++    return new CreateUrlResponse(
++        shortUrl(shortCode), shortCode, longUrl, expiresAt, codeSource.wireValue());
++  }
++
++  /** Renders the public short link for a code: {@code <base-url>/<code>}. */
++  public String shortUrl(String shortCode) {
++    return baseUrl + "/" + Objects.requireNonNull(shortCode, "shortCode");
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // Semantic checks (defence in depth on top of the DTO's Bean Validation constraints)
++  // ---------------------------------------------------------------------------------------------
++
++  private static String requireValidLongUrl(String longUrl) {
++    if (longUrl == null || longUrl.isBlank()) {
++      throw new InvalidUrlException(DETAIL_INVALID_LONG_URL);
++    }
++    if (longUrl.length() > CreateUrlRequest.MAX_LONG_URL_LENGTH) {
++      throw new InvalidUrlException(DETAIL_LONG_URL_TOO_LONG);
++    }
++    URI uri;
++    try {
++      uri = new URI(longUrl);
++    } catch (URISyntaxException e) {
++      throw new InvalidUrlException(DETAIL_INVALID_LONG_URL, e);
++    }
++    String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
++    boolean httpScheme = scheme.equals("http") || scheme.equals("https");
++    if (!httpScheme || !uri.isAbsolute() || uri.getHost() == null || uri.getHost().isBlank()) {
++      throw new InvalidUrlException(DETAIL_INVALID_LONG_URL);
++    }
++    return longUrl;
++  }
++
++  private static Instant requireFutureExpiry(OffsetDateTime expirationDate, Instant now) {
++    if (expirationDate == null) {
++      return null;
++    }
++    Instant expiresAt = expirationDate.toInstant();
++    if (!expiresAt.isAfter(now)) {
++      throw new InvalidUrlException(DETAIL_EXPIRY_NOT_IN_FUTURE);
++    }
++    return expiresAt;
++  }
++
++  private String requireAvailableAlias(String alias) {
++    if (!ALIAS.matcher(alias).matches()) {
++      throw new InvalidUrlException(DETAIL_INVALID_ALIAS);
++    }
++    if (repository.existsByShortCode(alias)) {
++      throw new AliasAlreadyExistsException(alias);
++    }
++    return alias;
++  }
++
++  private static String stripTrailingSlashes(String value) {
++    String result = value.strip();
++    while (result.endsWith("/")) {
++      result = result.substring(0, result.length() - 1);
++    }
++    return result;
++  }
++}
+diff --git a/src/test/java/com/example/shortener/write/UrlWriteControllerTest.java b/src/test/java/com/example/shortener/write/UrlWriteControllerTest.java
+new file mode 100644
+index 0000000..ba5a0da
+--- /dev/null
++++ b/src/test/java/com/example/shortener/write/UrlWriteControllerTest.java
+@@ -0,0 +1,327 @@
++package com.example.shortener.write;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
++
++import com.example.shortener.api.dto.CreateUrlRequest;
++import com.example.shortener.api.dto.CreateUrlResponse;
++import com.example.shortener.api.error.AliasAlreadyExistsException;
++import com.example.shortener.api.error.GlobalExceptionHandler;
++import com.example.shortener.api.error.InvalidUrlException;
++import java.time.Instant;
++import java.util.List;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.ValueSource;
++import org.mockito.ArgumentCaptor;
++import org.springframework.boot.test.context.runner.ApplicationContextRunner;
++import org.springframework.context.annotation.Profile;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.assertj.MockMvcTester;
++import org.springframework.test.web.servlet.assertj.MvcTestResult;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * {@link UrlWriteController} behind a standalone MockMvc together with the real {@link
++ * GlobalExceptionHandler} (the Boot 4 {@code @WebMvcTest} slice module is not a declared
++ * dependency): 201 payload (AC-1), 400 problem+json with no persistence (AC-5 and the other
++ * validation rules), 409 (AC-3), 500 (AC-16) and profile gating (AC-14).
++ */
++class UrlWriteControllerTest {
++
++  private static final String LONG_URL = "https://example.com/some/path";
++  private static final Instant EXPIRES_AT = Instant.parse("2030-01-01T00:00:00Z");
++
++  /** Contract values of {@link GlobalExceptionHandler} (package-private there). */
++  private static final String PROBLEM_TYPE_BASE = "https://example.com/problems/";
++
++  private static final String DETAIL_MALFORMED_REQUEST =
++      "Request body is missing, malformed or contains a value of the wrong type";
++  private static final String DETAIL_INTERNAL_ERROR =
++      "An unexpected error occurred while processing the request";
++
++  private final UrlWriteService service = mock(UrlWriteService.class);
++
++  private final MockMvcTester mvc =
++      MockMvcTester.of(
++          List.of(new UrlWriteController(service)),
++          builder -> builder.setControllerAdvice(new GlobalExceptionHandler()).build());
++
++  // --- 201 (AC-1) ------------------------------------------------------------------------------
++
++  @Test
++  void createsShortUrlAndReturns201WithSnakeCasePayload() {
++    when(service.create(any()))
++        .thenReturn(
++            new CreateUrlResponse(
++                "http://localhost:8080/100001", "100001", LONG_URL, null, "redis"));
++
++    MvcTestResult result = post("{\"long_url\":\"" + LONG_URL + "\"}");
++
++    assertThat(result)
++        .hasStatus(HttpStatus.CREATED)
++        .hasContentTypeCompatibleWith(MediaType.APPLICATION_JSON);
++    assertThat(result)
++        .bodyJson()
++        .extractingPath("$.short_url")
++        .isEqualTo("http://localhost:8080/100001");
++    assertThat(result).bodyJson().extractingPath("$.short_code").isEqualTo("100001");
++    assertThat(result).bodyJson().extractingPath("$.long_url").isEqualTo(LONG_URL);
++    assertThat(result).bodyJson().extractingPath("$.expires_at").isNull();
++    assertThat(result).bodyJson().extractingPath("$.code_source").isEqualTo("redis");
++    assertThat(result).bodyJson().doesNotHavePath("$.shortUrl");
++    assertThat(result).headers().hasValue(HttpHeaders.LOCATION, "http://localhost:8080/100001");
++
++    ArgumentCaptor<CreateUrlRequest> captor = ArgumentCaptor.forClass(CreateUrlRequest.class);
++    verify(service).create(captor.capture());
++    assertThat(captor.getValue()).isEqualTo(new CreateUrlRequest(LONG_URL, null, null));
++  }
++
++  @Test
++  void passesAliasAndExpiryThroughAndRendersExpiresAt() {
++    when(service.create(any()))
++        .thenReturn(
++            new CreateUrlResponse(
++                "http://localhost:8080/promo2024", "promo2024", LONG_URL, EXPIRES_AT, "redis"));
++
++    MvcTestResult result =
++        post(
++            "{\"long_url\":\""
++                + LONG_URL
++                + "\",\"custom_alias\":\"promo2024\","
++                + "\"expiration_date\":\"2030-01-01T01:00:00+01:00\"}");
++
++    assertThat(result).hasStatus(HttpStatus.CREATED);
++    assertThat(result).bodyJson().extractingPath("$.short_code").isEqualTo("promo2024");
++    assertThat(result)
++        .bodyJson()
++        .extractingPath("$.expires_at")
++        .asString()
++        .startsWith("2030-01-01T00:00:00");
++
++    ArgumentCaptor<CreateUrlRequest> captor = ArgumentCaptor.forClass(CreateUrlRequest.class);
++    verify(service).create(captor.capture());
++    assertThat(captor.getValue().customAlias()).isEqualTo("promo2024");
++    assertThat(captor.getValue().expirationDate().toInstant()).isEqualTo(EXPIRES_AT);
++  }
++
++  @Test
++  void dbSequenceCodeSourceIsRenderedAsIs() {
++    when(service.create(any()))
++        .thenReturn(
++            new CreateUrlResponse(
++                "http://localhost:8080/1Xy9zQ", "1Xy9zQ", LONG_URL, null, "db_sequence"));
++
++    MvcTestResult result = post("{\"long_url\":\"" + LONG_URL + "\"}");
++
++    assertThat(result).hasStatus(HttpStatus.CREATED);
++    assertThat(result).bodyJson().extractingPath("$.code_source").isEqualTo("db_sequence");
++  }
++
++  // --- 400: validation failures never reach the service (nothing persisted) -------------------
++
++  @ParameterizedTest
++  @ValueSource(
++      strings = {
++        "{\"long_url\":\"ftp://example.com/file\"}",
++        "{\"long_url\":\"\"}",
++        "{\"long_url\":\"   \"}",
++        "{\"long_url\":\"not a url\"}",
++        "{}"
++      })
++  void invalidLongUrlIs400ValidationProblemAndNothingIsPersisted(String body) {
++    MvcTestResult result = post(body);
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("long_url");
++    verifyNoInteractions(service);
++  }
++
++  @Test
++  void tooLongLongUrlIs400AndNothingIsPersisted() {
++    MvcTestResult result = post("{\"long_url\":\"https://example.com/" + "a".repeat(2048) + "\"}");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("long_url");
++    verifyNoInteractions(service);
++  }
++
++  @ParameterizedTest
++  @ValueSource(strings = {"ab", "bad-alias", "with space", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q"})
++  void invalidCustomAliasIs400AndNothingIsPersisted(String alias) {
++    MvcTestResult result =
++        post("{\"long_url\":\"" + LONG_URL + "\",\"custom_alias\":\"" + alias + "\"}");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("custom_alias");
++    verifyNoInteractions(service);
++  }
++
++  @Test
++  void pastExpirationDateIs400AndNothingIsPersisted() {
++    MvcTestResult result =
++        post("{\"long_url\":\"" + LONG_URL + "\",\"expiration_date\":\"2001-01-01T00:00:00Z\"}");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("expiration_date");
++    verifyNoInteractions(service);
++  }
++
++  @ParameterizedTest
++  @ValueSource(
++      strings = {
++        "{\"long_url\":\"https://example.com\",\"expiration_date\":\"tomorrow\"}",
++        "{\"long_url\":\"https://example.com\",\"expiration_date\":\"2030-13-45\"}",
++        "{ this is not json",
++        "",
++        "[]",
++        "{\"long_url\":[\"https://example.com\"]}"
++      })
++  void malformedBodyIs400MalformedRequestProblemAndNothingIsPersisted(String body) {
++    MvcTestResult result = post(body);
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "malformed-request");
++    assertThat(result).bodyJson().extractingPath("$.detail").isEqualTo(DETAIL_MALFORMED_REQUEST);
++    verifyNoInteractions(service);
++  }
++
++  @Test
++  void semanticRejectionFromTheServiceIs400InvalidUrlProblem() {
++    when(service.create(any()))
++        .thenThrow(new InvalidUrlException(UrlWriteService.DETAIL_INVALID_LONG_URL));
++
++    // Passes the DTO's structural pattern but has no host: rejected by the service (AC-2 depth).
++    MvcTestResult result = post("{\"long_url\":\"https:///no-host\"}");
++
++    assertProblem(result, HttpStatus.BAD_REQUEST, "invalid-url");
++    verify(service).create(new CreateUrlRequest("https:///no-host", null, null));
++    assertThat(result)
++        .bodyJson()
++        .extractingPath("$.detail")
++        .isEqualTo(UrlWriteService.DETAIL_INVALID_LONG_URL);
++  }
++
++  // --- 409 (AC-3) ------------------------------------------------------------------------------
++
++  @Test
++  void takenAliasIs409ConflictProblem() {
++    when(service.create(any())).thenThrow(new AliasAlreadyExistsException("promo2024"));
++
++    MvcTestResult result =
++        post("{\"long_url\":\"" + LONG_URL + "\",\"custom_alias\":\"promo2024\"}");
++
++    assertProblem(result, HttpStatus.CONFLICT, "alias-already-exists");
++    assertThat(result).bodyJson().extractingPath("$.title").isEqualTo("Alias already exists");
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().contains("promo2024");
++  }
++
++  // --- 500 (AC-16) -----------------------------------------------------------------------------
++
++  @Test
++  void unexpectedServiceFailureIs500ProblemWithoutInternalDetails() {
++    when(service.create(any())).thenThrow(new IllegalStateException("connection pool exhausted"));
++
++    MvcTestResult result = post("{\"long_url\":\"" + LONG_URL + "\"}");
++
++    assertProblem(result, HttpStatus.INTERNAL_SERVER_ERROR, "internal-error");
++    assertThat(result).bodyJson().extractingPath("$.detail").isEqualTo(DETAIL_INTERNAL_ERROR);
++    assertThat(bodyOf(result))
++        .doesNotContain("connection pool exhausted")
++        .doesNotContain("IllegalStateException")
++        .doesNotContain("com.example");
++  }
++
++  // --- request shape -------------------------------------------------------------------------
++
++  @Test
++  void nonJsonContentTypeIs415ProblemAndNothingIsPersisted() {
++    MvcTestResult result =
++        mvc.post()
++            .uri(UrlWriteController.PATH)
++            .contentType(MediaType.TEXT_PLAIN)
++            .content("long_url=https://example.com")
++            .exchange();
++
++    assertProblem(result, HttpStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported-media-type");
++    verifyNoInteractions(service);
++  }
++
++  @Test
++  void getOnTheWriteRouteIsMethodNotAllowed() {
++    MvcTestResult result = mvc.get().uri(UrlWriteController.PATH).exchange();
++
++    assertProblem(result, HttpStatus.METHOD_NOT_ALLOWED, "method-not-allowed");
++  }
++
++  // --- profile gating (AC-14) ------------------------------------------------------------------
++
++  @Test
++  void controllerIsGatedOnNotReadProfileAndMapsPostApiV1Urls() throws NoSuchMethodException {
++    Profile profile = UrlWriteController.class.getAnnotation(Profile.class);
++    assertThat(profile).isNotNull();
++    assertThat(profile.value()).containsExactly("!read");
++    assertThat(UrlWriteController.class.isAnnotationPresent(RestController.class)).isTrue();
++    assertThat(UrlWriteController.class.getAnnotation(RequestMapping.class).path())
++        .containsExactly("/api/v1/urls");
++    PostMapping mapping =
++        UrlWriteController.class
++            .getMethod("createShortUrl", CreateUrlRequest.class)
++            .getAnnotation(PostMapping.class);
++    assertThat(mapping).isNotNull();
++    assertThat(mapping.path()).isEmpty();
++  }
++
++  @Test
++  void controllerIsAbsentUnderTheReadProfileAndPresentOtherwise() {
++    ApplicationContextRunner runner =
++        new ApplicationContextRunner()
++            .withBean(UrlWriteService.class, () -> mock(UrlWriteService.class))
++            .withUserConfiguration(UrlWriteController.class);
++
++    runner
++        .withPropertyValues("spring.profiles.active=read")
++        .run(context -> assertThat(context).doesNotHaveBean(UrlWriteController.class));
++    runner
++        .withPropertyValues("spring.profiles.active=write")
++        .run(context -> assertThat(context).hasSingleBean(UrlWriteController.class));
++    runner.run(context -> assertThat(context).hasSingleBean(UrlWriteController.class));
++  }
++
++  // --- helpers ---------------------------------------------------------------------------------
++
++  private MvcTestResult post(String body) {
++    return mvc.post()
++        .uri(UrlWriteController.PATH)
++        .contentType(MediaType.APPLICATION_JSON)
++        .content(body)
++        .exchange();
++  }
++
++  private static void assertProblem(MvcTestResult result, HttpStatus status, String typeSlug) {
++    assertThat(result).hasStatus(status).hasContentType(MediaType.APPLICATION_PROBLEM_JSON);
++    assertThat(result).bodyJson().extractingPath("$.status").isEqualTo(status.value());
++    assertThat(result).bodyJson().extractingPath("$.type").isEqualTo(PROBLEM_TYPE_BASE + typeSlug);
++    assertThat(result).bodyJson().extractingPath("$.title").asString().isNotBlank();
++    assertThat(result).bodyJson().extractingPath("$.detail").asString().isNotBlank();
++    assertThat(result).bodyJson().extractingPath("$.instance").isEqualTo(UrlWriteController.PATH);
++    assertThat(result).bodyJson().doesNotHavePath("$.stackTrace");
++    assertThat(result).bodyJson().doesNotHavePath("$.trace");
++    assertThat(result).bodyJson().doesNotHavePath("$.exception");
++  }
++
++  private static String bodyOf(MvcTestResult result) {
++    try {
++      return result.getResponse().getContentAsString();
++    } catch (java.io.UnsupportedEncodingException e) {
++      throw new IllegalStateException(e);
++    }
++  }
++}
+diff --git a/src/test/java/com/example/shortener/write/UrlWriteServiceTest.java b/src/test/java/com/example/shortener/write/UrlWriteServiceTest.java
+new file mode 100644
+index 0000000..aacdbe3
+--- /dev/null
++++ b/src/test/java/com/example/shortener/write/UrlWriteServiceTest.java
+@@ -0,0 +1,306 @@
++package com.example.shortener.write;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
++import static org.assertj.core.api.Assertions.assertThatNullPointerException;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
++
++import com.example.shortener.api.dto.CreateUrlRequest;
++import com.example.shortener.api.dto.CreateUrlResponse;
++import com.example.shortener.api.error.AliasAlreadyExistsException;
++import com.example.shortener.api.error.InvalidUrlException;
++import com.example.shortener.codegen.AllocatedCode;
++import com.example.shortener.codegen.ShortCodeAllocator;
++import com.example.shortener.config.ShortenerProperties;
++import com.example.shortener.domain.CodeSource;
++import com.example.shortener.domain.UrlMapping;
++import com.example.shortener.domain.UrlMappingRepository;
++import java.time.Clock;
++import java.time.Duration;
++import java.time.Instant;
++import java.time.OffsetDateTime;
++import java.time.ZoneOffset;
++import java.util.List;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.ValueSource;
++import org.mockito.ArgumentCaptor;
++import org.springframework.dao.DataIntegrityViolationException;
++import org.springframework.transaction.annotation.Transactional;
++
++/**
++ * {@link UrlWriteService} with a mocked repository and allocator: success (AC-1), alias conflict
++ * (AC-3), no deduplication (AC-4), recorded {@code code_source} for both counters (AC-10, AC-11).
++ */
++class UrlWriteServiceTest {
++
++  private static final Instant NOW = Instant.parse("2026-09-14T10:15:30Z");
++  private static final String LONG_URL = "https://example.com/some/path";
++  private static final String BASE_URL = "http://localhost:8080";
++
++  private final UrlMappingRepository repository = mock(UrlMappingRepository.class);
++  private final ShortCodeAllocator allocator = mock(ShortCodeAllocator.class);
++  private final UrlWriteService service =
++      new UrlWriteService(repository, allocator, BASE_URL, Clock.fixed(NOW, ZoneOffset.UTC));
++
++  // --- success (AC-1, AC-10) -------------------------------------------------------------------
++
++  @Test
++  void persistsAllocatedRedisCodeAndReturnsShortUrlFromBaseUrl() {
++    when(allocator.allocate()).thenReturn(new AllocatedCode("100001", CodeSource.REDIS));
++
++    CreateUrlResponse response = service.create(new CreateUrlRequest(LONG_URL, null, null));
++
++    assertThat(response.shortCode()).isEqualTo("100001");
++    assertThat(response.shortUrl()).isEqualTo("http://localhost:8080/100001");
++    assertThat(response.longUrl()).isEqualTo(LONG_URL);
++    assertThat(response.expiresAt()).isNull();
++    assertThat(response.codeSource()).isEqualTo("redis");
++
++    UrlMapping saved = savedMapping();
++    assertThat(saved.getShortCode()).isEqualTo("100001");
++    assertThat(saved.getLongUrl()).isEqualTo(LONG_URL);
++    assertThat(saved.getCreatedAt()).isEqualTo(NOW);
++    assertThat(saved.getExpiresAt()).isNull();
++    assertThat(saved.getCreatedBy()).isNull();
++    assertThat(saved.getCodeSource()).isEqualTo(CodeSource.REDIS);
++    verify(repository, never()).existsByShortCode(any());
++  }
++
++  @Test
++  void persistsExpiryAsInstantAndEchoesItInTheResponse() {
++    OffsetDateTime expiry = OffsetDateTime.of(2030, 1, 1, 12, 0, 0, 0, ZoneOffset.ofHours(2));
++    when(allocator.allocate()).thenReturn(new AllocatedCode("100002", CodeSource.REDIS));
++
++    CreateUrlResponse response = service.create(new CreateUrlRequest(LONG_URL, null, expiry));
++
++    Instant expected = Instant.parse("2030-01-01T10:00:00Z");
++    assertThat(response.expiresAt()).isEqualTo(expected);
++    assertThat(savedMapping().getExpiresAt()).isEqualTo(expected);
++  }
++
++  @Test
++  void usesCustomAliasAsShortCodeWithoutAllocatingACode() {
++    when(repository.existsByShortCode("promo2024")).thenReturn(false);
++
++    CreateUrlResponse response = service.create(new CreateUrlRequest(LONG_URL, "promo2024", null));
++
++    assertThat(response.shortCode()).isEqualTo("promo2024");
++    assertThat(response.shortUrl()).isEqualTo("http://localhost:8080/promo2024");
++    assertThat(response.codeSource())
++        .isEqualTo(UrlWriteService.CUSTOM_ALIAS_CODE_SOURCE.wireValue());
++    UrlMapping saved = savedMapping();
++    assertThat(saved.getShortCode()).isEqualTo("promo2024");
++    assertThat(saved.getCreatedBy()).isNull();
++    assertThat(saved.getCodeSource()).isEqualTo(UrlWriteService.CUSTOM_ALIAS_CODE_SOURCE);
++    verifyNoInteractions(allocator);
++  }
++
++  @Test
++  void buildsShortUrlFromConfiguredPropertiesWithoutTrailingSlash() {
++    ShortenerProperties properties =
++        new ShortenerProperties("https://sho.rt/", 1000, Duration.ofHours(24), 916_132_832L);
++    UrlWriteService configured = new UrlWriteService(repository, allocator, properties);
++    when(allocator.allocate()).thenReturn(new AllocatedCode("abc123", CodeSource.REDIS));
++
++    assertThat(configured.baseUrl()).isEqualTo("https://sho.rt");
++    assertThat(configured.create(new CreateUrlRequest(LONG_URL, null, null)).shortUrl())
++        .isEqualTo("https://sho.rt/abc123");
++    assertThat(
++            new UrlWriteService(repository, allocator, "http://x//", Clock.systemUTC()).baseUrl())
++        .isEqualTo("http://x");
++  }
++
++  // --- alias conflict (AC-3) -------------------------------------------------------------------
++
++  @Test
++  void takenAliasIsRejectedByPreCheckAndNothingIsPersisted() {
++    when(repository.existsByShortCode("promo2024")).thenReturn(true);
++
++    assertThatThrownBy(() -> service.create(new CreateUrlRequest(LONG_URL, "promo2024", null)))
++        .isInstanceOf(AliasAlreadyExistsException.class)
++        .hasMessageContaining("promo2024");
++
++    verify(repository, never()).saveAndFlush(any());
++    verify(repository, never()).save(any());
++    verifyNoInteractions(allocator);
++  }
++
++  @Test
++  void primaryKeyViolationOnFlushIsRejectedAsConflict() {
++    when(repository.existsByShortCode("promo2024")).thenReturn(false);
++    when(repository.saveAndFlush(any(UrlMapping.class)))
++        .thenThrow(new DataIntegrityViolationException("duplicate key value violates pk_urls"));
++
++    assertThatThrownBy(() -> service.create(new CreateUrlRequest(LONG_URL, "promo2024", null)))
++        .isInstanceOf(AliasAlreadyExistsException.class)
++        .hasMessageContaining("promo2024")
++        .hasMessageNotContaining("pk_urls");
++  }
++
++  @Test
++  void generatedCodeCollisionOnFlushIsRejectedAsConflictToo() {
++    when(allocator.allocate()).thenReturn(new AllocatedCode("100001", CodeSource.REDIS));
++    when(repository.saveAndFlush(any(UrlMapping.class)))
++        .thenThrow(new DataIntegrityViolationException("duplicate key"));
++
++    assertThatThrownBy(() -> service.create(new CreateUrlRequest(LONG_URL, null, null)))
++        .isInstanceOf(AliasAlreadyExistsException.class)
++        .hasMessageContaining("100001");
++  }
++
++  // --- no deduplication (AC-4) -----------------------------------------------------------------
++
++  @Test
++  void repostingTheSameLongUrlAllocatesANewDistinctCodeEveryTime() {
++    when(allocator.allocate())
++        .thenReturn(new AllocatedCode("100001", CodeSource.REDIS))
++        .thenReturn(new AllocatedCode("100002", CodeSource.REDIS))
++        .thenReturn(new AllocatedCode("100003", CodeSource.REDIS));
++    CreateUrlRequest request = new CreateUrlRequest(LONG_URL, null, null);
++
++    List<String> codes =
++        List.of(
++            service.create(request).shortCode(),
++            service.create(request).shortCode(),
++            service.create(request).shortCode());
++
++    assertThat(codes).containsExactly("100001", "100002", "100003").doesNotHaveDuplicates();
++    verify(allocator, times(3)).allocate();
++    ArgumentCaptor<UrlMapping> captor = ArgumentCaptor.forClass(UrlMapping.class);
++    verify(repository, times(3)).saveAndFlush(captor.capture());
++    assertThat(captor.getAllValues()).extracting(UrlMapping::getLongUrl).containsOnly(LONG_URL);
++    assertThat(captor.getAllValues())
++        .extracting(UrlMapping::getShortCode)
++        .containsExactly("100001", "100002", "100003");
++    verify(repository, never()).existsByShortCode(any());
++  }
++
++  // --- db_sequence fallback (AC-11) ------------------------------------------------------------
++
++  @Test
++  void persistsDbSequenceCodeSourceWhenTheAllocatorFellBack() {
++    when(allocator.allocate()).thenReturn(new AllocatedCode("1Xy9zQ", CodeSource.DB_SEQUENCE));
++
++    CreateUrlResponse response = service.create(new CreateUrlRequest(LONG_URL, null, null));
++
++    assertThat(response.shortCode()).isEqualTo("1Xy9zQ");
++    assertThat(response.shortUrl()).isEqualTo("http://localhost:8080/1Xy9zQ");
++    assertThat(response.codeSource()).isEqualTo("db_sequence");
++    UrlMapping saved = savedMapping();
++    assertThat(saved.getCodeSource()).isEqualTo(CodeSource.DB_SEQUENCE);
++    assertThat(saved.getShortCode()).isEqualTo("1Xy9zQ");
++    assertThat(saved.getCreatedBy()).isNull();
++  }
++
++  @Test
++  void allocatorFailurePropagatesAndNothingIsPersisted() {
++    when(allocator.allocate()).thenThrow(new IllegalStateException("both counters down"));
++
++    assertThatThrownBy(() -> service.create(new CreateUrlRequest(LONG_URL, null, null)))
++        .isInstanceOf(IllegalStateException.class);
++
++    verify(repository, never()).saveAndFlush(any());
++  }
++
++  // --- semantic checks beyond Bean Validation --------------------------------------------------
++
++  @ParameterizedTest
++  @ValueSource(
++      strings = {
++        "ftp://example.com/file",
++        "https://",
++        "https:///path-without-host",
++        "http:// example.com",
++        "example.com/no-scheme",
++        "   ",
++        "HTTPS://"
++      })
++  void semanticallyInvalidLongUrlIsRejectedBeforeAllocation(String longUrl) {
++    assertThatThrownBy(() -> service.create(new CreateUrlRequest(longUrl, null, null)))
++        .isInstanceOf(InvalidUrlException.class)
++        .hasMessage(UrlWriteService.DETAIL_INVALID_LONG_URL);
++
++    verifyNoInteractions(allocator, repository);
++  }
++
++  @Test
++  void overlongLongUrlIsRejected() {
++    String url = "https://example.com/" + "a".repeat(2048);
++
++    assertThatThrownBy(() -> service.create(new CreateUrlRequest(url, null, null)))
++        .isInstanceOf(InvalidUrlException.class)
++        .hasMessage(UrlWriteService.DETAIL_LONG_URL_TOO_LONG);
++    verifyNoInteractions(allocator, repository);
++  }
++
++  @Test
++  void upperCaseSchemeWithHostIsAccepted() {
++    when(allocator.allocate()).thenReturn(new AllocatedCode("100009", CodeSource.REDIS));
++
++    assertThat(service.create(new CreateUrlRequest("HTTP://Example.com", null, null)).longUrl())
++        .isEqualTo("HTTP://Example.com");
++  }
++
++  @Test
++  void expiryAtOrBeforeNowIsRejected() {
++    OffsetDateTime atNow = NOW.atOffset(ZoneOffset.UTC);
++
++    assertThatThrownBy(() -> service.create(new CreateUrlRequest(LONG_URL, null, atNow)))
++        .isInstanceOf(InvalidUrlException.class)
++        .hasMessage(UrlWriteService.DETAIL_EXPIRY_NOT_IN_FUTURE);
++    assertThatThrownBy(
++            () -> service.create(new CreateUrlRequest(LONG_URL, null, atNow.minusSeconds(1))))
++        .isInstanceOf(InvalidUrlException.class);
++    verifyNoInteractions(allocator, repository);
++  }
++
++  @ParameterizedTest
++  @ValueSource(strings = {"ab", "bad-alias", "with space", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q"})
++  void malformedAliasIsRejectedWithoutTouchingTheRepository(String alias) {
++    assertThatThrownBy(() -> service.create(new CreateUrlRequest(LONG_URL, alias, null)))
++        .isInstanceOf(InvalidUrlException.class)
++        .hasMessage(UrlWriteService.DETAIL_INVALID_ALIAS);
++    verifyNoInteractions(allocator, repository);
++  }
++
++  // --- construction / wiring -------------------------------------------------------------------
++
++  @Test
++  void createIsTransactional() throws NoSuchMethodException {
++    assertThat(
++            UrlWriteService.class
++                .getMethod("create", CreateUrlRequest.class)
++                .isAnnotationPresent(Transactional.class))
++        .isTrue();
++  }
++
++  @Test
++  void rejectsMissingCollaborators() {
++    Clock clock = Clock.systemUTC();
++    assertThatNullPointerException()
++        .isThrownBy(() -> new UrlWriteService(null, allocator, BASE_URL, clock));
++    assertThatNullPointerException()
++        .isThrownBy(() -> new UrlWriteService(repository, null, BASE_URL, clock));
++    assertThatNullPointerException()
++        .isThrownBy(() -> new UrlWriteService(repository, allocator, null, clock));
++    assertThatNullPointerException()
++        .isThrownBy(() -> new UrlWriteService(repository, allocator, BASE_URL, null));
++    assertThatNullPointerException().isThrownBy(() -> service.create(null));
++    assertThatIllegalArgumentException()
++        .isThrownBy(() -> new UrlWriteService(repository, allocator, " / ", clock));
++  }
++
++  private UrlMapping savedMapping() {
++    ArgumentCaptor<UrlMapping> captor = ArgumentCaptor.forClass(UrlMapping.class);
++    verify(repository).saveAndFlush(captor.capture());
++    return captor.getValue();
++  }
++}

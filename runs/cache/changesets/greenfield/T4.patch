@@ -1,0 +1,1149 @@
+diff --git a/src/main/java/com/example/shortener/codegen/AllocatedCode.java b/src/main/java/com/example/shortener/codegen/AllocatedCode.java
+new file mode 100644
+index 0000000..10956bb
+--- /dev/null
++++ b/src/main/java/com/example/shortener/codegen/AllocatedCode.java
+@@ -0,0 +1,22 @@
++package com.example.shortener.codegen;
++
++import com.example.shortener.domain.CodeSource;
++import java.util.Objects;
++
++/**
++ * A freshly allocated short code together with the counter that produced it.
++ *
++ * @param code base62 short code (at least three characters, AMB-11)
++ * @param codeSource which counter produced the code; persisted in {@code urls.code_source}
++ */
++public record AllocatedCode(String code, CodeSource codeSource) {
++
++  /** Canonical constructor; rejects null or blank components. */
++  public AllocatedCode {
++    Objects.requireNonNull(code, "code");
++    Objects.requireNonNull(codeSource, "codeSource");
++    if (code.isBlank()) {
++      throw new IllegalArgumentException("code must not be blank");
++    }
++  }
++}
+diff --git a/src/main/java/com/example/shortener/codegen/Base62Codec.java b/src/main/java/com/example/shortener/codegen/Base62Codec.java
+new file mode 100644
+index 0000000..7aad9de
+--- /dev/null
++++ b/src/main/java/com/example/shortener/codegen/Base62Codec.java
+@@ -0,0 +1,112 @@
++package com.example.shortener.codegen;
++
++import java.util.Objects;
++
++/**
++ * Encodes non-negative counter values as base62 strings over the alphabet {@code [0-9a-zA-Z]} and
++ * decodes them back (AC-10).
++ *
++ * <p>The codec itself never pads: the minimum code length required by AMB-11 is obtained by adding
++ * {@code shortener.counter-seed-offset} to the raw counter value <em>before</em> encoding (see
++ * {@link ShortCodeAllocator}). {@link #MIN_OFFSET_FOR_THREE_CHARS} is the smallest offset that
++ * guarantees three characters for every non-negative counter value.
++ */
++public final class Base62Codec {
++
++  /** The 62-symbol alphabet; the index of a character is its digit value. */
++  public static final String ALPHABET =
++      "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
++
++  /** The radix, {@code 62}. */
++  public static final int RADIX = ALPHABET.length();
++
++  /** {@code 62^2}: the smallest value whose base62 encoding is three characters long. */
++  public static final long MIN_OFFSET_FOR_THREE_CHARS = (long) RADIX * RADIX;
++
++  private static final int[] DIGIT_VALUES = buildDigitValues();
++
++  private Base62Codec() {}
++
++  /**
++   * Encodes a non-negative value.
++   *
++   * @param value counter value, {@code >= 0}
++   * @return the base62 representation without leading zeros ({@code 0} encodes as {@code "0"})
++   * @throws IllegalArgumentException when {@code value} is negative
++   */
++  public static String encode(long value) {
++    if (value < 0) {
++      throw new IllegalArgumentException("value must be >= 0 but was " + value);
++    }
++    if (value == 0) {
++      return String.valueOf(ALPHABET.charAt(0));
++    }
++    // A long never needs more than 11 base62 digits.
++    char[] buffer = new char[11];
++    int position = buffer.length;
++    long remaining = value;
++    while (remaining > 0) {
++      buffer[--position] = ALPHABET.charAt((int) (remaining % RADIX));
++      remaining /= RADIX;
++    }
++    return new String(buffer, position, buffer.length - position);
++  }
++
++  /**
++   * Decodes a base62 string produced by {@link #encode(long)}.
++   *
++   * @param code non-empty string over {@code [0-9a-zA-Z]}
++   * @return the decoded value
++   * @throws IllegalArgumentException when the string is empty, contains a character outside the
++   *     alphabet, or overflows a {@code long}
++   */
++  public static long decode(String code) {
++    Objects.requireNonNull(code, "code");
++    if (code.isEmpty()) {
++      throw new IllegalArgumentException("code must not be empty");
++    }
++    long value = 0;
++    for (int i = 0; i < code.length(); i++) {
++      int digit = digitValue(code.charAt(i));
++      try {
++        value = Math.addExact(Math.multiplyExact(value, RADIX), digit);
++      } catch (ArithmeticException e) {
++        throw new IllegalArgumentException("code overflows a long: " + code, e);
++      }
++    }
++    return value;
++  }
++
++  /**
++   * Whether every character of {@code code} belongs to the alphabet (and the code is non-empty).
++   */
++  public static boolean isValid(String code) {
++    if (code == null || code.isEmpty()) {
++      return false;
++    }
++    for (int i = 0; i < code.length(); i++) {
++      char c = code.charAt(i);
++      if (c >= DIGIT_VALUES.length || DIGIT_VALUES[c] < 0) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  private static int digitValue(char c) {
++    int digit = c < DIGIT_VALUES.length ? DIGIT_VALUES[c] : -1;
++    if (digit < 0) {
++      throw new IllegalArgumentException("character outside the base62 alphabet: '" + c + "'");
++    }
++    return digit;
++  }
++
++  private static int[] buildDigitValues() {
++    int[] table = new int[128];
++    java.util.Arrays.fill(table, -1);
++    for (int i = 0; i < ALPHABET.length(); i++) {
++      table[ALPHABET.charAt(i)] = i;
++    }
++    return table;
++  }
++}
+diff --git a/src/main/java/com/example/shortener/codegen/CounterSource.java b/src/main/java/com/example/shortener/codegen/CounterSource.java
+new file mode 100644
+index 0000000..5e3c555
+--- /dev/null
++++ b/src/main/java/com/example/shortener/codegen/CounterSource.java
+@@ -0,0 +1,25 @@
++package com.example.shortener.codegen;
++
++import com.example.shortener.domain.CodeSource;
++
++/**
++ * A monotonically increasing source of raw counter values used to derive short codes.
++ *
++ * <p>Implementations must never hand out the same value twice for the lifetime of the backing
++ * store. Gaps are acceptable (AMB-10). Infrastructure failures are reported by throwing an
++ * unchecked exception; the decision whether to fall back to another source belongs to {@link
++ * ShortCodeAllocator}, not to the source.
++ */
++public interface CounterSource {
++
++  /**
++   * Returns the next raw counter value.
++   *
++   * @return a value strictly greater than every value previously returned by this source
++   * @throws RuntimeException when the backing store is unavailable or times out
++   */
++  long next();
++
++  /** Which {@link CodeSource} a code derived from this source is attributed to. */
++  CodeSource codeSource();
++}
+diff --git a/src/main/java/com/example/shortener/codegen/DbSequenceCounterSource.java b/src/main/java/com/example/shortener/codegen/DbSequenceCounterSource.java
+new file mode 100644
+index 0000000..0523a25
+--- /dev/null
++++ b/src/main/java/com/example/shortener/codegen/DbSequenceCounterSource.java
+@@ -0,0 +1,36 @@
++package com.example.shortener.codegen;
++
++import com.example.shortener.domain.CodeSource;
++import com.example.shortener.domain.UrlMappingRepository;
++import java.util.Objects;
++import org.springframework.stereotype.Component;
++
++/**
++ * Fallback counter backed by the Postgres sequence {@value #SEQUENCE_NAME} (AC-11, ADR-004).
++ *
++ * <p>Every call performs one {@code nextval('url_code_seq')} round trip; the sequence is seeded at
++ * {@code 62^3} by the V1 migration so that even before the seed offset is applied a value encodes
++ * to at least three base62 characters. Values are never reused; gaps are acceptable.
++ */
++@Component
++public class DbSequenceCounterSource implements CounterSource {
++
++  /** Name of the Postgres sequence drawn from. */
++  public static final String SEQUENCE_NAME = "url_code_seq";
++
++  private final UrlMappingRepository repository;
++
++  public DbSequenceCounterSource(UrlMappingRepository repository) {
++    this.repository = Objects.requireNonNull(repository, "repository");
++  }
++
++  @Override
++  public long next() {
++    return repository.nextSequenceValue();
++  }
++
++  @Override
++  public CodeSource codeSource() {
++    return CodeSource.DB_SEQUENCE;
++  }
++}
+diff --git a/src/main/java/com/example/shortener/codegen/RedisBatchCounterSource.java b/src/main/java/com/example/shortener/codegen/RedisBatchCounterSource.java
+new file mode 100644
+index 0000000..de20701
+--- /dev/null
++++ b/src/main/java/com/example/shortener/codegen/RedisBatchCounterSource.java
+@@ -0,0 +1,113 @@
++package com.example.shortener.codegen;
++
++import com.example.shortener.config.ShortenerProperties;
++import com.example.shortener.domain.CodeSource;
++import java.util.Objects;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.stereotype.Component;
++
++/**
++ * Primary counter: reserves a batch of values with a single {@code INCRBY <batchSize>} on the
++ * global Redis key {@value #COUNTER_KEY} and hands them out locally (AC-10, ADR-002).
++ *
++ * <p>Each instance owns the range {@code [reply - batchSize + 1, reply]} returned by its last
++ * {@code INCRBY}. Values are handed out under a lock, so within one instance they are strictly
++ * increasing and unique; across instances uniqueness follows from Redis' atomic increment. A range
++ * that is still partly unused when the process stops is simply lost: restart gaps are accepted
++ * (AMB-10).
++ *
++ * <p>This is the only class besides the URL cache that may reference Spring Data Redis types. Redis
++ * failures (connection refused, timeout, ...) are propagated as unchecked exceptions; the fallback
++ * decision is taken by {@link ShortCodeAllocator}.
++ */
++@Component
++public class RedisBatchCounterSource implements CounterSource {
++
++  /** Global Redis key holding the shared counter. */
++  public static final String COUNTER_KEY = "shortener:counter";
++
++  private static final Logger log = LoggerFactory.getLogger(RedisBatchCounterSource.class);
++
++  private final StringRedisTemplate redis;
++  private final int batchSize;
++  private final Object lock = new Object();
++
++  // Guarded by lock. Invariant: nextValue > rangeEnd means the local range is exhausted.
++  private long nextValue = 1;
++  private long rangeEnd = 0;
++
++  /** Creates a source using the configured {@code shortener.counter-batch-size}. */
++  public RedisBatchCounterSource(StringRedisTemplate redis, ShortenerProperties properties) {
++    this(redis, Objects.requireNonNull(properties, "properties").counterBatchSize());
++  }
++
++  /**
++   * Creates a source with an explicit batch size.
++   *
++   * @param redis template used to issue {@code INCRBY}
++   * @param batchSize number of values reserved per {@code INCRBY}, {@code >= 1}
++   */
++  public RedisBatchCounterSource(StringRedisTemplate redis, int batchSize) {
++    this.redis = Objects.requireNonNull(redis, "redis");
++    if (batchSize < 1) {
++      throw new IllegalArgumentException("batchSize must be >= 1 but was " + batchSize);
++    }
++    this.batchSize = batchSize;
++  }
++
++  /** Number of values reserved per {@code INCRBY}. */
++  public int batchSize() {
++    return batchSize;
++  }
++
++  @Override
++  public long next() {
++    synchronized (lock) {
++      if (nextValue > rangeEnd) {
++        reserveNextRange();
++      }
++      return nextValue++;
++    }
++  }
++
++  @Override
++  public CodeSource codeSource() {
++    return CodeSource.REDIS;
++  }
++
++  /**
++   * Issues exactly one {@code INCRBY batchSize} and installs the returned range. Holds the lock.
++   */
++  private void reserveNextRange() {
++    Long reply = redis.opsForValue().increment(COUNTER_KEY, batchSize);
++    if (reply == null) {
++      throw new IllegalStateException("Redis INCRBY returned no value for key " + COUNTER_KEY);
++    }
++    long end = reply;
++    long start = end - batchSize + 1;
++    if (start < 1) {
++      throw new IllegalStateException(
++          "Redis counter "
++              + COUNTER_KEY
++              + " is below the valid range (INCRBY returned "
++              + end
++              + ")");
++    }
++    if (start <= rangeEnd) {
++      // The key went backwards (reset/flush). Reusing values would collide with persisted codes.
++      throw new IllegalStateException(
++          "Redis counter "
++              + COUNTER_KEY
++              + " moved backwards: new range starts at "
++              + start
++              + " but "
++              + rangeEnd
++              + " was already handed out");
++    }
++    nextValue = start;
++    rangeEnd = end;
++    log.debug("Reserved counter range [{}, {}] from {}", start, end, COUNTER_KEY);
++  }
++}
+diff --git a/src/main/java/com/example/shortener/codegen/ShortCodeAllocator.java b/src/main/java/com/example/shortener/codegen/ShortCodeAllocator.java
+new file mode 100644
+index 0000000..bcc6d12
+--- /dev/null
++++ b/src/main/java/com/example/shortener/codegen/ShortCodeAllocator.java
+@@ -0,0 +1,100 @@
++package com.example.shortener.codegen;
++
++import com.example.shortener.config.ShortenerProperties;
++import java.util.Objects;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Qualifier;
++import org.springframework.stereotype.Component;
++
++/**
++ * Allocates short codes: draws a raw value from the primary (Redis) counter, falls back to the
++ * database sequence when Redis is unavailable, adds the configured seed offset and base62-encodes
++ * the result (AC-10, AC-11, AMB-11).
++ *
++ * <p>This class owns the fallback decision. Any unchecked exception thrown by the primary source is
++ * treated as an outage: it is logged once per failed allocation, by exception type only, so that
++ * connection details carried in driver messages never reach the logs, and the fallback source is
++ * used for this allocation. The next allocation tries the primary source again, so recovery is
++ * automatic. A failure of the fallback itself is propagated to the caller.
++ */
++@Component
++public class ShortCodeAllocator {
++
++  /** Bean name of the primary counter, see {@link RedisBatchCounterSource}. */
++  public static final String PRIMARY_SOURCE = "redisBatchCounterSource";
++
++  /** Bean name of the fallback counter, see {@link DbSequenceCounterSource}. */
++  public static final String FALLBACK_SOURCE = "dbSequenceCounterSource";
++
++  private static final Logger log = LoggerFactory.getLogger(ShortCodeAllocator.class);
++
++  private final CounterSource primary;
++  private final CounterSource fallback;
++  private final long seedOffset;
++
++  /** Creates an allocator using the configured {@code shortener.counter-seed-offset}. */
++  public ShortCodeAllocator(
++      @Qualifier(PRIMARY_SOURCE) CounterSource primary,
++      @Qualifier(FALLBACK_SOURCE) CounterSource fallback,
++      ShortenerProperties properties) {
++    this(primary, fallback, Objects.requireNonNull(properties, "properties").counterSeedOffset());
++  }
++
++  /**
++   * Creates an allocator with an explicit seed offset.
++   *
++   * @param primary the counter tried first (normally Redis)
++   * @param fallback the counter used when the primary throws (normally the DB sequence)
++   * @param seedOffset value added to every raw counter value before encoding; must be at least
++   *     {@link Base62Codec#MIN_OFFSET_FOR_THREE_CHARS} so codes are never shorter than three
++   *     characters (AMB-11)
++   */
++  public ShortCodeAllocator(CounterSource primary, CounterSource fallback, long seedOffset) {
++    this.primary = Objects.requireNonNull(primary, "primary");
++    this.fallback = Objects.requireNonNull(fallback, "fallback");
++    if (seedOffset < Base62Codec.MIN_OFFSET_FOR_THREE_CHARS) {
++      throw new IllegalArgumentException(
++          "seedOffset must be >= "
++              + Base62Codec.MIN_OFFSET_FOR_THREE_CHARS
++              + " (62^2) so every code has at least three characters, but was "
++              + seedOffset);
++    }
++    this.seedOffset = seedOffset;
++  }
++
++  /** The offset added to raw counter values before encoding. */
++  public long seedOffset() {
++    return seedOffset;
++  }
++
++  /**
++   * Allocates the next short code.
++   *
++   * @return the code and the counter that produced it
++   * @throws RuntimeException when both the primary and the fallback counter fail
++   */
++  public AllocatedCode allocate() {
++    CounterSource source = primary;
++    long raw;
++    try {
++      raw = primary.next();
++    } catch (RuntimeException primaryFailure) {
++      log.warn(
++          "Primary short-code counter ({}) unavailable: {}; falling back to {}",
++          primary.codeSource().wireValue(),
++          primaryFailure.getClass().getSimpleName(),
++          fallback.codeSource().wireValue());
++      source = fallback;
++      raw = fallback.next();
++    }
++    return new AllocatedCode(encode(raw), source.codeSource());
++  }
++
++  private String encode(long raw) {
++    if (raw < 0) {
++      throw new IllegalStateException("counter source returned a negative value: " + raw);
++    }
++    return Base62Codec.encode(Math.addExact(raw, seedOffset));
++  }
++}
+diff --git a/src/test/java/com/example/shortener/codegen/Base62CodecTest.java b/src/test/java/com/example/shortener/codegen/Base62CodecTest.java
+new file mode 100644
+index 0000000..dc0d0d7
+--- /dev/null
++++ b/src/test/java/com/example/shortener/codegen/Base62CodecTest.java
+@@ -0,0 +1,156 @@
++package com.example.shortener.codegen;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
++import static org.assertj.core.api.Assertions.assertThatNullPointerException;
++
++import com.example.shortener.config.ShortenerProperties;
++import java.util.Random;
++import java.util.regex.Pattern;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.CsvSource;
++import org.junit.jupiter.params.provider.ValueSource;
++
++/** Base62 encoding used for generated short codes (AC-10, AMB-11). */
++class Base62CodecTest {
++
++  private static final Pattern ALPHABET_PATTERN = Pattern.compile("^[0-9a-zA-Z]+$");
++
++  // --- alphabet --------------------------------------------------------------------------------
++
++  @Test
++  void alphabetIsDigitsThenLowerThenUpperWithoutDuplicates() {
++    assertThat(Base62Codec.ALPHABET)
++        .hasSize(62)
++        .isEqualTo("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ");
++    assertThat(Base62Codec.ALPHABET.chars().distinct().count()).isEqualTo(62L);
++    assertThat(Base62Codec.RADIX).isEqualTo(62);
++    assertThat(Base62Codec.MIN_OFFSET_FOR_THREE_CHARS).isEqualTo(3844L);
++  }
++
++  @ParameterizedTest
++  @CsvSource({
++    "0, 0",
++    "9, 9",
++    "10, a",
++    "35, z",
++    "36, A",
++    "61, Z",
++    "62, 10",
++    "3843, ZZ",
++    "3844, 100",
++    "238327, ZZZ",
++    "238328, 1000",
++    "916132832, 100000",
++    "9223372036854775807, aZl8N0y58M7"
++  })
++  void encodesKnownValues(long value, String expected) {
++    assertThat(Base62Codec.encode(value)).isEqualTo(expected);
++    assertThat(Base62Codec.decode(expected)).isEqualTo(value);
++  }
++
++  @Test
++  void everyEncodedCodeUsesOnlyTheAlphabet() {
++    Random random = new Random(62);
++    for (int i = 0; i < 10_000; i++) {
++      long value = Math.abs(random.nextLong() % Long.MAX_VALUE);
++      String code = Base62Codec.encode(value);
++      assertThat(code).matches(ALPHABET_PATTERN);
++      assertThat(Base62Codec.isValid(code)).isTrue();
++    }
++  }
++
++  // --- round trip ------------------------------------------------------------------------------
++
++  @Test
++  void roundTripsSmallValuesExhaustively() {
++    for (long value = 0; value < 62L * 62 * 62 + 62; value++) {
++      assertThat(Base62Codec.decode(Base62Codec.encode(value))).isEqualTo(value);
++    }
++  }
++
++  @Test
++  void roundTripsRandomValuesAndBoundaries() {
++    Random random = new Random(42);
++    for (int i = 0; i < 10_000; i++) {
++      long value = Math.abs(random.nextLong() % Long.MAX_VALUE);
++      assertThat(Base62Codec.decode(Base62Codec.encode(value))).isEqualTo(value);
++    }
++    assertThat(Base62Codec.decode(Base62Codec.encode(Long.MAX_VALUE))).isEqualTo(Long.MAX_VALUE);
++    assertThat(Base62Codec.decode(Base62Codec.encode(Integer.MAX_VALUE)))
++        .isEqualTo(Integer.MAX_VALUE);
++  }
++
++  @Test
++  void encodedLengthGrowsMonotonicallyWithTheValue() {
++    long previous = 1;
++    for (long value = 0; value < 300_000; value++) {
++      long length = Base62Codec.encode(value).length();
++      assertThat(length).isGreaterThanOrEqualTo(previous);
++      previous = length;
++    }
++    assertThat(previous).isEqualTo(4L); // 300_000 > 62^3
++  }
++
++  // --- rejected input --------------------------------------------------------------------------
++
++  @ParameterizedTest
++  @ValueSource(longs = {-1L, -62L, Long.MIN_VALUE})
++  void rejectsNegativeValues(long value) {
++    assertThatIllegalArgumentException().isThrownBy(() -> Base62Codec.encode(value));
++  }
++
++  @ParameterizedTest
++  @ValueSource(strings = {"", "abc-", "ab_c", "ä", "ab c", "AB/C", "a:b"})
++  void rejectsCodesOutsideTheAlphabet(String code) {
++    assertThatIllegalArgumentException().isThrownBy(() -> Base62Codec.decode(code));
++    assertThat(Base62Codec.isValid(code)).isFalse();
++  }
++
++  @ParameterizedTest
++  @ValueSource(strings = {"aZl8N0y58M8", "zzzzzzzzzzzz", "100000000000"})
++  void rejectsWellFormedCodesThatOverflowALong(String code) {
++    assertThatIllegalArgumentException()
++        .isThrownBy(() -> Base62Codec.decode(code))
++        .withMessageContaining("overflows");
++    // Alphabet-wise the code is fine; only its magnitude is not representable.
++    assertThat(Base62Codec.isValid(code)).isTrue();
++  }
++
++  @Test
++  void rejectsNullCode() {
++    assertThatNullPointerException().isThrownBy(() -> Base62Codec.decode(null));
++    assertThat(Base62Codec.isValid(null)).isFalse();
++  }
++
++  // --- minimum length after seed offset (AMB-11) -----------------------------------------------
++
++  @Test
++  void smallestOffsetGuaranteesThreeCharactersForEveryCounterValue() {
++    long offset = Base62Codec.MIN_OFFSET_FOR_THREE_CHARS;
++    for (long raw = 0; raw < 100_000; raw++) {
++      assertThat(Base62Codec.encode(raw + offset)).hasSizeGreaterThanOrEqualTo(3);
++    }
++    // One below the offset is still two characters: the bound is tight.
++    assertThat(Base62Codec.encode(offset - 1)).hasSize(2);
++  }
++
++  @Test
++  void defaultConfiguredOffsetYieldsAtLeastSixCharacters() {
++    long offset = ShortenerProperties.DEFAULT_COUNTER_SEED_OFFSET;
++    assertThat(offset).isEqualTo(62L * 62 * 62 * 62 * 62);
++    for (long raw = 0; raw < 100_000; raw++) {
++      assertThat(Base62Codec.encode(raw + offset)).hasSizeGreaterThanOrEqualTo(6);
++    }
++    assertThat(Base62Codec.encode(offset)).isEqualTo("100000");
++    assertThat(Base62Codec.encode(offset - 1)).hasSize(5);
++  }
++
++  @Test
++  void dbSequenceSeedAloneAlreadyYieldsThreeCharacters() {
++    // V1 migration seeds url_code_seq at 62^3 = 238328; even without the allocator's offset a
++    // raw sequence value encodes to at least four characters, comfortably above the minimum.
++    assertThat(Base62Codec.encode(238_328L)).isEqualTo("1000").hasSizeGreaterThanOrEqualTo(3);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/codegen/RedisBatchCounterSourceTest.java b/src/test/java/com/example/shortener/codegen/RedisBatchCounterSourceTest.java
+new file mode 100644
+index 0000000..97af90c
+--- /dev/null
++++ b/src/test/java/com/example/shortener/codegen/RedisBatchCounterSourceTest.java
+@@ -0,0 +1,263 @@
++package com.example.shortener.codegen;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoMoreInteractions;
++import static org.mockito.Mockito.when;
++
++import com.example.shortener.config.ShortenerProperties;
++import com.example.shortener.domain.CodeSource;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.stream.LongStream;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.data.redis.RedisConnectionFailureException;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.data.redis.core.ValueOperations;
++
++/**
++ * {@link RedisBatchCounterSource} reserves ranges with one {@code INCRBY} per batch and hands out
++ * strictly increasing, unique values, also under concurrent allocation (AC-10, AMB-10).
++ */
++class RedisBatchCounterSourceTest {
++
++  private static final int BATCH = 1000;
++
++  private final StringRedisTemplate redis = mock(StringRedisTemplate.class);
++
++  @SuppressWarnings("unchecked")
++  private final ValueOperations<String, String> ops = mock(ValueOperations.class);
++
++  /** Simulates the shared Redis key: INCRBY is atomic and returns the value after increment. */
++  private final AtomicLong redisKey = new AtomicLong();
++
++  @BeforeEach
++  void setUp() {
++    when(redis.opsForValue()).thenReturn(ops);
++    when(ops.increment(eq(RedisBatchCounterSource.COUNTER_KEY), anyLong()))
++        .thenAnswer(invocation -> redisKey.addAndGet(invocation.<Long>getArgument(1)));
++  }
++
++  private RedisBatchCounterSource source() {
++    return new RedisBatchCounterSource(redis, BATCH);
++  }
++
++  // --- batching --------------------------------------------------------------------------------
++
++  @Test
++  void firstAllocationReservesOneBatchAndStartsAtTheBeginningOfTheRange() {
++    RedisBatchCounterSource source = source();
++
++    long first = source.next();
++
++    assertThat(first).isEqualTo(1L);
++    verify(ops, times(1)).increment(RedisBatchCounterSource.COUNTER_KEY, (long) BATCH);
++    assertThat(redisKey.get()).isEqualTo(BATCH);
++  }
++
++  @Test
++  void wholeBatchIsServedWithExactlyOneIncrby() {
++    RedisBatchCounterSource source = source();
++
++    List<Long> values = new ArrayList<>();
++    for (int i = 0; i < BATCH; i++) {
++      values.add(source.next());
++    }
++
++    assertThat(values).containsExactlyElementsOf(LongStream.rangeClosed(1, BATCH).boxed().toList());
++    verify(ops, times(1)).increment(eq(RedisBatchCounterSource.COUNTER_KEY), anyLong());
++  }
++
++  @Test
++  void exhaustingTheRangeTriggersTheNextIncrbyAndValuesStayContiguous() {
++    RedisBatchCounterSource source = source();
++
++    List<Long> values = new ArrayList<>();
++    for (int i = 0; i < 3 * BATCH + 1; i++) {
++      values.add(source.next());
++    }
++
++    assertThat(values)
++        .containsExactlyElementsOf(LongStream.rangeClosed(1, 3L * BATCH + 1).boxed().toList());
++    verify(ops, times(4)).increment(RedisBatchCounterSource.COUNTER_KEY, (long) BATCH);
++  }
++
++  @Test
++  void keyNameAndCodeSourceAreFixed() {
++    assertThat(RedisBatchCounterSource.COUNTER_KEY).isEqualTo("shortener:counter");
++    assertThat(source().codeSource()).isEqualTo(CodeSource.REDIS);
++  }
++
++  @Test
++  void batchSizeDefaultsToOneThousandFromProperties() {
++    ShortenerProperties properties =
++        new ShortenerProperties(
++            ShortenerProperties.DEFAULT_BASE_URL,
++            ShortenerProperties.DEFAULT_COUNTER_BATCH_SIZE,
++            Duration.ofHours(24),
++            ShortenerProperties.DEFAULT_COUNTER_SEED_OFFSET);
++    RedisBatchCounterSource source = new RedisBatchCounterSource(redis, properties);
++
++    assertThat(source.batchSize()).isEqualTo(1000);
++    source.next();
++    verify(ops).increment(RedisBatchCounterSource.COUNTER_KEY, 1000L);
++  }
++
++  @Test
++  void smallBatchSizesAreHonoured() {
++    RedisBatchCounterSource source = new RedisBatchCounterSource(redis, 1);
++
++    assertThat(List.of(source.next(), source.next(), source.next())).containsExactly(1L, 2L, 3L);
++    verify(ops, times(3)).increment(RedisBatchCounterSource.COUNTER_KEY, 1L);
++  }
++
++  @Test
++  void rejectsNonPositiveBatchSize() {
++    assertThatIllegalArgumentException().isThrownBy(() -> new RedisBatchCounterSource(redis, 0));
++    assertThatIllegalArgumentException().isThrownBy(() -> new RedisBatchCounterSource(redis, -5));
++  }
++
++  // --- restart gaps (AMB-10) -------------------------------------------------------------------
++
++  @Test
++  void aNewInstanceNeverReusesValuesOfAPartiallyConsumedRange() {
++    RedisBatchCounterSource beforeRestart = source();
++    for (int i = 0; i < 10; i++) {
++      beforeRestart.next();
++    }
++
++    RedisBatchCounterSource afterRestart = source();
++    long firstAfterRestart = afterRestart.next();
++
++    // The 990 unused values of the first range are lost; the new range starts right after it.
++    assertThat(firstAfterRestart).isEqualTo(BATCH + 1L);
++    verify(ops, times(2)).increment(RedisBatchCounterSource.COUNTER_KEY, (long) BATCH);
++  }
++
++  @Test
++  void twoInstancesSharingTheKeyReceiveDisjointRanges() {
++    RedisBatchCounterSource a = source();
++    RedisBatchCounterSource b = source();
++
++    long fromA = a.next();
++    long fromB = b.next();
++
++    assertThat(fromA).isEqualTo(1L);
++    assertThat(fromB).isEqualTo(BATCH + 1L);
++    for (int i = 1; i < BATCH; i++) {
++      assertThat(a.next()).isEqualTo(1L + i);
++      assertThat(b.next()).isEqualTo(BATCH + 1L + i);
++    }
++  }
++
++  // --- failure propagation ---------------------------------------------------------------------
++
++  @Test
++  void redisFailurePropagatesAndTheNextCallRetriesTheIncrby() {
++    when(ops.increment(eq(RedisBatchCounterSource.COUNTER_KEY), anyLong()))
++        .thenThrow(new RedisConnectionFailureException("connection refused"))
++        .thenAnswer(invocation -> redisKey.addAndGet(invocation.<Long>getArgument(1)));
++    RedisBatchCounterSource source = source();
++
++    assertThatThrownBy(source::next).isInstanceOf(RedisConnectionFailureException.class);
++    assertThat(source.next()).isEqualTo(1L);
++    verify(ops, times(2)).increment(RedisBatchCounterSource.COUNTER_KEY, (long) BATCH);
++  }
++
++  @Test
++  void missingReplyIsReportedAsIllegalState() {
++    when(ops.increment(eq(RedisBatchCounterSource.COUNTER_KEY), anyLong())).thenReturn(null);
++
++    assertThatThrownBy(source()::next)
++        .isInstanceOf(IllegalStateException.class)
++        .hasMessageContaining(RedisBatchCounterSource.COUNTER_KEY);
++  }
++
++  @Test
++  void counterThatMovedBackwardsIsRejectedInsteadOfReusingValues() {
++    RedisBatchCounterSource source = source();
++    for (int i = 0; i < BATCH; i++) {
++      source.next();
++    }
++    // Simulate a FLUSHALL / key reset between batches.
++    redisKey.set(0);
++
++    assertThatThrownBy(source::next)
++        .isInstanceOf(IllegalStateException.class)
++        .hasMessageContaining("moved backwards");
++  }
++
++  @Test
++  void counterBelowOneIsRejected() {
++    redisKey.set(-2L * BATCH);
++
++    assertThatThrownBy(source()::next)
++        .isInstanceOf(IllegalStateException.class)
++        .hasMessageContaining("below the valid range");
++  }
++
++  // --- concurrency -----------------------------------------------------------------------------
++
++  @Test
++  void concurrentAllocationYieldsUniqueStrictlyIncreasingValuesWithOneIncrbyPerBatch()
++      throws Exception {
++    int threads = 16;
++    int perThread = 500; // 8000 values => exactly 8 batches of 1000
++    RedisBatchCounterSource source = source();
++    CountDownLatch start = new CountDownLatch(1);
++    ConcurrentHashMap.KeySetView<Long, Boolean> seen = ConcurrentHashMap.newKeySet();
++    List<Future<List<Long>>> results = new ArrayList<>();
++
++    ExecutorService pool = Executors.newFixedThreadPool(threads);
++    try {
++      for (int t = 0; t < threads; t++) {
++        results.add(
++            pool.submit(
++                () -> {
++                  List<Long> mine = new ArrayList<>(perThread);
++                  start.await();
++                  for (int i = 0; i < perThread; i++) {
++                    long value = source.next();
++                    assertThat(seen.add(value)).as("value %d handed out twice", value).isTrue();
++                    mine.add(value);
++                  }
++                  return mine;
++                }));
++      }
++      start.countDown();
++      for (Future<List<Long>> result : results) {
++        List<Long> mine = result.get(30, TimeUnit.SECONDS);
++        assertThat(mine).hasSize(perThread);
++        for (int i = 1; i < mine.size(); i++) {
++          assertThat(mine.get(i)).isGreaterThan(mine.get(i - 1));
++        }
++      }
++    } finally {
++      pool.shutdownNow();
++      assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
++    }
++
++    int total = threads * perThread;
++    assertThat(seen).hasSize(total);
++    assertThat(seen)
++        .containsExactlyInAnyOrderElementsOf(LongStream.rangeClosed(1, total).boxed().toList());
++    verify(redis, times(total / BATCH)).opsForValue();
++    verify(ops, times(total / BATCH)).increment(RedisBatchCounterSource.COUNTER_KEY, (long) BATCH);
++    verifyNoMoreInteractions(ops);
++  }
++}
+diff --git a/src/test/java/com/example/shortener/codegen/ShortCodeAllocatorTest.java b/src/test/java/com/example/shortener/codegen/ShortCodeAllocatorTest.java
+new file mode 100644
+index 0000000..321fd82
+--- /dev/null
++++ b/src/test/java/com/example/shortener/codegen/ShortCodeAllocatorTest.java
+@@ -0,0 +1,268 @@
++package com.example.shortener.codegen;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
++import static org.assertj.core.api.Assertions.assertThatNullPointerException;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
++
++import ch.qos.logback.classic.Level;
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.core.read.ListAppender;
++import com.example.shortener.config.ShortenerProperties;
++import com.example.shortener.domain.CodeSource;
++import com.example.shortener.domain.UrlMappingRepository;
++import java.time.Duration;
++import java.util.List;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.slf4j.LoggerFactory;
++import org.springframework.dao.DataAccessResourceFailureException;
++import org.springframework.dao.QueryTimeoutException;
++import org.springframework.data.redis.RedisConnectionFailureException;
++
++/**
++ * {@link ShortCodeAllocator} encodes counter values with the seed offset (AC-10, AMB-11) and falls
++ * back from the (mocked) Redis source to the database sequence when Redis fails (AC-11).
++ */
++class ShortCodeAllocatorTest {
++
++  private static final long OFFSET = ShortenerProperties.DEFAULT_COUNTER_SEED_OFFSET;
++
++  /** A driver-style message carrying connection details that must never be logged. */
++  private static final String CONNECTION_DETAILS =
++      "Unable to connect to Redis at redis://cache.internal.example:6379/0";
++
++  private final RedisBatchCounterSource redisSource = mock(RedisBatchCounterSource.class);
++  private final UrlMappingRepository repository = mock(UrlMappingRepository.class);
++  private final DbSequenceCounterSource dbSource = new DbSequenceCounterSource(repository);
++  private final ShortCodeAllocator allocator =
++      new ShortCodeAllocator(redisSource, dbSource, OFFSET);
++
++  private final ListAppender<ILoggingEvent> logEvents = new ListAppender<>();
++  private Logger allocatorLogger;
++
++  @BeforeEach
++  void setUp() {
++    when(redisSource.codeSource()).thenReturn(CodeSource.REDIS);
++    allocatorLogger = (Logger) LoggerFactory.getLogger(ShortCodeAllocator.class);
++    logEvents.start();
++    allocatorLogger.addAppender(logEvents);
++  }
++
++  @AfterEach
++  void tearDown() {
++    allocatorLogger.detachAppender(logEvents);
++    logEvents.stop();
++  }
++
++  // --- normal path -----------------------------------------------------------------------------
++
++  @Test
++  void allocatesFromRedisWithOffsetAppliedAndRedisSource() {
++    when(redisSource.next()).thenReturn(1L);
++
++    AllocatedCode allocated = allocator.allocate();
++
++    assertThat(allocated.codeSource()).isEqualTo(CodeSource.REDIS);
++    assertThat(allocated.code()).isEqualTo(Base62Codec.encode(1L + OFFSET)).isEqualTo("100001");
++    assertThat(Base62Codec.decode(allocated.code()) - OFFSET).isEqualTo(1L);
++    verifyNoInteractions(repository);
++    assertThat(logEvents.list).noneMatch(event -> event.getLevel().isGreaterOrEqual(Level.WARN));
++  }
++
++  @Test
++  void consecutiveRedisValuesYieldDistinctCodes() {
++    when(redisSource.next()).thenReturn(10L, 11L, 12L);
++
++    List<String> codes =
++        List.of(
++            allocator.allocate().code(), allocator.allocate().code(), allocator.allocate().code());
++
++    assertThat(codes).doesNotHaveDuplicates().allMatch(Base62Codec::isValid);
++    assertThat(codes.stream().map(Base62Codec::decode).map(v -> v - OFFSET))
++        .containsExactly(10L, 11L, 12L);
++    verify(redisSource, times(3)).next();
++    verifyNoInteractions(repository);
++  }
++
++  @Test
++  void everyCodeHasAtLeastThreeCharactersEvenWithTheSmallestOffset() {
++    ShortCodeAllocator minimal =
++        new ShortCodeAllocator(redisSource, dbSource, Base62Codec.MIN_OFFSET_FOR_THREE_CHARS);
++    when(redisSource.next()).thenReturn(0L, 1L, 61L, 62L, 3843L);
++
++    for (int i = 0; i < 5; i++) {
++      assertThat(minimal.allocate().code()).hasSizeGreaterThanOrEqualTo(3).matches("[0-9a-zA-Z]+");
++    }
++  }
++
++  @Test
++  void usesConfiguredSeedOffsetFromProperties() {
++    ShortenerProperties properties =
++        new ShortenerProperties("http://localhost:8080", 1000, Duration.ofHours(24), 4000L);
++    ShortCodeAllocator configured = new ShortCodeAllocator(redisSource, dbSource, properties);
++    when(redisSource.next()).thenReturn(5L);
++
++    assertThat(configured.seedOffset()).isEqualTo(4000L);
++    assertThat(configured.allocate().code()).isEqualTo(Base62Codec.encode(4005L));
++  }
++
++  // --- fallback path (AC-11) -------------------------------------------------------------------
++
++  @Test
++  void fallsBackToDbSequenceWhenRedisConnectionFails() {
++    when(redisSource.next()).thenThrow(new RedisConnectionFailureException(CONNECTION_DETAILS));
++    when(repository.nextSequenceValue()).thenReturn(238_328L);
++
++    AllocatedCode allocated = allocator.allocate();
++
++    assertThat(allocated.codeSource()).isEqualTo(CodeSource.DB_SEQUENCE);
++    assertThat(allocated.code()).isEqualTo(Base62Codec.encode(238_328L + OFFSET));
++    verify(repository).nextSequenceValue();
++  }
++
++  @Test
++  void fallsBackToDbSequenceWhenRedisTimesOut() {
++    when(redisSource.next()).thenThrow(new QueryTimeoutException("Redis command timed out"));
++    when(repository.nextSequenceValue()).thenReturn(238_329L);
++
++    AllocatedCode allocated = allocator.allocate();
++
++    assertThat(allocated.codeSource()).isEqualTo(CodeSource.DB_SEQUENCE);
++    assertThat(allocated.code()).isEqualTo(Base62Codec.encode(238_329L + OFFSET));
++  }
++
++  @Test
++  void fallsBackOnAnyRuntimeFailureOfTheRedisSource() {
++    when(redisSource.next()).thenThrow(new IllegalStateException("INCRBY returned no value"));
++    when(repository.nextSequenceValue()).thenReturn(238_330L);
++
++    assertThat(allocator.allocate().codeSource()).isEqualTo(CodeSource.DB_SEQUENCE);
++  }
++
++  @Test
++  void degradationIsLoggedOnceAsWarningWithoutConnectionDetails() {
++    when(redisSource.next()).thenThrow(new RedisConnectionFailureException(CONNECTION_DETAILS));
++    when(repository.nextSequenceValue()).thenReturn(238_331L);
++
++    allocator.allocate();
++
++    List<ILoggingEvent> warnings =
++        logEvents.list.stream().filter(e -> e.getLevel() == Level.WARN).toList();
++    assertThat(warnings).hasSize(1);
++    ILoggingEvent warning = warnings.getFirst();
++    assertThat(warning.getFormattedMessage())
++        .contains("RedisConnectionFailureException")
++        .contains(CodeSource.REDIS.wireValue())
++        .contains(CodeSource.DB_SEQUENCE.wireValue())
++        .doesNotContain(CONNECTION_DETAILS)
++        .doesNotContain("cache.internal.example")
++        .doesNotContain("6379")
++        .doesNotContain("redis://");
++    assertThat(warning.getThrowableProxy()).isNull();
++    assertThat(logEvents.list).noneMatch(e -> e.getLevel().isGreaterOrEqual(Level.ERROR));
++  }
++
++  @Test
++  void retriesRedisOnTheNextAllocationAfterAFailure() {
++    when(redisSource.next())
++        .thenThrow(new RedisConnectionFailureException(CONNECTION_DETAILS))
++        .thenReturn(7L);
++    when(repository.nextSequenceValue()).thenReturn(238_332L);
++
++    AllocatedCode first = allocator.allocate();
++    AllocatedCode second = allocator.allocate();
++
++    assertThat(first.codeSource()).isEqualTo(CodeSource.DB_SEQUENCE);
++    assertThat(second.codeSource()).isEqualTo(CodeSource.REDIS);
++    assertThat(second.code()).isEqualTo(Base62Codec.encode(7L + OFFSET));
++    verify(redisSource, times(2)).next();
++    verify(repository, times(1)).nextSequenceValue();
++  }
++
++  @Test
++  void propagatesFailureWhenTheFallbackFailsToo() {
++    when(redisSource.next()).thenThrow(new RedisConnectionFailureException(CONNECTION_DETAILS));
++    when(repository.nextSequenceValue())
++        .thenThrow(new DataAccessResourceFailureException("database unavailable"));
++
++    assertThatThrownBy(allocator::allocate)
++        .isInstanceOf(DataAccessResourceFailureException.class)
++        .hasMessage("database unavailable");
++  }
++
++  @Test
++  void rejectsNegativeCounterValuesInsteadOfProducingACode() {
++    when(redisSource.next()).thenReturn(-1L);
++
++    assertThatThrownBy(allocator::allocate).isInstanceOf(IllegalStateException.class);
++    verify(repository, never()).nextSequenceValue();
++  }
++
++  // --- construction ----------------------------------------------------------------------------
++
++  @Test
++  void rejectsSeedOffsetsThatCouldProduceCodesShorterThanThreeCharacters() {
++    assertThatIllegalArgumentException()
++        .isThrownBy(() -> new ShortCodeAllocator(redisSource, dbSource, 0L))
++        .withMessageContaining("3844");
++    assertThatIllegalArgumentException()
++        .isThrownBy(
++            () ->
++                new ShortCodeAllocator(
++                    redisSource, dbSource, Base62Codec.MIN_OFFSET_FOR_THREE_CHARS - 1));
++  }
++
++  @Test
++  void rejectsMissingSources() {
++    assertThatNullPointerException()
++        .isThrownBy(() -> new ShortCodeAllocator(null, dbSource, OFFSET));
++    assertThatNullPointerException()
++        .isThrownBy(() -> new ShortCodeAllocator(redisSource, null, OFFSET));
++  }
++
++  @Test
++  void beanNamesMatchTheDefaultComponentNamesOfTheSources() {
++    assertThat(ShortCodeAllocator.PRIMARY_SOURCE).isEqualTo("redisBatchCounterSource");
++    assertThat(ShortCodeAllocator.FALLBACK_SOURCE).isEqualTo("dbSequenceCounterSource");
++  }
++
++  // --- collaborators covered here: DbSequenceCounterSource and AllocatedCode -------------------
++
++  @Test
++  void dbSequenceSourceDrawsNextvalFromUrlCodeSeq() {
++    when(repository.nextSequenceValue()).thenReturn(238_328L, 238_329L);
++
++    assertThat(dbSource.next()).isEqualTo(238_328L);
++    assertThat(dbSource.next()).isEqualTo(238_329L);
++    assertThat(dbSource.codeSource()).isEqualTo(CodeSource.DB_SEQUENCE);
++    assertThat(DbSequenceCounterSource.SEQUENCE_NAME).isEqualTo("url_code_seq");
++    verify(repository, times(2)).nextSequenceValue();
++  }
++
++  @Test
++  void dbSequenceSourcePropagatesDatabaseFailures() {
++    when(repository.nextSequenceValue())
++        .thenThrow(new DataAccessResourceFailureException("database unavailable"));
++
++    assertThatThrownBy(dbSource::next).isInstanceOf(DataAccessResourceFailureException.class);
++  }
++
++  @Test
++  void allocatedCodeRejectsMissingOrBlankComponents() {
++    assertThat(new AllocatedCode("abc", CodeSource.REDIS))
++        .isEqualTo(new AllocatedCode("abc", CodeSource.REDIS));
++    assertThatNullPointerException().isThrownBy(() -> new AllocatedCode(null, CodeSource.REDIS));
++    assertThatNullPointerException().isThrownBy(() -> new AllocatedCode("abc", null));
++    assertThatIllegalArgumentException()
++        .isThrownBy(() -> new AllocatedCode("  ", CodeSource.DB_SEQUENCE));
++  }
++}

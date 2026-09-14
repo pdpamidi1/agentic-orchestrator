@@ -16,6 +16,7 @@ class Done:
     tokens_out: int = 0
     cost_usd: float = 0.0
     notes: str = ""
+    granted_scope: list[str] = field(default_factory=list)  # files a human granted (recorded runs replay it)
 
 
 @dataclass(frozen=True)

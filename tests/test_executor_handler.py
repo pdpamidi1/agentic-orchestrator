@@ -218,3 +218,46 @@ async def test_blocked_task_asks_for_scope_and_continues_once_approved(tmp_path:
     assert (
         ctx.feedback[node.id]["scope_change"]["task"] == "G2" and "scope_request" not in ctx.feedback[node.id]
     )
+
+
+class ReplaysWithGrant(OverlapDetector):
+    """Pretends to be a recording executor replaying a task whose extra file a human granted earlier."""
+
+    async def execute(
+        self, ctx: RunContext, task: TaskSpec, design: Design, feedback: dict[str, Any] | None
+    ) -> Done:
+        done = await super().execute(ctx, task, design, feedback)
+        if task.id == "G2":
+            (ctx.sandbox / "src" / "shared").mkdir(parents=True, exist_ok=True)
+            (ctx.sandbox / "src" / "shared" / "util.py").write_text("# granted\n")
+            git = GitSandbox(ctx.sandbox)
+            changed = await git.changed_files(f"{done.commit_sha}~1")
+            sha = await git.commit_task(task.id, task.title, ctx.run_id)
+            return Done(files_changed=changed, tests_added=[], commit_sha=sha, notes="replayed G2.patch",
+                        granted_scope=["src/shared/util.py"])  # fmt: skip
+        return done
+
+
+async def test_recorded_scope_grant_is_honoured_on_replay(tmp_path: Path) -> None:
+    ex = ReplaysWithGrant()
+    ctx = RunContext(
+        run_id="r1",
+        scenario="t",
+        policy=POLICY,
+        sandbox=tmp_path / "sb",
+        trace=InMemorySink(),
+        target_stack="python",
+    )
+    concrete = [
+        {"id": f"G{i}", "title": f"task {i}", "parallel_group": "g", "definition_of_done": ["done"],
+         "allowed_files": [f"src/g{i}.py", f"tests/test_g{i}.py"]}
+        for i in (1, 2, 3)
+    ]  # fmt: skip
+    ctx.put("plan", Plan.model_validate({"run_id": "r1", "spec_version": 1, "tasks": concrete}), "planning")
+    ctx.put("design", Design.model_validate(CANNED["Design"]), "architecture")
+    graph = Graph.load(REPO / "workflow.yaml")
+    out = await build_handlers(FakeClient(), ex, graph)["executor"](graph.nodes["implementation"], ctx)
+    assert isinstance(out, Success), out
+    statuses = [e.status for e in ctx.trace.events("r1") if e.kind == Kind.POLICY_DECISION]
+    assert "SCOPE_APPROVED" in statuses and "VIOLATION" not in statuses and statuses.count("OK") == 3
+    assert "scope:G2:src/shared/util.py" in ctx.approvals

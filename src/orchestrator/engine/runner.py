@@ -100,6 +100,20 @@ class Runner:
     async def approve(self, ctx: RunContext, state: RunState, node_id: str, approver: str) -> RunState:
         ctx.approvals.add(node_id)
         ctx.emit(Kind.APPROVAL_GRANTED, node_id=node_id, actor=approver, status="APPROVED")
+        if state.status == RunStatus.HALTED:  # safe-stop is "persist state then halt; resumable after review"
+            state.status = RunStatus.RUNNING
+            ctx.emit(
+                Kind.RUN_RESUMED,
+                node_id=node_id,
+                actor=approver,
+                payload={"after": state.halt_reason, "lineage": ctx.lineage_snapshot()},
+            )
+            state.halt_reason = None
+            fb = ctx.feedback.get(node_id)
+            if fb:
+                fb.pop(
+                    "task_attempts", None
+                )  # the reviewer decided to go on: the task gets a fresh allowance
         state.mark(node_id, NodeStatus.PENDING)
         return await self.run(ctx, state)
 
