@@ -33,7 +33,8 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor) -> dict[str, Any]:
         out = await agents[node.agent](node, ctx)  # type: ignore[index]
         if node.agent == "diagnoser" and isinstance(out, Success):
             d = out.artifacts["diagnosis"]
-            return Route(d.decision, dict(d.feedback, root_cause=d.root_cause))
+            fb = {"items": [i.model_dump() for i in d.feedback], "root_cause": d.root_cause}
+            return Route(d.decision, fb)
         return out
 
     async def executor_handler(node: NodeDef, ctx: RunContext) -> Outcome:

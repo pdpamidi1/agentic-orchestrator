@@ -138,13 +138,21 @@ CANNED: dict[str, dict[str, Any]] = {
                     "method": "POST",
                     "path": "/api/v1/urls",
                     "operation_id": "createShortUrl",
-                    "responses": {201: "ShortUrl", 400: "Problem", 409: "Problem"},
+                    "responses": [
+                        {"status": 201, "description": "ShortUrl"},
+                        {"status": 400, "description": "Problem"},
+                        {"status": 409, "description": "Problem"},
+                    ],
                 },
                 {
                     "method": "GET",
                     "path": "/{short_code}",
                     "operation_id": "redirect",
-                    "responses": {302: "redirect", 404: "Problem", 410: "Problem"},
+                    "responses": [
+                        {"status": 302, "description": "redirect"},
+                        {"status": 404, "description": "Problem"},
+                        {"status": 410, "description": "Problem"},
+                    ],
                 },
             ],
         },
@@ -237,7 +245,7 @@ CANNED: dict[str, dict[str, Any]] = {
     "Diagnosis": {
         "root_cause": "fake diagnosis: gate failed on the previous attempt",
         "decision": "retry",
-        "feedback": {"hint": "address the blocking findings"},
+        "feedback": [{"target": "implementation", "instruction": "address the blocking findings"}],
     },
     "Docs": {
         "readme_md": "# shortener\n\nFake docs.\n",
@@ -345,7 +353,10 @@ BROWNFIELD_DESIGN: dict[str, Any] = {
                 "method": "GET",
                 "path": "/api/v1/urls/{short_code}/stats",
                 "operation_id": "getStats",
-                "responses": {200: "ClickStats", 404: "Problem"},
+                "responses": [
+                    {"status": 200, "description": "ClickStats"},
+                    {"status": 404, "description": "Problem"},
+                ],
             },
         ],
     },

@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from ..engine.context import RunContext
-from ..models import Design, Impact, Plan, Spec
+from ..models import Design, Impact, Plan, Risk, Spec
 from ..models.common import Frozen
 from .base import Agent
 
@@ -71,8 +71,18 @@ class ImpactAgent(Agent[Impact]):
     produces = "impact"
 
 
+# Structured outputs cannot express free-form maps (the SDK turns `dict` into an empty object), so every
+# agent output is fully typed. New fields are new fields, never `dict[str, Any]`.
+class SecurityFinding(Frozen):
+    id: str
+    severity: str  # low | medium | high | critical
+    area: str  # input | authz | secrets | pii | logging | dependencies | infra
+    description: str
+    requirement: str  # the concrete requirement implementation must satisfy
+
+
 class SecurityFindings(Frozen):
-    findings: list[dict[str, Any]]  # {id, severity, area, description, requirement}
+    findings: list[SecurityFinding]
     required_controls: list[str]
     high_impact_actions_expected: list[str]  # e.g. ["schema.migration"] -> pre-announced approvals
 
@@ -85,7 +95,7 @@ class SecurityAgent(Agent[SecurityFindings]):
 
 
 class RiskRegister(Frozen):
-    risks: list[dict[str, Any]]  # {id, description, likelihood, severity, mitigation, detection}
+    risks: list[Risk]
     trade_offs: list[str]
     failure_scenarios: list[str]
 
@@ -97,8 +107,14 @@ class RiskAgent(Agent[RiskRegister]):
     produces = "risk_register"
 
 
+class CriterionVerdict(Frozen):
+    id: str  # acceptance criterion id
+    verdict: str  # PASS | FAIL
+    evidence: str  # test name or file:line
+
+
 class Review(Frozen):
-    criteria: list[dict[str, Any]]  # {id, verdict: PASS|FAIL, evidence}
+    criteria: list[CriterionVerdict]
     concerns: list[str]
     recommendation: str  # APPROVE | REVISE
 
@@ -113,10 +129,15 @@ class ReviewerAgent(Agent[Review]):
         return out.model_dump()
 
 
+class FeedbackItem(Frozen):
+    target: str  # file path, task id or area the instruction applies to
+    instruction: str  # precise, actionable
+
+
 class Diagnosis(BaseModel):
     root_cause: str
     decision: str  # retry | replan | halt
-    feedback: dict[str, Any] = {}  # handed to implementation (retry) or planner (replan)
+    feedback: list[FeedbackItem] = []  # handed to implementation (retry) or planner (replan)
 
 
 class DiagnoserAgent(Agent[Diagnosis]):

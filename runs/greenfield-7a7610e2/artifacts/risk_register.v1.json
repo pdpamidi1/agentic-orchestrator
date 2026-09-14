@@ -1,0 +1,119 @@
+{
+  "risks": [
+    {
+      "id": "R-1",
+      "description": "Redis counter key is lost or reset (FLUSHALL, non-persistent failover, key eviction under maxmemory policy), causing INCRBY to restart from the 3844 seed and hand out already-used counter values, producing duplicate short codes.",
+      "likelihood": "medium",
+      "severity": "high",
+      "mitigation": "Configure the Redis counter keyspace with noeviction and persistence (AOF) or replicate; on batch allocation, sanity-check that the returned range upper bound exceeds a persisted high-water mark (e.g., max base62-decoded redis-sourced code in Postgres) and refuse/re-seed the counter if it regressed; rely on the urls PK to reject duplicates and translate the PK violation in the generation path into a retry with a fresh batch rather than a 500.",
+      "detection": "Spike in DataIntegrityViolationException / PK-violation logs on inserts with code_source='redis'; alert on Redis counter value decreasing between batch allocations; integration test simulating counter reset."
+    },
+    {
+      "id": "R-2",
+      "description": "A custom alias (e.g., 'abc') occupies a value inside the generated base62 range; when the Redis counter later reaches that value, the generator produces an already-taken code and the insert fails with a PK violation, surfacing as a 500.",
+      "likelihood": "low",
+      "severity": "medium",
+      "mitigation": "In UrlWriteService, treat PK violations on generated (non-alias) codes as retryable: allocate the next counter value and retry a bounded number of times; alternatively reserve alias space by checking existsById in the generation loop.",
+      "detection": "5xx responses on POST /api/v1/urls correlated with PK-violation stack traces where code_source is 'redis' or 'db_sequence'; unit test encoding an alias's decoded value back through the allocator."
+    },
+    {
+      "id": "R-3",
+      "description": "Redis outage on the write path forces every request through the Redis timeout before falling back to the DB sequence; without a circuit breaker, sustained outage adds per-request latency equal to the Lettuce command timeout and may exhaust worker capacity under load.",
+      "likelihood": "medium",
+      "severity": "medium",
+      "mitigation": "Keep Lettuce command timeouts short (design already calls for this, e.g., <=200ms) and add a simple open/half-open breaker or cached 'redis unhealthy' flag in ShortCodeGenerator so fallback is immediate during a known outage, re-probing periodically.",
+      "detection": "WARN fallback logs with code_source='db_sequence' ratio rising; p95/p99 latency on POST /api/v1/urls increasing by ~the Redis timeout; Redis connection error metrics."
+    },
+    {
+      "id": "R-4",
+      "description": "Redis outage on the read path removes the cache layer and sends full redirect traffic to Postgres; if redirect QPS greatly exceeds Postgres capacity, reads degrade or the connection pool saturates.",
+      "likelihood": "medium",
+      "severity": "medium",
+      "mitigation": "Size the Postgres connection pool and read instances for cache-miss worst case; short Redis timeouts so UrlCache fails fast (already designed); consider an optional small in-process near-cache (Caffeine) as a second-level buffer if load tests show risk.",
+      "detection": "UrlCache WARN degradation logs; DB connection pool utilization and query latency metrics; increased GET /{shortCode} p99."
+    },
+    {
+      "id": "R-5",
+      "description": "Stale cache entries: because there is no delete/update endpoint the window is bounded, but a URL whose expires_at is edited directly in the DB (ops action) or a future admin feature could leave Redis serving a redirect for up to 24h (default TTL) after the source of truth changed.",
+      "likelihood": "low",
+      "severity": "medium",
+      "mitigation": "Document that the cache TTL bounds staleness at min(24h, time-to-expiry); make the default TTL configurable per AMB-9; establish an ops runbook step to DEL the short_code key in Redis after any manual DB change; add cache invalidation when mutation endpoints enter scope.",
+      "detection": "Manual verification in the runbook; discrepancy checks comparing sampled cache entries to DB rows; user reports of redirects to expired/changed targets."
+    },
+    {
+      "id": "R-6",
+      "description": "No authentication or rate limiting on POST /api/v1/urls allows abusive mass creation of short links (spam/phishing) and unbounded growth of the urls table and code space consumption; the service can be weaponized as an open redirector.",
+      "likelihood": "high",
+      "severity": "medium",
+      "mitigation": "Explicitly out of scope per the spec (auth is a non-goal), so mitigate at the edge: deploy behind a gateway/WAF with IP rate limits; record the risk for the auth follow-up scenario; long_url scheme/length validation already limits some abuse.",
+      "detection": "Write QPS and table row-count growth alerts; anomaly detection on request source distribution at the ingress layer."
+    },
+    {
+      "id": "R-7",
+      "description": "Java 25 / Spring Boot 4 is a bleeding-edge stack: library incompatibilities (Lettuce, Flyway, Testcontainers, springdoc) or immature GA behavior could block the build or introduce runtime regressions.",
+      "likelihood": "medium",
+      "severity": "medium",
+      "mitigation": "Pin exact dependency versions via the Spring Boot BOM; verify the full Testcontainers integration suite in CI on the same JDK image used in the Dockerfile; keep the code on stable APIs (Spring MVC, JPA) avoiding preview features.",
+      "detection": "CI build/test failures; startup errors in the containerized smoke test; dependency-convergence warnings in the build."
+    },
+    {
+      "id": "R-8",
+      "description": "The catch-all-style GET /{shortCode} mapping, though regex-constrained to [0-9a-zA-Z]{3,32}, can still collide with future top-level routes or reserved words (e.g., a generated or custom code 'health', 'docs'), and actuator/api paths must remain unshadowed.",
+      "likelihood": "low",
+      "severity": "low",
+      "mitigation": "Keep the regex constraint (ADR-12); maintain a configurable reserved-word denylist rejected at alias creation with 400; integration tests asserting /api/v1/urls and actuator endpoints are reachable on the combined profile.",
+      "detection": "Routing integration tests in CI; 404/route-shadowing bug reports; startup mapping report review."
+    },
+    {
+      "id": "R-9",
+      "description": "Custom alias race: two concurrent POSTs with the same custom_alias both pass the existsById pre-check; one insert wins, the other hits the PK constraint. If the DataIntegrityViolation-to-409 translation misfires, the loser sees a 500 instead of 409, violating AC-3.",
+      "likelihood": "medium",
+      "severity": "low",
+      "mitigation": "The design already translates DataIntegrityViolation to AliasConflictException; cover it with a concurrent Testcontainers integration test (two threads, same alias) asserting exactly one 201 and one 409 with problem+json.",
+      "detection": "Integration test failure in CI; production 500s on POST with alias-conflict stack traces."
+    },
+    {
+      "id": "R-10",
+      "description": "Profile misconfiguration at deploy time (e.g., read fleet accidentally started with the default combined profile) silently exposes the write endpoint on instances scaled and hardened only for reads.",
+      "likelihood": "low",
+      "severity": "medium",
+      "mitigation": "Fail-fast assertions/logging of the active profile at startup; per-profile smoke tests in the deploy pipeline (read instance must 404 on POST /api/v1/urls per AC-14); document profile usage in the README.",
+      "detection": "Deploy-time smoke test; startup log audit; unexpected write traffic on read-pool metrics."
+    },
+    {
+      "id": "R-11",
+      "description": "Cache-Control: private on the 302 does not include no-store/max-age directives, so browsers may cache the redirect locally and keep following it briefly after expires_at passes, serving 302 where the origin would return 410.",
+      "likelihood": "medium",
+      "severity": "low",
+      "mitigation": "Spec mandates exactly 'Cache-Control: private' (AC-7), so implement as specified and record the staleness window as accepted; raise as a spec follow-up whether max-age bounded by time-to-expiry is desired.",
+      "detection": "Manual browser testing; user reports of redirects working past expiry; documented in README limitations."
+    },
+    {
+      "id": "R-12",
+      "description": "Testcontainers-based integration tests require a Docker daemon; CI environments without Docker-in-Docker or with image-pull rate limits cause flaky or failing builds, undermining AC-15.",
+      "likelihood": "medium",
+      "severity": "low",
+      "mitigation": "Pin postgres and redis image versions; use a registry mirror/cache in CI; gate integration tests behind a profile that fails loudly (not silently skips) when Docker is unavailable.",
+      "detection": "CI failure trends and image-pull errors; test-duration anomalies; explicit precondition check output in test logs."
+    }
+  ],
+  "trade_offs": [
+    "Batched Redis counter with discard-on-restart (ADR-3, AMB-10): up to 999 codes are wasted per instance restart in exchange for one Redis round-trip per 1000 allocations and no reclamation bookkeeping; code space (62^n) makes the waste immaterial.",
+    "Disjoint DB fallback range starting at 62^6 (ADR-5): structurally eliminates cross-source collisions without retry loops, at the cost of fallback codes always being 7 characters (longer short URLs during Redis outages) and a permanently partitioned code space.",
+    "Graceful degradation over strict dependency health (ADR-7): the service stays available when Redis is down, but writes get slower (timeout-then-fallback) and reads shift full load to Postgres; availability is bought with latency and DB load headroom.",
+    "Cache TTL = min(24h, time-to-expiry) (ADR-6): bounds Redis memory and staleness but accepts up to 24h of potential staleness for any out-of-band data change, versus shorter TTLs that would increase Postgres read load.",
+    "Blocking Spring MVC on virtual threads instead of WebFlux (ADR-2): simpler code, easier testing and debugging, at the cost of forgoing reactive backpressure; acceptable because each request does at most one Redis and one DB hit.",
+    "Single artifact with profile-conditional controllers instead of separate modules/services (ADR-10): one build, one Dockerfile, simpler CI, but read and write code ship together, so a defect in either path forces redeploying both fleets and package-level isolation relies on discipline plus layering rules rather than compile-time separation.",
+    "No deduplication of long_url (ADR-11, AC-4): predictable POST semantics and no unique-index contention, but repeated shortening of the same URL consumes code space and storage linearly.",
+    "Postgres as sole source of truth with Redis as disposable cache/counter (ADR-14): durability and simple recovery (cache rebuilds lazily), but the counter's uniqueness guarantee depends on Redis persistence configuration, which is operational rather than structural (see R-1)."
+  ],
+  "failure_scenarios": [
+    "Redis unavailable on the write path: ShortCodeGenerator's Redis call fails fast (short Lettuce timeout), falls back to the Postgres sequence url_code_seq, persists code_source='db_sequence', logs the fallback at WARN, and still returns 201 (AC-11). Degraded mode: added latency up to the Redis timeout per request and 7-character codes. Recovery: when Redis returns, allocation resumes from the global counter automatically; no rollback needed because ranges are disjoint.",
+    "Redis unavailable on the read path: UrlCache catches the connectivity failure, logs cache degradation at WARN, and UrlReadService serves the 302 directly from Postgres (AC-13). Degraded mode: higher redirect latency and full read load on Postgres. Recovery: cache repopulates lazily on subsequent hits once Redis returns; no data loss possible since Redis holds no authoritative state.",
+    "Postgres unavailable: writes fail entirely (no durable store) and return 500 problem+json via the global handler — this is a safe-stop, not silent acceptance, because Redis must never become the system of record. Reads continue to serve cache hits from Redis until TTLs lapse; cache misses return 500 problem+json. Recovery: normal operation resumes when Postgres returns; readiness probes should mark write instances unready to shed traffic at the load balancer.",
+    "Redis counter reset/regression (flush or failover to a stale replica): duplicate counter values produce PK violations on insert. Expected behaviour: the generation path detects the integrity violation, does not corrupt existing rows (PK safe-stops the write), and either retries with the DB fallback or returns 500; operators re-seed the counter above the persisted high-water mark. No rollback of stored URLs is needed — Postgres rejects duplicates by construction.",
+    "Concurrent custom_alias collision: two simultaneous POSTs with the same alias — exactly one insert commits; the loser's DataIntegrityViolation is translated to AliasConflictException and a 409 problem+json (AC-3). The existing mapping is unchanged; the losing transaction rolls back atomically.",
+    "Flyway migration failure on deploy: the application fails to start (fail-fast), leaving the previous schema and running instances untouched. Expected behaviour: halt the rollout, fix or add a corrective forward migration (append-only, never edit applied versions), and redeploy; because migrations are expand/contract, the prior application version remains compatible with a partially expanded schema, enabling instance-level rollback.",
+    "Both Redis and Postgres unavailable: total outage — all endpoints return 500 problem+json via the global exception handler (consistent bodies per AC-16); liveness stays up but readiness fails so orchestration stops routing traffic. Recovery order matters: restore Postgres first (source of truth), then Redis; the cache rebuilds lazily and the counter resumes from its persisted value or is re-seeded per the R-1 runbook."
+  ]
+}

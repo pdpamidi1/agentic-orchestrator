@@ -1,0 +1,113 @@
+{
+  "findings": [
+    {
+      "id": "SEC-1",
+      "severity": "high",
+      "area": "Abuse / rate limiting",
+      "description": "POST /api/v1/urls is unauthenticated by spec (auth is a non-goal) and creates persistent rows and Redis counter consumption. Without throttling, the write path enables unbounded storage growth, alias squatting at scale, and mass creation of malicious short links.",
+      "requirement": "Implement rate limiting on POST /api/v1/urls (e.g., per-client-IP token bucket via a servlet filter or gateway-level control), returning 429 with application/problem+json. Limits must be configurable and documented in the README. If rate limiting is deferred to an upstream gateway, that decision must be explicitly recorded and the service must still enforce a conservative default limit."
+    },
+    {
+      "id": "SEC-2",
+      "severity": "high",
+      "area": "Open redirect / malicious destinations",
+      "description": "GET /{shortCode} issues a 302 to any stored long_url. The service is by design an open redirector; while destination scheme is restricted to http/https at write time, nothing prevents shortening links to phishing/malware destinations, and validation must not be bypassable (e.g., via 'javascript:', 'data:', userinfo tricks like https://trusted@evil.com, or whitespace/control characters in the URL).",
+      "requirement": "Validate long_url by parsing with java.net.URI: require an absolute URI, scheme exactly 'http' or 'https' (case-insensitive), a non-empty host, and reject URLs containing control characters, CR/LF, or embedded userinfo unless explicitly accepted. Persist and reflect the URL exactly as validated. The Location header must be set from the stored value without further interpolation. Note: blocklisting/reputation checking of destinations is not in the spec — if required it is a product decision, flagged as out of current scope, not silently assumed."
+    },
+    {
+      "id": "SEC-3",
+      "severity": "high",
+      "area": "Input validation",
+      "description": "Redirect responses echo attacker-supplied data (long_url) into the Location header. CRLF sequences surviving into the header enable HTTP response splitting / header injection.",
+      "requirement": "Reject any long_url containing CR, LF, or other ASCII control characters at validation time (400 problem+json), and rely on Spring's header-value sanitization as defense in depth. Add explicit unit tests for CRLF-injection payloads on both write (validation) and read (header emission) paths."
+    },
+    {
+      "id": "SEC-4",
+      "severity": "high",
+      "area": "Secret handling",
+      "description": "The service requires Postgres and Redis credentials. The design does not state how secrets are supplied; hardcoding them in application.yml, the Dockerfile, or committed config would be a critical failure.",
+      "requirement": "All credentials (Postgres URL/user/password, Redis URI/password) must be supplied via environment variables or an external secret mechanism, never committed to the repository, baked into the Docker image, or present in the OpenAPI/README examples with real values. Testcontainers-generated credentials are exempt. Add a .gitignore/.dockerignore entry pattern for local env files and verify no secrets appear in logs at any level."
+    },
+    {
+      "id": "SEC-5",
+      "severity": "medium",
+      "area": "Logging hygiene / PII",
+      "description": "long_url values frequently embed PII, session tokens, or capability URLs (e.g., signed links). The design mandates logging cache degradation and Redis fallback; if request/URL contents are logged verbatim, sensitive data leaks into logs. created_by is null in this scope, so no direct user PII is stored, but URLs themselves are sensitive.",
+      "requirement": "Log degradation events (Redis outage, cache bypass, counter fallback) with short_code and error class only — never the full long_url or request body at INFO/WARN. If long_url must appear in DEBUG logs, truncate and redact query strings. Ensure the global exception handler never includes stack traces, exception messages containing SQL/connection strings, or internal class names in problem+json 'detail' for 500 responses; log the correlation-worthy details server-side instead."
+    },
+    {
+      "id": "SEC-6",
+      "severity": "medium",
+      "area": "Information disclosure",
+      "description": "Unhandled 500s route through the GlobalExceptionHandler. If the handler passes raw exception messages into ProblemDetail.detail, internal details (JDBC URLs, Redis hosts, Hibernate internals) leak to clients.",
+      "requirement": "For 500 responses, the problem+json body must contain a generic title/detail (e.g., 'Internal Server Error') and no exception message, stack trace, or internal identifiers. For 400 validation failures, detail may enumerate field-level violations but must not echo excessively long input values (truncate long_url echoes). Add an integration test asserting the 500 body shape."
+    },
+    {
+      "id": "SEC-7",
+      "severity": "medium",
+      "area": "Route hijacking / alias abuse",
+      "description": "Custom aliases share the root path namespace with /api/v1 and any actuator/management endpoints. Although the ADR-12 regex prevents shadowing multi-segment paths, single-segment reserved words (e.g., 'api', 'actuator', 'health', 'admin') could still be registered as aliases, enabling confusing or deceptive links on the service's own domain.",
+      "requirement": "Maintain a configurable reserved-word blocklist for custom_alias (at minimum: 'api', 'actuator', 'health', 'admin', 'metrics', 'error') and reject matches with 400 problem+json. Confirm actuator endpoints (if enabled) are not exposed publicly on the same port without justification, or are restricted to liveness/readiness only."
+    },
+    {
+      "id": "SEC-8",
+      "severity": "medium",
+      "area": "Denial of service / resource limits",
+      "description": "The write endpoint accepts JSON bodies; without size limits, oversized payloads or deeply nested JSON can exhaust resources. The 2048-char limit applies to long_url only, not the raw request.",
+      "requirement": "Enforce a maximum HTTP request body size for POST /api/v1/urls (e.g., server/Tomcat max post size and/or explicit content-length check, on the order of a few KB), rejecting oversized requests before deserialization. Configure short, explicit connection/command timeouts for Redis (already noted in RedisConfig) and Postgres so outages fail fast rather than exhausting threads."
+    },
+    {
+      "id": "SEC-9",
+      "severity": "medium",
+      "area": "Host header / URL construction",
+      "description": "short_url is built from the configured app.base-url. If implementation instead derives it from the incoming Host header or X-Forwarded-* headers, attackers could poison generated short_urls (host header injection).",
+      "requirement": "Build short_url exclusively from the app.base-url configuration property (default http://localhost:8080), never from request headers. Document that production deployments must set app.base-url explicitly and should use https."
+    },
+    {
+      "id": "SEC-10",
+      "severity": "low",
+      "area": "Cache integrity",
+      "description": "Redis cache entries map short_code -> long_url. If Redis is shared or unauthenticated, a compromised or co-tenant client could poison cache entries, redirecting users to attacker destinations without touching Postgres.",
+      "requirement": "Document that Redis must be network-isolated and authenticated (requirepass/ACL) in production; use a key prefix/namespace (e.g., 'urlshort:cache:') to avoid collisions with other tenants. The design's cache-first read means poisoned entries are served without DB verification — this residual risk must be recorded in the README/threat notes since per-request verification would defeat the cache."
+    },
+    {
+      "id": "SEC-11",
+      "severity": "medium",
+      "area": "Dependency policy",
+      "description": "Java 25 / Spring Boot 4 stack pulls Spring MVC, Spring Data JPA, Lettuce, Flyway, Testcontainers, and a Postgres driver. No dependency governance is stated in the design.",
+      "requirement": "Pin all dependency versions via the Spring Boot BOM plus explicit versions for anything outside it; add OWASP Dependency-Check or an equivalent SCA step to the build with a failure threshold for known critical CVEs; do not add dependencies beyond those needed for the stated deliverables without recording the addition. Base Docker image must be a minimal, digest-pinned JRE image running as a non-root user."
+    },
+    {
+      "id": "SEC-12",
+      "severity": "low",
+      "area": "Redirect caching semantics",
+      "description": "Cache-Control: private is mandated (AC-7) which correctly prevents shared-cache storage of per-link redirects, but browsers may still cache 302s; a link later expiring (410) could continue redirecting from the browser cache.",
+      "requirement": "Emit Cache-Control: private as specified; additionally include 'no-store' or a bounded max-age only if the spec owner approves — this is an ambiguity to raise, not an assumption to make. At minimum, add 'no-store' consideration to the README's operational notes and ensure the 302 response contains no Set-Cookie or other sensitive headers."
+    },
+    {
+      "id": "SEC-13",
+      "severity": "low",
+      "area": "Enumeration",
+      "description": "Sequential counter-based base62 codes are trivially enumerable, allowing bulk discovery of all shortened URLs (which may embed sensitive capability links). The spec mandates this scheme, so it cannot be changed unilaterally.",
+      "requirement": "Record enumeration as an accepted residual risk in the README/threat notes (spec-mandated design). Ensure rate limiting (SEC-1) also covers GET /{shortCode} lookups to slow scraping, and ensure 404 vs 410 responses do not include additional metadata beyond the problem+json basics."
+    }
+  ],
+  "required_controls": [
+    "Input validation: strict Bean Validation plus programmatic java.net.URI parsing for long_url (absolute, http/https only, non-empty host, <=2048 chars, no control/CRLF characters, no userinfo); custom_alias ^[0-9a-zA-Z]{3,32}$ plus reserved-word blocklist; expiration_date must be well-formed ISO-8601 and strictly in the future; shortCode path variable regex-constrained at the mapping",
+    "Rate limiting: configurable per-client throttling on POST /api/v1/urls (and abuse-resistant limits on GET /{shortCode}), returning 429 problem+json; request body size cap enforced before deserialization",
+    "Secret handling: all datastore credentials via environment variables/externalized config; no secrets in source, Dockerfile, image layers, OpenAPI examples, or logs; Testcontainers credentials confined to test scope",
+    "PII: created_by remains null per spec; treat long_url as sensitive data — never log it in full, redact query strings, and do not include it in error responses beyond truncated validation echoes",
+    "Logging hygiene: degradation/fallback logs carry short_code and error class only; 500 problem+json bodies are generic with no stack traces, exception messages, or internal identifiers; no Set-Cookie or sensitive headers on redirects",
+    "Dependency policy: versions pinned via Spring Boot BOM, SCA/vulnerability scanning in the build with critical-CVE gating, minimal digest-pinned non-root base image in the Dockerfile, no unrecorded dependency additions",
+    "Infrastructure hygiene: Redis authenticated and network-isolated with namespaced keys, short command timeouts on Redis and Postgres clients, actuator exposure restricted to liveness/readiness, short_url built only from app.base-url configuration"
+  ],
+  "high_impact_actions_expected": [
+    "Create and apply Flyway database migrations (V1__create_urls_table.sql with CHECK constraints, V2__create_code_sequence.sql creating url_code_seq)",
+    "Add new third-party dependencies to the build (Spring Boot 4 starters, Spring Data JPA, Lettuce/Spring Data Redis, Flyway, Postgres driver, Testcontainers for Postgres and Redis, springdoc/OpenAPI tooling, optional rate-limiting library such as Bucket4j)",
+    "Create a Dockerfile (protected infrastructure artifact per layering rules — requires explicit approval since infra artifacts are declared out of agent scope)",
+    "Introduce a rate-limiting filter/configuration affecting all write-path traffic, including new 429 response semantics not currently in the OpenAPI document (OpenAPI update required)",
+    "Externalize and wire datastore secrets via environment-variable configuration in application profiles and the container entrypoint",
+    "Run Testcontainers-based integration tests that start ephemeral Postgres and Redis containers on the build host",
+    "Seed and mutate the global Redis counter (SETNX seed at 3844, batched INCRBY 1000) shared across all write instances"
+  ]
+}

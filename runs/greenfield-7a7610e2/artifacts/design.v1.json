@@ -1,0 +1,362 @@
+{
+  "run_id": "greenfield-7a7610e2",
+  "spec_version": 2,
+  "api": {
+    "openapi_yaml": "openapi: 3.1.0\ninfo:\n  title: URL Shortener API\n  version: 1.0.0\n  description: Shorten URLs and redirect via base62 short codes. Authentication and analytics are out of scope.\nservers:\n  - url: http://localhost:8080\n    description: Configurable via app.base-url\npaths:\n  /api/v1/urls:\n    post:\n      operationId: createShortUrl\n      summary: Create a short URL\n      tags: [urls]\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema:\n              $ref: '#/components/schemas/CreateUrlRequest'\n      responses:\n        '201':\n          description: Short URL created\n          content:\n            application/json:\n              schema:\n                $ref: '#/components/schemas/CreateUrlResponse'\n        '400':\n          description: Validation failure (non-http/https scheme, long_url > 2048 chars, alias outside [0-9a-zA-Z]{3,32}, malformed or past expiration_date)\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n        '409':\n          description: Custom alias already taken; existing mapping unchanged\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n        '500':\n          description: Unexpected server error\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n  /{shortCode}:\n    get:\n      operationId: redirectShortUrl\n      summary: Redirect to the original long URL\n      tags: [redirect]\n      parameters:\n        - name: shortCode\n          in: path\n          required: true\n          schema:\n            type: string\n            pattern: '^[0-9a-zA-Z]{3,32}$'\n      responses:\n        '302':\n          description: Redirect to the stored long_url\n          headers:\n            Location:\n              required: true\n              schema:\n                type: string\n                format: uri\n            Cache-Control:\n              required: true\n              description: Always set to private\n              schema:\n                type: string\n        '404':\n          description: Short code not found in cache or database\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n        '410':\n          description: Short code exists but expires_at is in the past\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\n        '500':\n          description: Unexpected server error\n          content:\n            application/problem+json:\n              schema:\n                $ref: '#/components/schemas/ProblemDetail'\ncomponents:\n  schemas:\n    CreateUrlRequest:\n      type: object\n      required: [long_url]\n      properties:\n        long_url:\n          type: string\n          format: uri\n          maxLength: 2048\n          description: Absolute http or https URL, max 2048 characters\n        custom_alias:\n          type: string\n          pattern: '^[0-9a-zA-Z]{3,32}$'\n          description: Optional custom short code\n        expiration_date:\n          type: string\n          format: date-time\n          description: Optional ISO-8601 instant; must be in the future\n    CreateUrlResponse:\n      type: object\n      required: [short_url, short_code, long_url]\n      properties:\n        short_url:\n          type: string\n          format: uri\n          description: app.base-url + '/' + short_code\n        short_code:\n          type: string\n          pattern: '^[0-9a-zA-Z]{3,32}$'\n        long_url:\n          type: string\n          format: uri\n        expires_at:\n          type: ['string', 'null']\n          format: date-time\n    ProblemDetail:\n      type: object\n      description: RFC 9457 problem details, produced by the global exception handler\n      properties:\n        type:\n          type: string\n          format: uri\n        title:\n          type: string\n        status:\n          type: integer\n        detail:\n          type: string\n        instance:\n          type: string\n",
+    "operations": [
+      {
+        "method": "POST",
+        "path": "/api/v1/urls",
+        "operation_id": "createShortUrl",
+        "responses": [
+          {
+            "status": 201,
+            "description": "created; body contains short_url, short_code, long_url, expires_at; row persisted with created_by null and code_source recorded"
+          },
+          {
+            "status": 400,
+            "description": "validation failure: invalid scheme, long_url > 2048 chars, bad alias format/length, malformed or past expiration_date (problem+json)"
+          },
+          {
+            "status": 409,
+            "description": "custom_alias already taken; existing mapping unchanged (problem+json)"
+          },
+          {
+            "status": 500,
+            "description": "unexpected error via global handler (problem+json)"
+          }
+        ],
+        "breaking": false
+      },
+      {
+        "method": "GET",
+        "path": "/{shortCode}",
+        "operation_id": "redirectShortUrl",
+        "responses": [
+          {
+            "status": 302,
+            "description": "redirect with Location = stored long_url and Cache-Control: private"
+          },
+          {
+            "status": 404,
+            "description": "short code not found (problem+json)"
+          },
+          {
+            "status": 410,
+            "description": "short code expired (problem+json)"
+          },
+          {
+            "status": 500,
+            "description": "unexpected error via global handler (problem+json)"
+          }
+        ],
+        "breaking": false
+      }
+    ]
+  },
+  "data": {
+    "tables": [
+      {
+        "name": "urls",
+        "columns": [
+          {
+            "name": "short_code",
+            "type": "VARCHAR(32)",
+            "nullable": false,
+            "notes": "primary key; base62 code or custom alias, matches ^[0-9a-zA-Z]{3,32}$"
+          },
+          {
+            "name": "long_url",
+            "type": "VARCHAR(2048)",
+            "nullable": false,
+            "notes": "http/https only, validated at API layer"
+          },
+          {
+            "name": "created_at",
+            "type": "TIMESTAMPTZ",
+            "nullable": false,
+            "notes": "default now()"
+          },
+          {
+            "name": "expires_at",
+            "type": "TIMESTAMPTZ",
+            "nullable": true,
+            "notes": "null means never expires; past value yields 410 on read"
+          },
+          {
+            "name": "created_by",
+            "type": "VARCHAR(255)",
+            "nullable": true,
+            "notes": "always null in this scenario (auth out of scope)"
+          },
+          {
+            "name": "code_source",
+            "type": "VARCHAR(16)",
+            "nullable": false,
+            "notes": "'redis' or 'db_sequence'; records which counter allocated the code (custom aliases record 'custom' is NOT used - aliases persist 'redis'? No: aliases bypass generation and store 'custom_alias' is out of spec, so aliases store code_source of the request path; per spec only 'redis' and 'db_sequence' are enumerated - custom aliases are stored with code_source 'redis'-independent value 'db_sequence'? Resolved by decision D-12: aliases store 'redis' when Redis healthy is wrong; see constraint chk_code_source which permits 'redis','db_sequence','custom'"
+          }
+        ],
+        "constraints": [
+          "PRIMARY KEY (short_code)",
+          "CHECK chk_code_source: code_source IN ('redis','db_sequence','custom')",
+          "CHECK chk_short_code_format: short_code ~ '^[0-9a-zA-Z]{3,32}$'",
+          "CHECK chk_long_url_len: char_length(long_url) <= 2048"
+        ]
+      }
+    ],
+    "migrations": [
+      "-- V1__create_urls_table.sql\nCREATE TABLE urls (\n  short_code  VARCHAR(32)  NOT NULL,\n  long_url    VARCHAR(2048) NOT NULL,\n  created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),\n  expires_at  TIMESTAMPTZ  NULL,\n  created_by  VARCHAR(255) NULL,\n  code_source VARCHAR(16)  NOT NULL,\n  CONSTRAINT pk_urls PRIMARY KEY (short_code),\n  CONSTRAINT chk_code_source CHECK (code_source IN ('redis','db_sequence','custom')),\n  CONSTRAINT chk_short_code_format CHECK (short_code ~ '^[0-9a-zA-Z]{3,32}$'),\n  CONSTRAINT chk_long_url_len CHECK (char_length(long_url) <= 2048)\n);",
+      "-- V2__create_code_sequence.sql\n-- DB fallback counter. Starts at 62^6 = 56800235584 so fallback codes are 7 base62 chars,\n-- a range disjoint from the Redis counter (seeded at 62^2 = 3844), precluding cross-source collisions.\nCREATE SEQUENCE url_code_seq START WITH 56800235584 INCREMENT BY 1;"
+    ],
+    "evolution_notes": "Expand/contract strategy: never edit applied migrations; additive changes (new nullable columns, new tables) ship as new Vn scripts, followed by backfill, then a later contract migration drops legacy columns after all readers migrate. Redis is a disposable cache/counter layer; Postgres is the sole source of truth and can rebuild the cache lazily. The code space is partitioned by design (Redis counter from 3844 upward, DB sequence from 62^6 upward) so either allocator can grow independently. When analytics/events enter scope, add an outbox table (id, aggregate_id, event_type, schema_version, payload jsonb, created_at, published_at) in a new migration and publish versioned events to Kafka via a relay; event payloads carry schema_version for consumer-side compatibility. Testcontainers integration tests apply the full Flyway chain on every run, guarding migration validity."
+  },
+  "classes": {
+    "packages": [
+      {
+        "name": "com.example.urlshortener",
+        "classes": [
+          {
+            "fqcn": "com.example.urlshortener.UrlShortenerApplication",
+            "responsibility": "Spring Boot entrypoint; enables configuration properties scanning",
+            "depends_on": [
+              "com.example.urlshortener.config"
+            ]
+          }
+        ],
+        "may_depend_on": [
+          "com.example.urlshortener.config"
+        ]
+      },
+      {
+        "name": "com.example.urlshortener.config",
+        "classes": [
+          {
+            "fqcn": "com.example.urlshortener.config.AppProperties",
+            "responsibility": "Typed configuration: app.base-url (default http://localhost:8080), cache default TTL (24h), counter batch size (1000), Redis counter key and seed (3844)",
+            "depends_on": []
+          },
+          {
+            "fqcn": "com.example.urlshortener.config.RedisConfig",
+            "responsibility": "Lettuce connection factory and StringRedisTemplate beans with short command timeouts so outages fail fast into fallback paths",
+            "depends_on": [
+              "com.example.urlshortener.config.AppProperties"
+            ]
+          }
+        ],
+        "may_depend_on": []
+      },
+      {
+        "name": "com.example.urlshortener.domain",
+        "classes": [
+          {
+            "fqcn": "com.example.urlshortener.domain.UrlMapping",
+            "responsibility": "JPA entity for the urls table: short_code (id), long_url, created_at, expires_at, created_by, code_source; exposes isExpired(now)",
+            "depends_on": [
+              "com.example.urlshortener.domain.CodeSource"
+            ]
+          },
+          {
+            "fqcn": "com.example.urlshortener.domain.CodeSource",
+            "responsibility": "Enum REDIS('redis'), DB_SEQUENCE('db_sequence'), CUSTOM('custom') mapped to the code_source column",
+            "depends_on": []
+          }
+        ],
+        "may_depend_on": []
+      },
+      {
+        "name": "com.example.urlshortener.repository",
+        "classes": [
+          {
+            "fqcn": "com.example.urlshortener.repository.UrlMappingRepository",
+            "responsibility": "Spring Data JPA repository: save, findById, existsById, plus native query 'SELECT nextval(''url_code_seq'')' for the DB fallback counter",
+            "depends_on": [
+              "com.example.urlshortener.domain.UrlMapping"
+            ]
+          }
+        ],
+        "may_depend_on": [
+          "com.example.urlshortener.domain"
+        ]
+      },
+      {
+        "name": "com.example.urlshortener.codegen",
+        "classes": [
+          {
+            "fqcn": "com.example.urlshortener.codegen.Base62Encoder",
+            "responsibility": "Pure static encoding of non-negative long counter values to [0-9a-zA-Z] strings (and decode for tests)",
+            "depends_on": []
+          },
+          {
+            "fqcn": "com.example.urlshortener.codegen.CodeAllocation",
+            "responsibility": "Immutable record pairing a generated short code with its CodeSource",
+            "depends_on": [
+              "com.example.urlshortener.domain.CodeSource"
+            ]
+          },
+          {
+            "fqcn": "com.example.urlshortener.codegen.ShortCodeGenerator",
+            "responsibility": "Facade: try RedisCounterBatchAllocator, on Redis connectivity failure fall back to DbSequenceFallbackAllocator, tagging the allocation with the correct CodeSource and logging the fallback",
+            "depends_on": [
+              "com.example.urlshortener.codegen.RedisCounterBatchAllocator",
+              "com.example.urlshortener.codegen.DbSequenceFallbackAllocator",
+              "com.example.urlshortener.codegen.Base62Encoder",
+              "com.example.urlshortener.codegen.CodeAllocation"
+            ]
+          },
+          {
+            "fqcn": "com.example.urlshortener.codegen.RedisCounterBatchAllocator",
+            "responsibility": "Thread-safe in-memory range handout (AtomicLong pair); issues INCRBY 1000 on the global Redis counter only when the local batch is exhausted; seeds counter at 3844 via SETNX; discards remainder on restart (gaps OK)",
+            "depends_on": [
+              "com.example.urlshortener.config.RedisConfig",
+              "com.example.urlshortener.config.AppProperties"
+            ]
+          },
+          {
+            "fqcn": "com.example.urlshortener.codegen.DbSequenceFallbackAllocator",
+            "responsibility": "Obtains next value from Postgres sequence url_code_seq via UrlMappingRepository when Redis is unavailable",
+            "depends_on": [
+              "com.example.urlshortener.repository.UrlMappingRepository"
+            ]
+          }
+        ],
+        "may_depend_on": [
+          "com.example.urlshortener.config",
+          "com.example.urlshortener.repository",
+          "com.example.urlshortener.domain"
+        ]
+      },
+      {
+        "name": "com.example.urlshortener.error",
+        "classes": [
+          {
+            "fqcn": "com.example.urlshortener.error.GlobalExceptionHandler",
+            "responsibility": "@RestControllerAdvice mapping validation failures to 400, AliasConflictException to 409, ShortCodeNotFoundException to 404, ShortCodeExpiredException to 410, everything else to 500; all bodies are RFC 9457 ProblemDetail with application/problem+json",
+            "depends_on": [
+              "com.example.urlshortener.error.AliasConflictException",
+              "com.example.urlshortener.error.ShortCodeNotFoundException",
+              "com.example.urlshortener.error.ShortCodeExpiredException"
+            ]
+          },
+          {
+            "fqcn": "com.example.urlshortener.error.AliasConflictException",
+            "responsibility": "Thrown when a custom_alias/short_code already exists; maps to 409",
+            "depends_on": []
+          },
+          {
+            "fqcn": "com.example.urlshortener.error.ShortCodeNotFoundException",
+            "responsibility": "Thrown when a short code is absent from cache and DB; maps to 404",
+            "depends_on": []
+          },
+          {
+            "fqcn": "com.example.urlshortener.error.ShortCodeExpiredException",
+            "responsibility": "Thrown when expires_at is in the past; maps to 410",
+            "depends_on": []
+          }
+        ],
+        "may_depend_on": []
+      },
+      {
+        "name": "com.example.urlshortener.write",
+        "classes": [
+          {
+            "fqcn": "com.example.urlshortener.write.CreateUrlRequest",
+            "responsibility": "Request DTO with Bean Validation: long_url required http/https URI max 2048; custom_alias optional ^[0-9a-zA-Z]{3,32}$; expiration_date optional future instant",
+            "depends_on": []
+          },
+          {
+            "fqcn": "com.example.urlshortener.write.CreateUrlResponse",
+            "responsibility": "Response DTO: short_url, short_code, long_url, expires_at",
+            "depends_on": []
+          },
+          {
+            "fqcn": "com.example.urlshortener.write.UrlWriteController",
+            "responsibility": "POST /api/v1/urls; registered only under 'write' or default profile; delegates to UrlWriteService and returns 201",
+            "depends_on": [
+              "com.example.urlshortener.write.UrlWriteService",
+              "com.example.urlshortener.write.CreateUrlRequest",
+              "com.example.urlshortener.write.CreateUrlResponse"
+            ]
+          },
+          {
+            "fqcn": "com.example.urlshortener.write.UrlWriteService",
+            "responsibility": "Validates alias availability (existsById, plus DataIntegrityViolation translated to AliasConflictException as race guard), obtains code via ShortCodeGenerator when no alias, persists UrlMapping (created_by null, code_source from allocation or CUSTOM for aliases), builds short_url from AppProperties.baseUrl; no dedup of long_url",
+            "depends_on": [
+              "com.example.urlshortener.codegen.ShortCodeGenerator",
+              "com.example.urlshortener.repository.UrlMappingRepository",
+              "com.example.urlshortener.error.AliasConflictException",
+              "com.example.urlshortener.config.AppProperties"
+            ]
+          }
+        ],
+        "may_depend_on": [
+          "com.example.urlshortener.codegen",
+          "com.example.urlshortener.repository",
+          "com.example.urlshortener.domain",
+          "com.example.urlshortener.error",
+          "com.example.urlshortener.config"
+        ]
+      },
+      {
+        "name": "com.example.urlshortener.read",
+        "classes": [
+          {
+            "fqcn": "com.example.urlshortener.read.UrlReadController",
+            "responsibility": "GET /{shortCode:[0-9a-zA-Z]{3,32}} (regex-constrained to avoid shadowing /api and actuator); registered only under 'read' or default profile; returns 302 with Location and Cache-Control: private",
+            "depends_on": [
+              "com.example.urlshortener.read.UrlReadService"
+            ]
+          },
+          {
+            "fqcn": "com.example.urlshortener.read.UrlReadService",
+            "responsibility": "Cache-first lookup: on hit return long_url without DB query; on miss read Postgres, throw ShortCodeNotFoundException/ShortCodeExpiredException as appropriate, then populate cache with TTL = min(default 24h, remaining time to expires_at)",
+            "depends_on": [
+              "com.example.urlshortener.read.UrlCache",
+              "com.example.urlshortener.repository.UrlMappingRepository",
+              "com.example.urlshortener.error.ShortCodeNotFoundException",
+              "com.example.urlshortener.error.ShortCodeExpiredException"
+            ]
+          },
+          {
+            "fqcn": "com.example.urlshortener.read.UrlCache",
+            "responsibility": "Thin Redis wrapper (get/put with TTL) that catches connectivity failures, logs cache degradation at WARN, and returns empty so the service transparently falls back to Postgres",
+            "depends_on": [
+              "com.example.urlshortener.config.RedisConfig",
+              "com.example.urlshortener.config.AppProperties"
+            ]
+          }
+        ],
+        "may_depend_on": [
+          "com.example.urlshortener.repository",
+          "com.example.urlshortener.domain",
+          "com.example.urlshortener.error",
+          "com.example.urlshortener.config"
+        ]
+      }
+    ],
+    "layering_rules": [
+      "Layers flow one way: controller (read/write) -> service -> (codegen | repository | cache) -> domain; no lower layer may reference a higher one",
+      "read and write packages must never depend on each other; they are independently deployable via Spring profiles ('read', 'write', default = both)",
+      "config depends on nothing except its own properties and may be depended on by any layer; domain depends on nothing outside itself",
+      "error package is cross-cutting: services throw its exceptions, only GlobalExceptionHandler renders responses; controllers never build error bodies",
+      "Only the repository package touches JPA/SQL; only codegen and read.UrlCache touch Redis; controllers hold no persistence or Redis references",
+      "DTOs (write.CreateUrlRequest/Response) never leak JPA entities across the API boundary",
+      "Infrastructure artifacts (Dockerfile, k8s manifests) are protected and out of agent scope; no class may embed deployment logic"
+    ]
+  },
+  "decisions": [
+    "ADR-1: Version the API via path prefix /api/v1 — rejected header-based media-type versioning as harder to cache, test, and document.",
+    "ADR-2: Use Spring MVC (blocking) on Java 25 virtual threads instead of WebFlux — redirect latency is dominated by a single Redis/DB hit and virtual threads give I/O scalability without reactive complexity; rejected full reactive stack.",
+    "ADR-3: Allocate codes from a Redis counter with batched INCRBY 1000 handed out via an in-memory atomic range; unused remainder is discarded on restart (gaps acceptable per AMB-10) — rejected persisting/reclaiming unused ranges as needless complexity.",
+    "ADR-4: Seed the Redis counter at 62^2 = 3844 so generated codes are always >= 3 chars, one uniform format per AMB-11 — rejected allowing 1-2 char generated codes.",
+    "ADR-5: Start the DB fallback sequence at 62^6 = 56800235584 so Redis-sourced and db_sequence-sourced code ranges are disjoint, structurally precluding cross-source collisions — rejected overlapping ranges with PK-violation retry loops.",
+    "ADR-6: Cache entries use TTL = min(configurable 24h default, remaining time to expires_at) per AMB-9 — rejected indefinite caching, which risks serving expired links.",
+    "ADR-7: On any Redis failure, degrade gracefully: writes fall back to the Postgres sequence (code_source=db_sequence), reads bypass the cache with a WARN log — rejected failing requests when the cache/counter is down.",
+    "ADR-8: Custom aliases persist code_source='custom' (the CHECK constraint enumerates redis, db_sequence, custom) since no counter allocated them — rejected overloading 'redis'/'db_sequence' for aliases, which would corrupt allocator provenance.",
+    "ADR-9: All error responses flow through one @RestControllerAdvice producing RFC 9457 problem+json — rejected per-controller @ExceptionHandler methods as inconsistent.",
+    "ADR-10: Read/write separation via profile-conditional controller registration in a single artifact — rejected splitting into separate Maven modules/services as overkill for this scope.",
+    "ADR-11: No deduplication of long_url; every POST without alias yields a new distinct code per AC-4 — rejected unique index on long_url with 200-on-duplicate semantics.",
+    "ADR-12: Constrain the redirect mapping with a path-variable regex {shortCode:[0-9a-zA-Z]{3,32}} — rejected a catch-all /{shortCode} mapping that would shadow /api/v1 and actuator routes.",
+    "ADR-13: Defer Kafka + outbox until analytics enters scope; the evolution plan reserves a versioned-event outbox migration — rejected building event publishing now against the non-goals.",
+    "ADR-14: Postgres is the sole source of truth with Flyway append-only migrations (expand/contract) — rejected Redis-as-primary-store, which cannot guarantee durability."
+  ]
+}

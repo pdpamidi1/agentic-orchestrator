@@ -190,9 +190,10 @@ def _render_app(design: Design, pkg: str) -> str:
         f"app = FastAPI(title={pkg!r})",
     ]
     for op in design.api.operations:
-        codes = sorted(op.responses) or [200]
+        by_code = op.codes
+        codes = sorted(by_code) or [200]
         success = codes[0]
-        others = ", ".join(f"{c}: {{'description': {op.responses[c]!r}}}" for c in codes if c != success)
+        others = ", ".join(f"{c}: {{'description': {by_code[c]!r}}}" for c in codes if c != success)
         lines += [
             "",
             "",

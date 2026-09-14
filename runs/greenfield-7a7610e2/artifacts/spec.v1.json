@@ -1,0 +1,213 @@
+{
+  "run_id": "greenfield-7a7610e2",
+  "version": 1,
+  "summary": "Build a URL shortener service in Java 25 / Spring Boot 4 exposing a POST /api/v1/urls endpoint to create short URLs (with optional custom alias and expiration) and a GET /{short_code} redirect endpoint. Short codes are base62-encoded values from a globally unique Redis counter (batched INCRBY 1000) with fallback to a DB sequence, recording code_source. Postgres is the source of truth (Flyway migrations); Redis caches short_code -> long_url on the read path. Write and read paths must be independently deployable/scalable via profiles/config. Deliverables include global exception handling (problem+json), a committed OpenAPI document, unit and integration tests with Testcontainers, a Dockerfile, and a README.",
+  "stories": [
+    {
+      "id": "US-1",
+      "as_a": "API client",
+      "i_want": "to POST a long URL (optionally with a custom alias and expiration date) to /api/v1/urls",
+      "so_that": "I receive a short URL I can share instead of the long URL"
+    },
+    {
+      "id": "US-2",
+      "as_a": "end user",
+      "i_want": "to open a short URL and be redirected (302) to the original long URL",
+      "so_that": "I reach the intended destination via a compact link"
+    },
+    {
+      "id": "US-3",
+      "as_a": "API client",
+      "i_want": "clear, standard error responses (400 problem+json for invalid URLs, 409 for taken aliases/duplicates, 404 for unknown codes, 410 for expired codes)",
+      "so_that": "I can handle failures programmatically and reliably"
+    },
+    {
+      "id": "US-4",
+      "as_a": "platform operator",
+      "i_want": "short codes generated from a globally unique Redis counter (batched INCRBY 1000) with automatic fallback to a DB sequence when Redis is unavailable, recording code_source",
+      "so_that": "code generation is unique, fast, and resilient to Redis outages"
+    },
+    {
+      "id": "US-5",
+      "as_a": "platform operator",
+      "i_want": "the read path to consult a Redis cache (short_code -> long_url with TTL bounded by expiry) before hitting Postgres, and read/write paths deployable as separate independently scalable instances via profiles/config",
+      "so_that": "redirect latency stays low and each path scales to its own load profile"
+    },
+    {
+      "id": "US-6",
+      "as_a": "developer",
+      "i_want": "Flyway-managed Postgres schema, a committed OpenAPI document, unit and Testcontainers-based integration tests, a Dockerfile, and a README",
+      "so_that": "the service is reproducible, documented, and verifiable in CI"
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-1",
+      "given": "a running service and a valid request body containing a well-formed long_url",
+      "when": "the client sends POST /api/v1/urls",
+      "then": "the service responds 201 with a JSON body containing short_url, and a row exists in the Postgres urls table with short_code, long_url, created_at, and code_source populated"
+    },
+    {
+      "id": "AC-2",
+      "given": "a POST /api/v1/urls request whose long_url is missing or not a valid URL",
+      "when": "the request is processed",
+      "then": "the service responds 400 with Content-Type application/problem+json and a problem detail body describing the validation failure"
+    },
+    {
+      "id": "AC-3",
+      "given": "a custom_alias that is already registered as an existing short_code",
+      "when": "a client sends POST /api/v1/urls with that custom_alias",
+      "then": "the service responds 409 with an application/problem+json body indicating the alias/resource already exists"
+    },
+    {
+      "id": "AC-4",
+      "given": "a POST /api/v1/urls request with a valid ISO-8601 expiration_date",
+      "when": "the short URL is created",
+      "then": "expires_at is persisted in the urls table and any Redis cache entry for that code has a TTL no greater than the time remaining until expiry"
+    },
+    {
+      "id": "AC-5",
+      "given": "an existing, non-expired short_code",
+      "when": "a client sends GET /{short_code}",
+      "then": "the service responds 302 with Location set to the stored long_url and a Cache-Control: private header"
+    },
+    {
+      "id": "AC-6",
+      "given": "a short_code that does not exist",
+      "when": "a client sends GET /{short_code}",
+      "then": "the service responds 404 via the global exception handler with an application/problem+json body"
+    },
+    {
+      "id": "AC-7",
+      "given": "a short_code whose expires_at is in the past",
+      "when": "a client sends GET /{short_code}",
+      "then": "the service responds 410 Gone with an application/problem+json body"
+    },
+    {
+      "id": "AC-8",
+      "given": "Redis is available and the counter batch is exhausted or uninitialized",
+      "when": "a new short code is generated",
+      "then": "the service reserves a batch via INCRBY 1000 on the global Redis counter, encodes the allocated value in base62, and persists code_source indicating Redis as the origin"
+    },
+    {
+      "id": "AC-9",
+      "given": "Redis is unavailable (connection failure or timeout)",
+      "when": "a client sends POST /api/v1/urls without a custom_alias",
+      "then": "the service generates the code from a Postgres DB sequence, persists code_source indicating the DB fallback, and still responds 201"
+    },
+    {
+      "id": "AC-10",
+      "given": "a short_code whose mapping is present in the Redis cache",
+      "when": "a client sends GET /{short_code}",
+      "then": "the service serves the 302 redirect from the cache without querying Postgres; and given the mapping is not cached, the service reads from Postgres and populates the cache with TTL <= remaining expiry"
+    },
+    {
+      "id": "AC-11",
+      "given": "the application is started with the read-path profile/config and separately with the write-path profile/config",
+      "when": "requests are sent to each instance",
+      "then": "the read instance serves GET /{short_code} and the write instance serves POST /api/v1/urls, allowing independent scaling of each deployment"
+    },
+    {
+      "id": "AC-12",
+      "given": "a fresh checkout of the repository",
+      "when": "the build and test suite run",
+      "then": "Flyway migrations create the urls table (short_code PK, long_url, created_at, expires_at, created_by, code_source), unit tests and Testcontainers-based integration tests (Postgres and Redis) pass, the committed OpenAPI document matches the implemented endpoints, and the Dockerfile builds a runnable image as described in the README"
+    }
+  ],
+  "non_goals": [
+    "Authentication or authorization of API clients (explicitly out of scope; created_by is stored but not enforced)",
+    "Analytics, click tracking, or usage reporting (deferred to next scenario)",
+    "Python/FastAPI implementation (target stack for this run is Java; the FastAPI variant applies only when SDLC_TARGET_STACK=python)",
+    "Custom UI/front-end for creating or managing short URLs",
+    "Rate limiting and abuse prevention"
+  ],
+  "ambiguities": [
+    {
+      "id": "AMB-1",
+      "question": "What character rules and length constraints apply to custom_alias?",
+      "options": [
+        "Base62 characters only [0-9a-zA-Z], length 3-32",
+        "URL-safe characters including hyphen/underscore, length 1-64",
+        "No restriction beyond URL-path safety"
+      ],
+      "default_if_unanswered": "Base62 characters only [0-9a-zA-Z], length 3-32; violations return 400 problem+json"
+    },
+    {
+      "id": "AMB-2",
+      "question": "How should a POST be treated when the same long_url was already shortened (no custom_alias)? The spec says 'resource already exists -> 409' — does that apply to duplicate long_urls or only to taken aliases?",
+      "options": [
+        "409 only for taken custom_alias; duplicate long_urls get a new distinct short code",
+        "409 for duplicate long_url by the same creator",
+        "Return 200/201 with the existing short_url (idempotent)"
+      ],
+      "default_if_unanswered": "409 only applies to taken custom_alias; posting the same long_url again creates a new distinct short code"
+    },
+    {
+      "id": "AMB-3",
+      "question": "What URL validation rules apply to long_url (allowed schemes, max length)?",
+      "options": [
+        "Only http/https, max 2048 characters",
+        "Any syntactically valid absolute URI, max 8192 characters",
+        "http/https plus ftp, no length limit"
+      ],
+      "default_if_unanswered": "Only http and https schemes, maximum 2048 characters; otherwise 400 problem+json"
+    },
+    {
+      "id": "AMB-4",
+      "question": "Since authentication is a non-goal, how should the created_by column be populated?",
+      "options": [
+        "Nullable and left null",
+        "Populated from an optional request header (e.g., X-Created-By) if present, else null",
+        "Fixed constant such as 'anonymous'"
+      ],
+      "default_if_unanswered": "Nullable column left null in this scenario"
+    },
+    {
+      "id": "AMB-5",
+      "question": "Should an expiration_date in the past (or invalid ISO-8601 value) be rejected at creation time?",
+      "options": [
+        "Reject both past and malformed values with 400",
+        "Reject malformed values with 400 but accept past dates (link is immediately 410)",
+        "Accept anything parseable, silently ignore invalid values"
+      ],
+      "default_if_unanswered": "Reject both malformed ISO-8601 and past expiration_date values with 400 problem+json"
+    },
+    {
+      "id": "AMB-6",
+      "question": "How should Redis unavailability affect the read path (cache miss handling)?",
+      "options": [
+        "Bypass cache and serve directly from Postgres, degrade gracefully",
+        "Return 503 if Redis is down",
+        "Serve from Postgres and asynchronously retry cache population"
+      ],
+      "default_if_unanswered": "Bypass the cache and serve redirects directly from Postgres, logging the degradation"
+    },
+    {
+      "id": "AMB-7",
+      "question": "How are read-path and write-path separations enforced — should each instance disable the other path's endpoints?",
+      "options": [
+        "Profiles conditionally register only the relevant controllers; other endpoints return 404",
+        "All endpoints available on all instances; separation is routing/infrastructure concern only",
+        "A single 'all' profile plus dedicated read/write profiles"
+      ],
+      "default_if_unanswered": "Spring profiles (read, write, plus a default combined profile) conditionally register controllers; a read instance returns 404 for write endpoints and vice versa"
+    },
+    {
+      "id": "AMB-8",
+      "question": "What is the short_url base domain/host returned in the response?",
+      "options": [
+        "Configurable base URL property (e.g., app.base-url) with a localhost default",
+        "Derived from the incoming request's Host header",
+        "Hardcoded placeholder domain"
+      ],
+      "default_if_unanswered": "Configurable base URL application property, defaulting to http://localhost:8080"
+    }
+  ],
+  "assumptions": [
+    "Target stack is Java 25 with Spring Boot 4 and Flyway (SDLC_TARGET_STACK is not python for this run)",
+    "Postgres is the single source of truth; Redis is used for the counter and read cache only",
+    "The Redis counter batch size is exactly 1000 (INCRBY 1000) and each instance allocates codes from its reserved range in memory",
+    "Errors are rendered as RFC 7807 application/problem+json via a global exception handler",
+    "No previously answered clarifications exist; all listed ambiguities remain open"
+  ]
+}

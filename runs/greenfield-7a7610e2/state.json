@@ -1,0 +1,36 @@
+{
+  "run_id": "greenfield-7a7610e2",
+  "scenario": "greenfield",
+  "status": "AWAITING_APPROVAL",
+  "spec_version": 1,
+  "plan_version": 1,
+  "nodes": {
+    "requirement": "PASSED",
+    "clarify": "PASSED",
+    "planning": "PASSED",
+    "architecture": "PASSED",
+    "impact": "SKIPPED",
+    "security_review": "PASSED",
+    "risk_analysis": "PASSED",
+    "approval_design": "AWAITING_APPROVAL",
+    "implementation": "PENDING",
+    "unit_tests": "PENDING",
+    "code_review": "PENDING",
+    "integration_tests": "PENDING",
+    "validation": "PENDING",
+    "diagnose": "PENDING",
+    "documentation": "PENDING",
+    "release_readiness": "PENDING",
+    "approval_release": "PENDING"
+  },
+  "artifact_versions": {},
+  "pending_questions": [],
+  "halt_reason": null,
+  "budget": {
+    "tokens_used": 87877,
+    "cost_usd": 2.35617,
+    "replans": 0,
+    "started_at": "2026-09-14T03:16:40.076917Z"
+  },
+  "updated_at": "2026-09-14T03:25:22.400388Z"
+}

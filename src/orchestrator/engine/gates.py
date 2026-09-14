@@ -70,7 +70,8 @@ def contract_shape(doc: Mapping[str, Any]) -> Shape:
 
 def design_shape(design: Any) -> Shape:
     return {
-        f"{o.method.upper()} {_norm(o.path)}": {str(c) for c in o.responses} for o in design.api.operations
+        f"{o.method.upper()} {_norm(o.path)}": {str(r.status) for r in o.responses}
+        for o in design.api.operations
     }
 
 

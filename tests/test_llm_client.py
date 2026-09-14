@@ -3,6 +3,7 @@ prices correctly, record -> replay round-trips, and --record refuses to run with
 
 from __future__ import annotations
 
+import asyncio
 import json
 import string
 from pathlib import Path
@@ -15,7 +16,7 @@ from test_fake_llm import settings
 from orchestrator.agents.base import PROMPTS
 from orchestrator.agents.catalog import AGENTS
 from orchestrator.engine.context import RunContext
-from orchestrator.llm.client import AnthropicClient, RecordingClient, ReplayClient
+from orchestrator.llm.client import AnthropicClient, RecordingClient, ReplayClient, _key
 from orchestrator.llm.fake import CANNED, FakeClient
 from orchestrator.models import Plan, Spec
 from orchestrator.service import OrchestratorService
@@ -144,3 +145,43 @@ async def test_record_refuses_without_live_agents(tmp_path: Path, monkeypatch: p
     with pytest.raises(RuntimeError, match="nothing to record in replay mode"):
         await svc.start("greenfield", record=True)
     assert not (tmp_path / "runs" / "cache").exists()
+
+
+def _empty_objects(node: object, path: str = "") -> list[str]:
+    """Paths in a transformed schema that became `{}`-only objects (a dict the API cannot express)."""
+    found: list[str] = []
+    if isinstance(node, dict):
+        if (
+            node.get("type") == "object"
+            and node.get("properties") == {}
+            and not node.get("additionalProperties")
+        ):
+            found.append(path or "<root>")
+        for k, v in node.items():
+            found += _empty_objects(v, f"{path}.{k}" if path else k)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            found += _empty_objects(v, f"{path}[{i}]")
+    return found
+
+
+@pytest.mark.parametrize("agent_cls", list(AGENTS.values()), ids=lambda a: a.name)
+def test_no_agent_schema_degrades_to_an_empty_object(agent_cls) -> None:  # type: ignore[no-untyped-def]
+    from anthropic.lib._parse._transform import transform_schema
+
+    assert _empty_objects(transform_schema(agent_cls.output.model_json_schema())) == []
+
+
+async def test_recording_client_reuses_valid_hits_and_rerecords_stale_ones(tmp_path: Path) -> None:
+    inner = FakeClient()
+    rec = RecordingClient(inner, tmp_path)
+    await rec.structured("sys", "prompt", Spec)
+    await rec.structured("sys", "prompt", Spec)
+    assert inner.calls == ["Spec"]  # second call served from the cache, no live call
+    stale = tmp_path / f"{_key('sys', 'prompt', Spec)}.json"
+    await asyncio.to_thread(
+        stale.write_text, json.dumps({"schema": "Spec", "output": {"broken": True}, "usage": {}})
+    )
+    spec, _ = await rec.structured("sys", "prompt", Spec)
+    assert inner.calls == ["Spec", "Spec"] and spec.summary  # re-recorded
+    assert json.loads(await asyncio.to_thread(stale.read_text))["output"]["summary"] == spec.summary

@@ -59,7 +59,11 @@ class ClaudeCodeCliExecutor:
             title=task.title,
             stack=stack,
             allowed="\n".join(f"- {f}" for f in task.allowed_files),
-            contract="\n".join(f"- {o.method} {o.path} ({o.operation_id}) -> {o.responses}" for o in ops)
+            contract="\n".join(
+                f"- {o.method} {o.path} ({o.operation_id}) -> "
+                + ", ".join(f"{r.status} {r.description}" for r in o.responses)
+                for o in ops
+            )
             or "(none)",
             data="\n".join(f"- {t}" for t in task.data_model_slice) or "(none)",
             classes="\n".join(f"- {c}" for c in task.class_structure) or "(none)",

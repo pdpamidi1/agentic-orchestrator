@@ -166,8 +166,14 @@ class RecordingClient:
     async def structured(
         self, system: str, prompt: str, schema: type[T], *, max_repairs: int = 2
     ) -> tuple[T, Usage]:
-        out, usage = await self.inner.structured(system, prompt, schema, max_repairs=max_repairs)
         p = self.cache_dir / f"{_key(system, prompt, schema)}.json"
+        if p.exists():  # record once: an exact hit that still validates is reused, a stale one is re-recorded
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                return schema.model_validate(data["output"]), Usage(**data.get("usage", {}))
+            except (ValueError, KeyError):
+                pass
+        out, usage = await self.inner.structured(system, prompt, schema, max_repairs=max_repairs)
         p.write_text(
             json.dumps(
                 {"schema": schema.__name__, "output": out.model_dump(mode="json"), "usage": usage.__dict__},

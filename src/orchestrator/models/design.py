@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+from pydantic import Field
+
 from .common import Frozen
+
+
+class ResponseSpec(Frozen):
+    status: int = Field(description="HTTP status code, e.g. 201")
+    description: str = Field(
+        description="what the code means for this operation, e.g. 'created' or 'alias taken'"
+    )
 
 
 class Operation(Frozen):
     method: str
     path: str
     operation_id: str
-    responses: dict[int, str]
+    responses: list[ResponseSpec] = Field(
+        min_length=1, description="every status code the operation can return, success first"
+    )
     breaking: bool = False
+
+    @property
+    def codes(self) -> dict[int, str]:
+        return {r.status: r.description for r in self.responses}
 
 
 class ApiContract(Frozen):
