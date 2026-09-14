@@ -28,7 +28,7 @@ Status legend: [ ] todo · [~] in progress · [x] done
       the expected downstream; `plan.previous_version == 1`; one deliberate second re-plan hits `replan.limit_reached`.
 - [ ] **T10 Postgres store + trace sink**: `store/pg_store.py` and `trace/pg_sink.py` (SQLAlchemy async), migrations in
       `sql/`, `sql/views.sql` metrics must equal `trace/metrics.py` on the same run (test both).
-- [ ] **T11 Run report**: `reports/run_report.py` renders `runs/<id>/run_report.md`: requirement -> plan -> tasks ->
+- [x] **T11 Run report** (`sdlc report <run>`; sections 1-14 incl. an optional `delivery_notes.md`; NOT yet wired into `release_readiness`, which would need a `report:` flag on the node rather than a hard-coded id): `reports/run_report.py` renders `runs/<id>/run_report.md`: requirement -> plan -> tasks ->
       gates -> approvals -> metrics -> lineage table -> risks/assumptions/limitations. Wire into `release_readiness`.
 - [x] **T12 Resume** (`service.load`: state + typed artifacts + `context.json`, trace fallback for older runs; brownfield-859b9d7f resumed this way after a restart): rebuild `RunContext` from `runs/<id>/artifacts` so `approve`/`answer` work after an API restart.
 - [ ] **T13 Kafka trace mirror** (profile `kafka`): `trace/kafka_sink.py` publishing `TraceEvent`s to `sdlc.trace.events`.

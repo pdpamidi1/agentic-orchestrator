@@ -50,6 +50,7 @@ sdlc run --scenario greenfield --replay     # no API key; uses runs/cache
 SDLC_LLM=fake SDLC_TARGET_STACK=python make run   # offline loop: canned agents + fake executor; then:
 sdlc run --scenario greenfield              #   pauses at approval_design like a live run
 sdlc brief <run_id> approval_design         #   the design/plan/cost/changes brief a human decides on (also printed by run/answer)
+sdlc report <run_id>                        #   runs/<id>/run_report.md: requirement, spec, design, plan, decisions, timeline, gates, metrics
 sdlc approve <run_id> approval_design       #   attempt 1 writes .env -> VIOLATION + revert; attempt 2 clean;
                                             #   then pauses on the HIGH release task
 sdlc resume <run_id>                        #   after an API restart: continue a run that was RUNNING when its

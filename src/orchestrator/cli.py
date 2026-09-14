@@ -119,6 +119,14 @@ def metrics(run_id: str) -> None:
 
 
 @app.command()
+def report(run_id: str) -> None:
+    """Render ``runs/<id>/run_report.md`` offline from the run directory (artifacts, trace, approvals)."""
+    from .reports.run_report import write
+
+    typer.echo(str(write(Settings().runs_dir, run_id)))
+
+
+@app.command()
 def graph() -> None:
     """Print ``workflow.yaml`` as a Mermaid diagram, offline (loaded from ``Settings.workflow_path``)."""
     typer.echo(Graph.load(Settings().workflow_path).to_mermaid())
