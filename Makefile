@@ -7,8 +7,8 @@ demo:    ; sdlc run --scenario greenfield --replay
 approve: ; sdlc approve $(RUN) $(NODE)
 metrics: ; sdlc metrics $(RUN)
 # --- the delivered url-shortener with its own Postgres (localhost:5433) and Redis (localhost:6380) ---
-shortener-up:    ; docker compose --profile shortener up -d --build
-shortener-up-all:; docker compose --profile shortener --profile shortener-kafka up -d --build   # + Kafka (brownfield)
+shortener-up:    ; docker compose --profile shortener up -d --build shortener-app   # deps (postgres, redis, kafka) come along; the orchestrator's own postgres/redis stay out
+shortener-up-all:; docker compose --profile shortener --profile shortener-kafka up -d --build shortener-app   # alias of shortener-up (Kafka is in the profile now)
 shortener-down:  ; docker compose --profile shortener --profile shortener-kafka down
 shortener-logs:  ; docker compose --profile shortener logs -f shortener-app
 shortener-psql:  ; docker compose --profile shortener exec shortener-postgres psql -U shortener -d shortener
