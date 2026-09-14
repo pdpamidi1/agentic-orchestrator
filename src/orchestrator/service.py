@@ -301,14 +301,19 @@ class OrchestratorService:
         Raises ``FileNotFoundError`` when there is no ``state.json``.
         """
         state = await self.store.load(run_id)
-        saved = await self.store.load_context(run_id)
-        if saved is None or self.store.context_stale(run_id):
-            # no context.json, or one older than state.json (the process died between the two saves):
-            # approvals and producers come from the trace, which is appended synchronously; feedback and
-            # answers from the file are kept when there is one (answers are also replayed from the trace)
-            replayed = self._context_from_trace(run_id, state)
-            saved = {**(saved or {}), **replayed, "feedback": (saved or {}).get("feedback") or {}}
-            saved["answers"] = {**((saved or {}).get("answers") or {}), **replayed["answers"]}
+        saved = await self.store.load_context(run_id) or {}
+        # The trace is the ground truth for approvals (every grant, consumption and revocation is an
+        # event, appended synchronously); context.json is a cache of it that can lag or, worse, be
+        # rewritten from a stale view by a process that loaded the run mid-flight. Node tokens (a human's
+        # grant a handler has not consumed yet) come from the trace only, so a consumed grant is never
+        # resurrected; task/scope/action tokens are the union, so a stale file cannot lose one.
+        replayed = self._context_from_trace(run_id, state)
+        file_tokens = {a for a in saved.get("approvals") or () if a not in self.graph.nodes}
+        approvals = file_tokens | set(replayed["approvals"])
+        producers = {**replayed["producers"], **(saved.get("producers") or {})}
+        answers = {**(saved.get("answers") or {}), **replayed["answers"]}
+        feedback = saved.get("feedback") or replayed["feedback"]
+        saved = {**replayed, **saved, "producers": producers}
         ctx = RunContext(
             run_id=run_id,
             scenario=str(saved.get("scenario") or state.scenario),
@@ -318,13 +323,12 @@ class OrchestratorService:
             target_stack=str(saved.get("target_stack") or self.s.target_stack),
             replay=bool(saved.get("replay", False)),
         )
-        producers: dict[str, str] = dict(saved.get("producers") or {})
         for name, (version, path) in self.store.latest_artifacts(run_id).items():
             raw = json.loads(path.read_text(encoding="utf-8"))
             ctx.artifacts[name] = Artifact(name, version, _revive(name, raw), producers.get(name, "intake"))
-        ctx.feedback.update(saved.get("feedback") or {})
-        ctx.answers.update(saved.get("answers") or {})
-        ctx.approvals |= set(saved.get("approvals") or ())
+        ctx.feedback.update(feedback)
+        ctx.answers.update(answers)
+        ctx.approvals |= approvals
         # a node still RUNNING on disk was mid-attempt when its process died: nothing of that attempt is
         # trusted, so it is queued again (its handler resumes from committed work, e.g. changeset.commits)
         for nid, status in list(state.nodes.items()):
