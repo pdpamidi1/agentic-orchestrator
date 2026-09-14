@@ -216,3 +216,41 @@ async def test_halted_run_resumes_on_approval_with_a_fresh_task_allowance(graph,
         st.status in (RunStatus.COMPLETED, RunStatus.AWAITING_APPROVAL)
         and st.nodes["impl"] == NodeStatus.PASSED
     )
+
+
+async def test_persist_hook_runs_after_every_state_save(graph, ctx, state, store):  # type: ignore[no-untyped-def]
+    """The context half of a run is written as often as the state (a dead process loses no batch)."""
+    saved: list[str] = []
+
+    async def persist(c, st):  # type: ignore[no-untyped-def]
+        saved.append(st.status.value)
+
+    hs = make_handlers({"a": [Success({"spec": spec()})], "b": [Success({"plan": "p1"})]})
+    r = Runner(graph, hs, store, sleep=no_sleep, persist=persist)
+    st = await r.run(ctx, state)
+    assert st.status == RunStatus.AWAITING_APPROVAL
+    assert len(saved) >= 4 and saved[-1] == "AWAITING_APPROVAL"  # batch starts, batch ends, the pause
+
+
+async def test_approve_after_a_diagnose_halt_is_the_reviewers_retry(graph, ctx, state, store):  # type: ignore[no-untyped-def]
+    """Resuming a `diagnose.unrecoverable` halt re-runs the gates instead of re-reading their failure."""
+    hs = make_handlers(
+        {
+            "a": [Success({"spec": spec()})],
+            "b": [Success({"plan": "p1"})],
+            "impl": [Success({"changeset": "cs"})],
+            "validate": [Retry("scope: token missing"), Retry("scope"), Retry("scope"), Success()],
+            "diagnose": [Route("halt")],
+        }
+    )
+    r = Runner(graph, hs, store, sleep=no_sleep)
+    st = await r.run(ctx, state)
+    st = await r.approve(ctx, st, "approve", "pdp")
+    assert st.status == RunStatus.HALTED and st.halt_reason == "diagnose.unrecoverable"
+    validate_runs = hs["_calls"]["validate"]
+    st = await r.approve(ctx, st, "impl", "pdp")  # the reviewer fixed the cause and asks for another try
+    events = ctx.trace.events(ctx.run_id)
+    trig = [e for e in events if e.kind == Kind.REPLAN_TRIGGERED and e.payload.get("route") == "human.retry"]
+    assert trig and trig[0].payload["changed"] == ["changeset"] and trig[0].actor == "pdp"
+    assert hs["_calls"]["validate"] > validate_runs and hs["_calls"]["impl"] == 2
+    assert st.status == RunStatus.AWAITING_APPROVAL and st.nodes["release"] == NodeStatus.AWAITING_APPROVAL

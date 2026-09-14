@@ -102,6 +102,7 @@ class Runner:
         store: StateStore,
         rollback: RollbackHook | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        persist: Callable[[RunContext, RunState], Awaitable[None]] | None = None,
     ) -> None:
         """Wire the collaborators.
 
@@ -111,12 +112,22 @@ class Runner:
             store: where ``RunState`` is persisted.
             rollback: hook applied on retry exhaustion without a fallback; ``None`` -> ``NoRollback``.
             sleep: backoff sleeper, injectable so tests do not wait for real seconds.
+            persist: called with (ctx, state) right after every state save (batch end, pause, halt) so
+                the context half of the run (artifacts, approvals, feedback) is on disk as often as the
+                state is; a process that dies mid-run then resumes without losing a batch's grants.
         """
         self.graph = graph
         self.handlers = handlers  # keyed by node kind ("agent", "executor", "gate", "approval", "input")
         self.store = store
         self.rollback = rollback or NoRollback()
         self._sleep = sleep
+        self._persist = persist
+
+    async def _save(self, ctx: RunContext, state: RunState) -> None:
+        """Persist the state and, when configured, the context (see ``persist`` in ``__init__``)."""
+        await self.store.save(state)
+        if self._persist is not None:
+            await self._persist(ctx, state)
 
     # ------------------------------------------------------------------ public API
     async def run(self, ctx: RunContext, state: RunState) -> RunState:
@@ -157,13 +168,13 @@ class Runner:
                 else:
                     # stuck: a node FAILED without a fallback, so its dependents can never become ready
                     state.status = state.status if state.status != RunStatus.RUNNING else RunStatus.FAILED
-                await self.store.save(state)
+                await self._save(ctx, state)
                 return state
 
             batch = ready[: pol.budgets.parallelism]
             for n in batch:
                 state.mark(n.id, NodeStatus.RUNNING)
-            await self.store.save(state)
+            await self._save(ctx, state)
 
             results = await asyncio.gather(*(self._execute(n, ctx, state) for n in batch))  # join point
 
@@ -174,7 +185,7 @@ class Runner:
                 paused |= await self._apply(node, outcome, ctx, state)
             if paused and state.status != RunStatus.HALTED:
                 state.budget.pause()  # AWAITING_*: the wall clock stops until a human answers
-            await self.store.save(state)
+            await self._save(ctx, state)
             if state.status == RunStatus.HALTED:
                 return state
             if paused:
@@ -196,12 +207,24 @@ class Runner:
         ctx.emit(Kind.APPROVAL_GRANTED, node_id=node_id, actor=approver, status="APPROVED")
         if state.status == RunStatus.HALTED:  # safe-stop is "persist state then halt; resumable after review"
             state.status = RunStatus.RUNNING
+            after = state.halt_reason or ""
             ctx.emit(
                 Kind.RUN_RESUMED,
                 node_id=node_id,
                 actor=approver,
-                payload={"after": state.halt_reason, "lineage": ctx.lineage_snapshot()},
+                payload={"after": after, "lineage": ctx.lineage_snapshot()},
             )
+            if after.startswith("diagnose") or after == "gate.repeated_failure":
+                # the reviewer asks for another try after a failed validation: the same invalidation the
+                # diagnoser's `retry` route performs, so the gates (and what depends on them) run again
+                # instead of re-reading the recorded failure
+                ctx.emit(
+                    Kind.REPLAN_TRIGGERED,
+                    node_id=node_id,
+                    actor=approver,
+                    payload={"changed": ["changeset"], "route": "human.retry"},
+                )
+                self.invalidate(ctx, state, {"changeset"}, origin=node_id, reproduce=True)
             if state.halt_reason == "budget.exceeded:wall_clock":
                 # the reviewer decided to go on: like task_attempts below, the wall clock starts afresh
                 state.budget.started_at = utcnow()
@@ -604,5 +627,5 @@ class Runner:
         ctx.emit(
             Kind.RUN_HALTED, status="HALTED", payload={"trigger": reason, "lineage": ctx.lineage_snapshot()}
         )
-        await self.store.save(state)
+        await self._save(ctx, state)
         return state

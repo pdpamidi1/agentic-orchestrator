@@ -186,3 +186,30 @@ async def test_scope_gate_accepts_human_granted_files(tmp_path: Path) -> None:
     assert [f.file for f in findings if f.rule == "task.allowed_files"] == ["tests/unit/test_x.py"]
     ctx.approvals.add(f"scope:{task.id}:tests/unit/test_x.py")  # the human granted exactly that file
     assert await diff_scope(ctx, git) == []
+
+
+async def test_stale_context_file_is_rebuilt_from_the_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """context.json older than state.json (process died between the two saves) must not lose grants."""
+    import json
+    import os
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    first = OrchestratorService(settings(tmp_path, target_stack="python"))
+    live = await first.start("greenfield")
+    run_id = live.state.run_id
+    live = await first.approve(run_id, "approval_design", "pdp")
+    live = await first.approve(run_id, "implementation", "pdp")
+    run_dir = tmp_path / "runs" / run_id
+    ctx_file, state_file = run_dir / "context.json", run_dir / "state.json"
+    doc = json.loads(ctx_file.read_text())
+    doc["approvals"] = [a for a in doc["approvals"] if not a.startswith("task:")]  # as if never saved
+    ctx_file.write_text(json.dumps(doc))
+    old = state_file.stat().st_mtime
+    os.utime(ctx_file, (old - 10, old - 10))  # the state save came later than the context save
+
+    back = await OrchestratorService(settings(tmp_path, target_stack="python")).live(run_id)
+    assert back is not None
+    assert back.ctx.approvals == live.ctx.approvals
+    assert any(a.startswith("task:") for a in back.ctx.approvals)

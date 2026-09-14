@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import functools
 import json
 import os
 import shutil
@@ -208,7 +209,13 @@ class OrchestratorService:
         if record:  # record once (live or fake), replay forever
             llm = RecordingClient(llm, self.s.cache_dir / "llm")
             executor = RecordingExecutor(executor, self.s.cache_dir / "changesets")
-        return Runner(self.graph, build_handlers(llm, executor, self.graph), self.store, GitRollback())
+        return Runner(
+            self.graph,
+            build_handlers(llm, executor, self.graph),
+            self.store,
+            GitRollback(),
+            persist=functools.partial(self._persist, record=record),
+        )
 
     async def start(
         self,
@@ -295,8 +302,13 @@ class OrchestratorService:
         """
         state = await self.store.load(run_id)
         saved = await self.store.load_context(run_id)
-        if saved is None:
-            saved = self._context_from_trace(run_id, state)
+        if saved is None or self.store.context_stale(run_id):
+            # no context.json, or one older than state.json (the process died between the two saves):
+            # approvals and producers come from the trace, which is appended synchronously; feedback and
+            # answers from the file are kept when there is one (answers are also replayed from the trace)
+            replayed = self._context_from_trace(run_id, state)
+            saved = {**(saved or {}), **replayed, "feedback": (saved or {}).get("feedback") or {}}
+            saved["answers"] = {**((saved or {}).get("answers") or {}), **replayed["answers"]}
         ctx = RunContext(
             run_id=run_id,
             scenario=str(saved.get("scenario") or state.scenario),
@@ -316,13 +328,20 @@ class OrchestratorService:
         # a node still RUNNING on disk was mid-attempt when its process died: nothing of that attempt is
         # trusted, so it is queued again (its handler resumes from committed work, e.g. changeset.commits)
         for nid, status in list(state.nodes.items()):
-            if status == NodeStatus.RUNNING:
+            node = self.graph.nodes.get(nid)
+            lost = [a for a in (node.produces if node else []) if a not in ctx.artifacts]
+            if status == NodeStatus.RUNNING or (status == NodeStatus.PASSED and lost):
+                # PASSED-but-artifact-missing: the node finished in memory but its process died before
+                # the artifact reached disk; re-running it is the only honest way to get the result back
                 state.mark(nid, NodeStatus.PENDING)
                 ctx.emit(
                     Kind.NODE_INVALIDATED,
                     node_id=nid,
                     actor="orchestrator",
-                    payload={"because": ["process.restart"], "origin": "resume"},
+                    payload={
+                        "because": ["process.restart"] if status == NodeStatus.RUNNING else lost,
+                        "origin": "resume",
+                    },
                 )
         live = LiveRun(ctx, state, record=bool(saved.get("record", False)))
         self.runs[run_id] = live
@@ -493,13 +512,17 @@ class OrchestratorService:
         return live
 
     async def _persist_artifacts(self, live: LiveRun) -> None:
+        """Persist a live run's context (see ``_persist``); the post-call hook of start/approve/answer."""
+        await self._persist(live.ctx, live.state, record=live.record)
+
+    async def _persist(self, ctx: RunContext, state: RunState, *, record: bool) -> None:
         """Write every artifact in context as ``artifacts/<name>.v<n>.json`` plus ``context.json``.
 
-        Idempotent: existing versions are rewritten with identical content; older versions are never
-        removed. ``context.json`` (feedback, answers, approval tokens, producers, mode flags) is what
-        ``load`` needs beyond the artifacts to resume the run in another process.
+        Called by the runner after every state save (``Runner.persist``) and by the service after each
+        start/approve/answer/resume. Idempotent: existing versions are rewritten with identical content;
+        older versions are never removed. ``context.json`` (feedback, answers, approval tokens, producers,
+        mode flags) is what ``load`` needs beyond the artifacts to resume the run in another process.
         """
-        ctx = live.ctx
         for a in ctx.artifacts.values():
             await self.store.save_artifact(ctx.run_id, a.name, a.version, a.value)
         await self.store.save_context(
@@ -507,7 +530,7 @@ class OrchestratorService:
             {
                 "scenario": ctx.scenario,
                 "replay": ctx.replay,
-                "record": live.record,
+                "record": record,
                 "target_stack": ctx.target_stack,
                 "producers": {a.name: a.produced_by for a in ctx.artifacts.values()},
                 "feedback": ctx.feedback,

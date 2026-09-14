@@ -97,6 +97,15 @@ class FileStore:
         data: dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
         return data
 
+    def context_stale(self, run_id: str) -> bool:
+        """True when ``context.json`` is missing or older than ``state.json``: the process died between
+        the state save and the context save, so the file may lack grants the trace already records."""
+        d = self.runs_dir / run_id
+        ctx, st = d / "context.json", d / "state.json"
+        if not ctx.exists():
+            return True
+        return st.exists() and ctx.stat().st_mtime < st.stat().st_mtime - 1
+
     def latest_artifacts(self, run_id: str) -> dict[str, tuple[int, Path]]:
         """Artifact name -> (highest saved version, its file) from ``artifacts/<name>.v<n>.json``."""
         out: dict[str, tuple[int, Path]] = {}
