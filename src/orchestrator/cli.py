@@ -23,15 +23,26 @@ from .trace.sink import JsonlSink
 app = typer.Typer(no_args_is_help=True)
 # base URL of the API process; overridable so the CLI can drive a remote or non-default port
 BASE = os.environ.get("SDLC_API", "http://localhost:8080")
+# how long a blocking call (run/approve/answer) waits for the next pause; the run outlives the client
+TIMEOUT = float(os.environ.get("SDLC_CLI_TIMEOUT", "3600"))
 
 
 def _post(path: str, body: dict) -> None:  # type: ignore[type-arg]
     """POST ``body`` as JSON to ``BASE + path`` and print the reply.
 
-    The timeout is one hour because ``/runs`` blocks until the run pauses or finishes. A 4xx/5xx reply
-    (e.g. 404 unknown run, 409 deliver on a non-COMPLETED run) raises ``httpx.HTTPStatusError``.
+    The request blocks until the run pauses or finishes, so the read timeout is ``SDLC_CLI_TIMEOUT``
+    seconds (default one hour). Hitting it does not stop the run: the server keeps executing after the
+    client disconnects, so the CLI says how to follow the run instead of failing. A 4xx/5xx reply (e.g.
+    404 unknown run, 409 deliver on a non-COMPLETED run) raises ``httpx.HTTPStatusError``.
     """
-    r = httpx.post(f"{BASE}{path}", json=body, timeout=3600)
+    try:
+        r = httpx.post(f"{BASE}{path}", json=body, timeout=TIMEOUT)
+    except httpx.ReadTimeout:
+        typer.echo(
+            f"still running after {TIMEOUT:.0f}s; the run continues on the server. "
+            "Follow it with `sdlc status <run>` (or SDLC_CLI_TIMEOUT=<seconds> to wait longer)."
+        )
+        return
     r.raise_for_status()
     data = r.json()
     brief = data.pop("pending_approval", None) if isinstance(data, dict) else None
