@@ -9,7 +9,7 @@ Sources, in the order the document presents them:
   security_findings, risk_register, review, diagnosis, unit/integration/validation results;
 - ``approvals.jsonl``: every human decision;
 - ``trace.jsonl``: the execution timeline (tasks, policy decisions, rollbacks, halts, resumes, gate results)
-  and the cost split (agent ``LLM_CALL`` vs executor ``EXECUTOR_CALL``), plus ``trace/metrics.compute``;
+  and token usage, plus ``trace/metrics.compute``;
 - ``state.json``: status, halt reason, budget;
 - ``delivery_notes.md`` (optional): free text an operator adds about what happened after the run, e.g. a
   manual delivery; appended verbatim as the last section.
@@ -23,6 +23,7 @@ survives schema drift between the run's version and today's.
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -105,9 +106,8 @@ def _fmt_dt(v: datetime | str | None) -> str:
 
 
 def _header(run_id: str, state: dict[str, Any] | None, events: list[TraceEvent]) -> list[str]:
-    llm = sum(e.cost_usd for e in events if e.kind == Kind.LLM_CALL)
-    exe = sum(e.cost_usd for e in events if e.kind == Kind.EXECUTOR_CALL)
     tokens = sum(e.tokens_in + e.tokens_out for e in events if e.kind == Kind.LLM_CALL)
+    calls = sum(1 for e in events if e.kind == Kind.EXECUTOR_CALL)
     first, last = (events[0].ts, events[-1].ts) if events else (None, None)
     rows: list[list[object]] = [
         ["Scenario", (state or {}).get("scenario", "-")],
@@ -115,18 +115,12 @@ def _header(run_id: str, state: dict[str, Any] | None, events: list[TraceEvent])
         ["Halt reason", (state or {}).get("halt_reason") or "-"],
         ["First event", _fmt_dt(first)],
         ["Last event", _fmt_dt(last)],
-        ["Agent (LLM) spend", f"${llm:.2f} ({tokens:,} tokens)"],
-        ["Executor (Claude Code) spend, recorded", f"${exe:.2f}"],
-        ["Total recorded spend", f"${llm + exe:.2f}"],
+        ["Agent (LLM) tokens", f"{tokens:,}"],
+        ["Executor (Claude Code) calls", calls],
     ]
     if state:
         b = state.get("budget", {})
-        rows.append(
-            [
-                "Budget counters (state.json)",
-                f"cost ${b.get('cost_usd', 0):.2f}, replans {b.get('replans', 0)}",
-            ]
-        )
+        rows.append(["Re-plans (state.json)", b.get("replans", 0)])
     return [f"# Run report: {run_id}", "", *_table(["Field", "Value"], rows)]
 
 
@@ -363,6 +357,7 @@ def _approvals(run_dir: Path, a: dict[str, tuple[int, Any]]) -> list[str]:
             "",
         ]
         brief_md = str(b.get("markdown", "")).strip().replace("\n## ", "\n#### ").replace("\n# ", "\n### ")
+        brief_md = re.sub(r" · spent so far:[^\n]*", "", brief_md)  # no spend figures in the document
         out += [brief_md, "", "</details>", ""]
     return out
 
@@ -378,9 +373,7 @@ def _timeline(events: list[TraceEvent]) -> list[str]:
             continue  # a clean write-boundary check per task is not a decision worth a row
         detail = ""
         if e.kind == Kind.EXECUTOR_CALL:
-            detail = f"turns {p.get('turns', '-')}, ${e.cost_usd:.2f}" + (
-                f", {p.get('patch')}" if p.get("patch") else ""
-            )
+            detail = f"turns {p.get('turns', '-')}" + (f", {p.get('patch')}" if p.get("patch") else "")
         elif e.kind == Kind.POLICY_DECISION:
             if p.get("findings"):
                 detail = "; ".join(f"{f.get('file')}: {f.get('rule')}" for f in p["findings"][:4])
@@ -417,7 +410,7 @@ def _timeline(events: list[TraceEvent]) -> list[str]:
 def _tasks_executed(events: list[TraceEvent]) -> list[str]:
     out = ["## 9. Tasks as executed", ""]
     per: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {"calls": 0, "cost": 0.0, "ok": 0, "violations": 0, "rolled_back": 0, "reused": 0}
+        lambda: {"calls": 0, "ok": 0, "violations": 0, "rolled_back": 0, "reused": 0}
     )
     for e in events:
         if not e.task_id:
@@ -425,7 +418,6 @@ def _tasks_executed(events: list[TraceEvent]) -> list[str]:
         t = per[e.task_id]
         if e.kind == Kind.EXECUTOR_CALL:
             t["calls"] += 1
-            t["cost"] += e.cost_usd
             if e.status == "OK":
                 t["ok"] += 1
             if e.status == "REUSED":
@@ -435,18 +427,13 @@ def _tasks_executed(events: list[TraceEvent]) -> list[str]:
         elif e.kind == Kind.ROLLED_BACK:
             t["rolled_back"] += 1
     out += _table(
-        ["Task", "Executor calls", "Recorded cost", "Reused patches", "Policy violations", "Rollbacks"],
+        ["Task", "Executor calls", "Reused patches", "Policy violations", "Rollbacks"],
         [
-            [k, v["calls"], f"${v['cost']:.2f}", v["reused"], v["violations"], v["rolled_back"]]
+            [k, v["calls"], v["reused"], v["violations"], v["rolled_back"]]
             for k, v in sorted(per.items())
             if v["calls"]  # gate events carry the gate node as task_id; only executed tasks belong here
         ],
     )
-    out += [
-        "Attempts killed by the per-task timeout do not report cost (the agent's JSON never arrives), so",
-        "recorded executor spend is a lower bound.",
-        "",
-    ]
     return out
 
 
@@ -502,11 +489,8 @@ def _gates(a: dict[str, tuple[int, Any]]) -> list[str]:
 
 def _metrics(run_id: str, events: list[TraceEvent]) -> list[str]:
     m = compute(run_id, events).as_dict()
-    return [
-        "## 11. Metrics (derived from the trace)",
-        "",
-        *_table(["Metric", "Value"], [[k, v] for k, v in m.items()]),
-    ]
+    rows = [[k, v] for k, v in m.items() if "cost" not in k]  # spend stays in the trace, not the document
+    return ["## 11. Metrics (derived from the trace)", "", *_table(["Metric", "Value"], rows)]
 
 
 def _lineage(a: dict[str, tuple[int, Any]], events: list[TraceEvent]) -> list[str]:

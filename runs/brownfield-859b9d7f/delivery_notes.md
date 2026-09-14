@@ -17,5 +17,4 @@ gained Kafka in the `shortener` profile plus `SHORTENER_KAFKA_BOOTSTRAP_SERVERS`
 `SHORTENER_ANALYTICS_IP_SALT`. Orchestrator defects found by this run and fixed the same day: `**/` glob
 matching, wall clock counting human waits, executor timeout leaving Maven/JVM orphans, prompt without a time
 budget, PII scan flagging prose, scope gate ignoring human scope grants, context persistence only at call
-end, no resume after a process restart (T12). Recorded spend for the run is a lower bound: four attempts
-killed by the timeout never reported their cost.
+end, no resume after a process restart (T12).

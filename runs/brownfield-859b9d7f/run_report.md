@@ -7,10 +7,9 @@
 | Halt reason | - |
 | First event | 2026-09-14 14:18:40 UTC |
 | Last event | 2026-09-14 19:23:44 UTC |
-| Agent (LLM) spend | $2.71 (223,647 tokens) |
-| Executor (Claude Code) spend, recorded | $34.49 |
-| Total recorded spend | $37.19 |
-| Budget counters (state.json) | cost $2.29, replans 0 |
+| Agent (LLM) tokens | 223,647 |
+| Executor (Claude Code) calls | 14 |
+| Re-plans (state.json) | 0 |
 
 ## 1. Requirement
 
@@ -654,7 +653,7 @@ Failure scenarios:
 <details><summary>Full brief as shown to the approver</summary>
 
 # Approval requested: approval_design (plan.approve)
-Run brownfield-859b9d7f · scenario brownfield · spent so far: 2.068 USD (agents 2.068, executor 0.0)
+Run brownfield-859b9d7f · scenario brownfield
 
 #### What is being built
 Extend the existing Java URL shortener with privacy-preserving click analytics: every successful GET /{short_code} redirect records a url.clicked event via a transactional outbox (never blocking the redirect), an in-process poller publishes those events to the Kafka topic url.clicked keyed by short_code, an analytics consumer aggregates them into click_stats, and a new additive endpoint GET /api/v1/urls/{short_code}/stats exposes total clicks, last clicked timestamp, and a 30-day daily breakdown with an as_of timestamp. Raw IPs are never persisted (salted SHA-256 only), raw click events are retained 90 days, and publishing/consuming use bounded retries with exponential backoff + jitter, timeouts, and idempotency keys. The existing redirect contract stays backward compatible with no more than a 5% p95 latency increase.
@@ -779,16 +778,16 @@ Decide with `sdlc approve <run> <node>` or `sdlc reject <run> <node> --reason ..
 | 15:06:34 | APPROVAL_GRANTED | implementation |  | APPROVED |  |
 | 15:06:34 | RUN_STARTED |  |  |  |  |
 | 15:06:34 | POLICY_DECISION | implementation | T1 | APPROVED | task.high_impact |
-| 15:14:30 | EXECUTOR_CALL |  | T1 | OK | turns 29, $2.47 |
+| 15:14:30 | EXECUTOR_CALL |  | T1 | OK | turns 29 |
 | 15:14:30 | POLICY_DECISION |  | T1 | OK | approved actions: dependency.major_version, secrets.or_config |
 | 15:14:30 | APPROVAL_REQUESTED | implementation |  | PENDING | task.high_impact — T2: Schema migrations plus persistence model for click_outbox and click_stats |
 | 15:16:37 | APPROVAL_GRANTED | implementation |  | APPROVED |  |
 | 15:16:37 | RUN_STARTED |  |  |  |  |
 | 15:16:37 | POLICY_DECISION | implementation | T2 | APPROVED | task.high_impact |
-| 15:27:51 | EXECUTOR_CALL |  | T2 | OK | turns 39, $4.52 |
+| 15:27:51 | EXECUTOR_CALL |  | T2 | OK | turns 39 |
 | 15:27:51 | POLICY_DECISION |  | T2 | VIOLATION | src/main/java/com/example/shortener/analytics/domain/ClickOutboxEntry.java: task.allowed_files; src/main/java/com/example/shortener/analytics/domain/ClickStats… |
 | 15:27:51 | ROLLED_BACK | implementation | T2 |  | policy violation at the write boundary |
-| 15:28:54 | EXECUTOR_CALL |  | T2 | OK | turns 6, $0.60 |
+| 15:28:54 | EXECUTOR_CALL |  | T2 | OK | turns 6 |
 | 15:28:54 | POLICY_DECISION | implementation | T2 | SCOPE_REQUESTED | task.scope_change: src/main/java/com/example/shortener/analytics/domain/ClickOutboxEntry.java, src/main/java/com/example/shortener/analytics/domain/OutboxStatu… |
 | 15:28:54 | APPROVAL_REQUESTED | implementation |  | PENDING | task.scope_change — T2: None |
 | 15:29:49 | APPROVAL_GRANTED | implementation |  | APPROVED |  |
@@ -798,13 +797,13 @@ Decide with `sdlc approve <run> <node>` or `sdlc reject <run> <node> --reason ..
 | 16:54:34 | RUN_RESUMED | implementation |  |  | after budget.exceeded:wall_clock |
 | 16:54:34 | RUN_STARTED |  |  |  |  |
 | 16:54:34 | POLICY_DECISION | implementation | T2 | SCOPE_APPROVED | task.scope_change: src/main/java/com/example/shortener/analytics/domain/ClickOutboxEntry.java, src/main/java/com/example/shortener/analytics/domain/OutboxStatu… |
-| 16:54:35 | EXECUTOR_CALL |  | T2 | REUSED | turns -, $0.00, T2.attempt1.patch |
+| 16:54:35 | EXECUTOR_CALL |  | T2 | REUSED | turns -, T2.attempt1.patch |
 | 16:54:35 | POLICY_DECISION |  | T2 | OK | approved actions: schema.migration |
-| 17:06:41 | EXECUTOR_CALL |  | T3 | OK | turns 39, $4.67 |
-| 17:16:21 | EXECUTOR_CALL |  | T4 | OK | turns 31, $4.47 |
-| 17:26:14 | EXECUTOR_CALL |  | T5 | OK | turns 25, $4.42 |
-| 17:53:35 | EXECUTOR_CALL |  | T6 | OK | turns 22, $1.52 |
-| 18:00:57 | EXECUTOR_CALL |  | T7 | OK | turns 35, $4.13 |
+| 17:06:41 | EXECUTOR_CALL |  | T3 | OK | turns 39 |
+| 17:16:21 | EXECUTOR_CALL |  | T4 | OK | turns 31 |
+| 17:26:14 | EXECUTOR_CALL |  | T5 | OK | turns 25 |
+| 17:53:35 | EXECUTOR_CALL |  | T6 | OK | turns 22 |
+| 18:00:57 | EXECUTOR_CALL |  | T7 | OK | turns 35 |
 | 18:00:57 | POLICY_DECISION | implementation | T7 | SCOPE_REQUESTED | task.scope_change: src/test/java/com/example/shortener/it/OpenApiContractIT.java |
 | 18:00:57 | APPROVAL_REQUESTED | implementation |  | PENDING | task.scope_change — T7: None |
 | 18:01:23 | APPROVAL_GRANTED | implementation |  | APPROVED |  |
@@ -819,12 +818,12 @@ Decide with `sdlc approve <run> <node>` or `sdlc reject <run> <node> --reason ..
 | 18:49:36 | APPROVAL_GRANTED | implementation |  | APPROVED |  |
 | 18:49:36 | RUN_RESUMED | implementation |  |  | after implementation.blocked |
 | 18:49:36 | RUN_STARTED |  |  |  |  |
-| 18:51:21 | EXECUTOR_CALL |  | T7 | OK | turns 15, $1.11 |
+| 18:51:21 | EXECUTOR_CALL |  | T7 | OK | turns 15 |
 | 18:51:22 | POLICY_DECISION | implementation | T8 | APPROVED | task.high_impact |
-| 19:00:08 | EXECUTOR_CALL |  | T8 | OK | turns 53, $4.55 |
+| 19:00:08 | EXECUTOR_CALL |  | T8 | OK | turns 53 |
 | 19:00:08 | POLICY_DECISION |  | T8 | VIOLATION | README.md: compliance.pii |
 | 19:00:08 | ROLLED_BACK | implementation | T8 |  | policy violation at the write boundary |
-| 19:02:45 | EXECUTOR_CALL |  | T8 | OK | turns 16, $0.88 |
+| 19:02:45 | EXECUTOR_CALL |  | T8 | OK | turns 16 |
 | 19:02:45 | POLICY_DECISION |  | T8 | OK | approved actions: infrastructure.change, release.config |
 | 19:02:45 | GATE_RESULT |  | unit_tests | FAILED | scope: 1 finding(s), 0.221 s |
 | 19:08:31 | RUN_RESUMED |  |  |  | after process.restart |
@@ -843,26 +842,23 @@ Decide with `sdlc approve <run> <node>` or `sdlc reject <run> <node> --reason ..
 | 19:19:36 | REPLAN_TRIGGERED | implementation |  |  | human.retry |
 | 19:19:36 | POLICY_DECISION | implementation |  | APPROVAL_REVOKED | revoked: unit_tests |
 | 19:19:36 | RUN_STARTED |  |  |  |  |
-| 19:21:39 | EXECUTOR_CALL |  | T7 | OK | turns 12, $0.64 |
+| 19:21:39 | EXECUTOR_CALL |  | T7 | OK | turns 12 |
 | 19:21:40 | POLICY_DECISION | implementation | T8 | APPROVED | task.high_impact |
-| 19:23:43 | EXECUTOR_CALL |  | T8 | OK | turns 8, $0.54 |
+| 19:23:43 | EXECUTOR_CALL |  | T8 | OK | turns 8 |
 | 19:23:44 | GATE_RESULT |  | unit_tests | FAILED | scope: 2 finding(s), 0.327 s |
 
 ## 9. Tasks as executed
 
-| Task | Executor calls | Recorded cost | Reused patches | Policy violations | Rollbacks |
-|---|---|---|---|---|---|
-| T1 | 1 | $2.47 | 0 | 0 | 0 |
-| T2 | 3 | $5.11 | 1 | 1 | 1 |
-| T3 | 1 | $4.67 | 0 | 0 | 0 |
-| T4 | 1 | $4.47 | 0 | 0 | 0 |
-| T5 | 1 | $4.42 | 0 | 0 | 0 |
-| T6 | 1 | $1.52 | 0 | 0 | 0 |
-| T7 | 3 | $5.87 | 0 | 0 | 0 |
-| T8 | 3 | $5.96 | 0 | 1 | 1 |
-
-Attempts killed by the per-task timeout do not report cost (the agent's JSON never arrives), so
-recorded executor spend is a lower bound.
+| Task | Executor calls | Reused patches | Policy violations | Rollbacks |
+|---|---|---|---|---|
+| T1 | 1 | 0 | 0 | 0 |
+| T2 | 3 | 1 | 1 | 1 |
+| T3 | 1 | 0 | 0 | 0 |
+| T4 | 1 | 0 | 0 | 0 |
+| T5 | 1 | 0 | 0 | 0 |
+| T6 | 1 | 0 | 0 | 0 |
+| T7 | 3 | 0 | 0 | 0 |
+| T8 | 3 | 0 | 1 | 1 |
 
 ## 10. Gates
 
@@ -930,7 +926,6 @@ Concerns:
 | rollback_count | 2 |
 | mttr_seconds | 15433.035 |
 | e2e_latency_seconds | 17532.433 |
-| llm_cost_usd | 37.1922 |
 | tokens | 513480 |
 | human_checkpoints | 5 |
 | replans | 0 |
@@ -994,5 +989,4 @@ gained Kafka in the `shortener` profile plus `SHORTENER_KAFKA_BOOTSTRAP_SERVERS`
 `SHORTENER_ANALYTICS_IP_SALT`. Orchestrator defects found by this run and fixed the same day: `**/` glob
 matching, wall clock counting human waits, executor timeout leaving Maven/JVM orphans, prompt without a time
 budget, PII scan flagging prose, scope gate ignoring human scope grants, context persistence only at call
-end, no resume after a process restart (T12). Recorded spend for the run is a lower bound: four attempts
-killed by the timeout never reported their cost.
+end, no resume after a process restart (T12).
