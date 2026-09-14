@@ -66,10 +66,14 @@ Implement exactly this task inside the current repository. Stack: {stack}.
 ## Build contract — these gates run on the whole repository after all tasks; make them work from task 1
 {gates}
 
-## Turn budget
-You have at most {turns} tool turns in this attempt. Plan the edits first, write whole files, run the
-build once at the end. If the attempt runs out of turns, the next attempt continues on the current tree
-(nothing is reset) with this feedback, so leave the tree in a coherent state as you go.
+## Turn and time budget
+You have at most {turns} tool turns and {minutes} minutes in this attempt; after that the attempt is
+killed and counts as a failure. Plan the edits first, write whole files, run the build once at the end.
+Verify with the fast checks only: compile, the formatter, the unit tests you touched and the architecture
+test. Do NOT run the integration profile, `verify`, or start the application: the orchestrator runs every
+gate listed above itself after all tasks, and one integration run costs most of your time budget. If the
+attempt runs out of turns or time, the next attempt continues on the current tree (nothing is reset)
+with this feedback, so leave the tree in a coherent state as you go.
 
 ## Feedback from the previous attempt — fix these first
 {feedback}
@@ -100,8 +104,9 @@ class ClaudeCodeCliExecutor:
         """Render `PROMPT` for one task attempt.
 
         Only the operations named in `task.contract_slice` are copied from `design.api.operations`, so the
-        agent sees its slice of the API, not the whole contract. `policy` supplies the gate contract lines
-        and the turn budget; when it is None (unit tests) both read "(none)"/"n/a". `feedback` is embedded
+        agent sees its slice of the API, not the whole contract. `policy` supplies the gate contract lines,
+        the turn budget and the time budget (``budgets.node_timeout_seconds``, the executor's own per-attempt
+        limit); when it is None (unit tests) they read "(none)"/"n/a". `feedback` is embedded
         as pretty-printed JSON so the previous attempt's findings are visible verbatim. Pure function: no
         I/O, no side effects.
         """
@@ -123,6 +128,7 @@ class ClaudeCodeCliExecutor:
             dod="\n".join(f"- {d}" for d in task.definition_of_done),
             gates="\n".join(gate_contract(policy, stack)) if policy else "(none)",
             turns=policy.claude_code.max_turns if policy else "n/a",
+            minutes=policy.budgets.node_timeout_seconds // 60 if policy else "n/a",
             feedback=json.dumps(feedback, indent=2) if feedback else "(none)",
         )
 
