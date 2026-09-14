@@ -54,6 +54,14 @@ def answer(run_id: str, answers_json: str) -> None:
 
 
 @app.command()
+def deliver(
+    run_id: str, to: str = typer.Option(None, help="destination dir; default SDLC_WORKSPACE")
+) -> None:
+    """Copy a COMPLETED run's sandbox tree into the workspace (the release.merge outcome)."""
+    _post(f"/runs/{run_id}/deliver", {"to": to})
+
+
+@app.command()
 def metrics(run_id: str) -> None:
     s = Settings()
     typer.echo(json.dumps(compute(run_id, JsonlSink(s.runs_dir).events(run_id)).as_dict(), indent=2))

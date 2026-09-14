@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -66,6 +67,21 @@ async def answer(run_id: str, body: Answers) -> dict[str, Any]:
         "spec_version": live.ctx.version("spec"),
         "plan_version": live.state.plan_version,
     }
+
+
+class Deliver(BaseModel):
+    to: str | None = None
+
+
+@router.post("/runs/{run_id}/deliver")
+async def deliver(run_id: str, body: Deliver) -> dict[str, Any]:
+    if run_id not in svc.runs:
+        raise HTTPException(404, "unknown run (prototype keeps live runs in memory)")
+    try:
+        dest = await svc.deliver(run_id, Path(body.to) if body.to else None)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+    return {"run_id": run_id, "delivered_to": str(dest)}
 
 
 @router.get("/runs/{run_id}/metrics")

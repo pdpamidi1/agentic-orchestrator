@@ -87,6 +87,8 @@ async def test_done_commits_and_reports_usage(tmp_path: Path) -> None:
     prompt = args.split("-p\n", 1)[1].split("\n--output-format")[0]
     assert task.title in prompt and "createShortUrl" in prompt and "use base62" in prompt
     assert "URL shortener" not in prompt  # spec-driven: the raw requirement never reaches the executor
+    assert "## Build contract" in prompt and POLICY.gate("unit", "python").cmd in prompt
+    assert "tests/test_architecture.py" in prompt and "springdoc" not in prompt  # stack-specific notes
     assert (REPO / cc.system_prompt_file).read_text().strip() in args  # --append-system-prompt content
 
 
@@ -109,3 +111,13 @@ async def test_missing_binary_is_not_transient(tmp_path: Path) -> None:
     r = await ClaudeCodeCliExecutor(binary=str(tmp_path / "nope")).execute(ctx, task, design, None)
     assert isinstance(r, Errored) and not r.transient and "not found" in r.reason
     assert not os.environ.get("CLAUDECODE") or True  # documented: env is scrubbed, nested sessions allowed
+
+
+def test_gate_contract_for_java_lists_the_maven_gates_and_the_springdoc_dump() -> None:
+    from orchestrator.executors.claude_code_cli import gate_contract
+
+    lines = gate_contract(POLICY, "java")
+    text = "\n".join(lines)
+    assert "`./mvnw -q -Pit verify`" in text and "-Dtest=ArchitectureTest" in text and "(advisory)" in text
+    assert "target/openapi.json" in text and "src/main/resources/openapi.yaml" in text
+    assert "src/test/java/sdlc/ArchitectureTest.java" in text

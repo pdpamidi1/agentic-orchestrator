@@ -6,7 +6,6 @@ __pycache__/
 .ruff_cache/
 runs/*/sandbox/
 runs/sdlc.db
-workspace/
 .venv/
 *.egg-info/
 .env.*

@@ -21,7 +21,7 @@ from .executors.recording import RecordingExecutor
 from .executors.replay import ReplayExecutor
 from .llm.client import AnthropicClient, LLMClient, RecordingClient, ReplayClient
 from .llm.fake import PLANTED, FakeClient
-from .models import RunState, load_policy
+from .models import Kind, RunState, RunStatus, load_policy
 from .sandbox.git import GitSandbox
 from .sandbox.repo_map import SKIP_DIRS, build_repo_map
 from .store.file_store import FileStore
@@ -39,6 +39,12 @@ class GitRollback:
             # runs/<id>/rejected/<task>.patch, next to the sandbox (never a cwd-relative path)
             await git.export_patch(f"{sha}~1", ctx.sandbox.parent / "rejected" / f"{task_id}.patch")
             await git.revert(sha)
+
+
+def _copy_tree(src: Path, dest: Path) -> int:
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dest, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git", *SKIP_DIRS))
+    return sum(1 for p in dest.rglob("*") if p.is_file())
 
 
 def _seed(workspace: Path, sandbox: Path) -> bool:
@@ -174,6 +180,27 @@ class OrchestratorService:
         )
         await self._persist_artifacts(live)
         return live
+
+    async def deliver(self, run_id: str, dest: Path | None = None) -> Path:
+        """Copy the run's sandbox tree (the run branch's working tree, no .git) into the workspace.
+
+        Only a COMPLETED run can be delivered: approval_release is the human 'release.merge' checkpoint.
+        """
+        live = self.runs[run_id]
+        if live.state.status != RunStatus.COMPLETED:
+            raise RuntimeError(
+                f"deliver needs a COMPLETED run (approval_release); {run_id} is {live.state.status}"
+            )
+        target = dest or self.s.workspace
+        head = await GitSandbox(live.ctx.sandbox).head()
+        files = await asyncio.to_thread(_copy_tree, live.ctx.sandbox, target)
+        live.ctx.emit(
+            Kind.ARTIFACT_WRITTEN,
+            node_id="approval_release",
+            actor="orchestrator",
+            payload={"artifact": "delivery", "path": str(target), "commit": head, "files": files},
+        )
+        return target
 
     def metrics(self, run_id: str) -> RunMetrics:
         return compute(run_id, self.trace.events(run_id))

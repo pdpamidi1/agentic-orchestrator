@@ -7,8 +7,10 @@ from pathlib import Path
 
 from orchestrator.engine.arch_contract import (
     CONTRACT_PATH,
+    JAVA_CONTRACT_PATH,
     importlinter_config,
     render_architecture_test,
+    render_architecture_test_java,
     write_architecture_contract,
 )
 from orchestrator.engine.context import RunContext
@@ -157,13 +159,32 @@ async def test_architecture_contract_is_committed_and_the_gate_catches_a_violati
     assert await git.changed_files() == ["src/demo/repo/__init__.py"]  # the contract test itself is committed
 
 
-async def test_contract_not_written_for_java_or_without_design(tmp_path: Path) -> None:
-    ctx = make_ctx(tmp_path, "py_layers", "java")
+async def test_contract_not_written_without_design_or_for_an_unknown_stack(tmp_path: Path) -> None:
+    ctx = make_ctx(tmp_path, "py_layers", "python")
     git = GitSandbox(ctx.sandbox)
     await git.ensure_repo()
+    assert await write_architecture_contract(ctx, git, "implementation") is False  # no design yet
     ctx.put("design", layered_design("demo.api -> demo.repo"), "architecture")
+    ctx.target_stack = "kotlin"
     assert await write_architecture_contract(ctx, git, "implementation") is False
-    ctx.target_stack = "python"
-    ctx.artifacts.clear()
-    assert await write_architecture_contract(ctx, git, "implementation") is False
-    assert not (ctx.sandbox / CONTRACT_PATH).exists()
+    assert not (ctx.sandbox / CONTRACT_PATH).exists() and not (ctx.sandbox / JAVA_CONTRACT_PATH).exists()
+
+
+def test_java_architecture_contract_from_free_text_layer_rules() -> None:
+    d = layered_design(
+        "Controller -> Service -> Repository -> Domain; dependencies point strictly inward, never reverse",
+        "domain has zero outward dependencies",
+    )
+    java = render_architecture_test_java(d)
+    assert 'List.of("controller", "service", "repository", "domain")' in java
+    assert "class ArchitectureTest" in java and "package sdlc;" in java and "@Test" in java
+    assert "domain has zero outward dependencies" in java  # prose kept for humans
+
+
+async def test_java_contract_is_written_for_the_java_stack(tmp_path: Path) -> None:
+    ctx = make_ctx(tmp_path, None, "java")
+    git = GitSandbox(ctx.sandbox)
+    await git.ensure_repo()
+    ctx.put("design", layered_design("Controller -> Service -> Repository"), "architecture")
+    assert await write_architecture_contract(ctx, git, "implementation") is True
+    assert (ctx.sandbox / JAVA_CONTRACT_PATH).exists() and not (ctx.sandbox / CONTRACT_PATH).exists()
