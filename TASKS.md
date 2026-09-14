@@ -37,6 +37,7 @@ Status legend: [ ] todo · [~] in progress · [x] done
 - [ ] **T15 CI**: GitHub Actions: lint, test, and a `--replay` golden run for all three scenarios diffed against committed metrics.
 
 ## Stretch
+- [ ] Count executor spend in `Budget.cost_usd` (today only agent `Success` outcomes accumulate; a live run's Claude Code tasks, $2-5 each, never reach `max_cost_usd_per_run`; the trace has the per-task cost on `EXECUTOR_CALL`)
 - [ ] Bound `diagnose -> retry` cycles per run (a fake run whose gates can never pass loops until the wall-clock or cost budget trips; only `replan` is counted today)
 - [ ] Container-isolated executor (docker run with the sandbox mounted) instead of process + path policy
 - [ ] Task-level (not node-level) invalidation using `Plan.invalidated_task_ids`
