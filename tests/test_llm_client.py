@@ -67,7 +67,20 @@ def fake_anthropic(responses: list) -> tuple[AnthropicClient, list]:  # type: ig
             raise r
         return r
 
-    ac.client = SimpleNamespace(messages=SimpleNamespace(parse=parse))  # type: ignore[assignment]
+    class _Stream:  # stands in for the SDK's AsyncMessageStreamManager
+        def __init__(self, kw):  # type: ignore[no-untyped-def]
+            self.kw = kw
+
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __aexit__(self, *a):  # type: ignore[no-untyped-def]
+            return False
+
+        async def get_final_message(self):  # type: ignore[no-untyped-def]
+            return await parse(**self.kw)
+
+    ac.client = SimpleNamespace(messages=SimpleNamespace(stream=lambda **kw: _Stream(kw)))  # type: ignore[assignment]
     return ac, calls
 
 

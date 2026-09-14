@@ -142,7 +142,7 @@ class ReplayClient:
 
 
 class AnthropicClient:
-    """Structured outputs: `messages.parse(output_format=schema)` makes the API constrain the reply to the
+    """Structured outputs: `messages.stream(output_format=schema)` makes the API constrain the reply to the
     schema's JSON and the SDK validate it into the Pydantic model. Model-agnostic (no forced tool use, which
     Claude Fable 5.1 rejects) and compatible with adaptive thinking, which is on by default on Claude Opus 5.
     Model-level validators (e.g. Plan acyclicity) can still fail -> errors are fed back, up to max_repairs.
@@ -185,7 +185,7 @@ class AnthropicClient:
     async def structured[T: BaseModel](
         self, system: str, prompt: str, schema: type[T], *, max_repairs: int = 2
     ) -> tuple[T, Usage]:
-        """Call `messages.parse` until the reply validates into `schema`, at most `max_repairs + 1` times.
+        """Stream `messages` until the reply validates into `schema`, at most `max_repairs + 1` times.
 
         Loop behaviour per round:
         - SDK/pydantic `ValueError` (invalid JSON or schema violation): if the error looks like truncation
@@ -204,13 +204,16 @@ class AnthropicClient:
         max_tokens = self.MAX_TOKENS
         for _ in range(max_repairs + 1):
             try:
-                resp = await self.client.messages.parse(
+                # streamed: the SDK refuses non-streaming requests whose max_tokens could exceed its
+                # 10-minute window (a doubled budget after a truncation trips it); parsed the same way
+                async with self.client.messages.stream(
                     model=self.model,
                     max_tokens=max_tokens,
                     system=system,
                     messages=messages,
                     output_format=schema,
-                )
+                ) as stream:
+                    resp = await stream.get_final_message()
             except ValueError as e:  # pydantic ValidationError / bad JSON: repair with the errors as feedback
                 last_error = str(e)
                 if _truncated(last_error) and max_tokens < self.MAX_TOKENS_CAP:
