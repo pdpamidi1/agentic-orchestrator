@@ -1,1 +1,1 @@
-Make the URL shortener more reliable and production-ready.
+- Update/optimize to make the URL shortener more reliable and production-ready.
