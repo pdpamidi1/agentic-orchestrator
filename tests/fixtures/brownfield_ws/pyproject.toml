@@ -1,0 +1,4 @@
+[project]
+name = "shortener"
+version = "0.3.0"
+dependencies = ["fastapi", "sqlalchemy", "redis"]

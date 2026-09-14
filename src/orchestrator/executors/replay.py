@@ -27,7 +27,7 @@ class ReplayExecutor:
         if not patch.exists():
             return Errored(f"no recorded patch for {task.id} ({patch})", transient=False)
         git = GitSandbox(ctx.sandbox)
-        base = await git.base_ref()
+        base = await git.head()
         proc = await asyncio.create_subprocess_exec(
             "git", "apply", "--whitespace=nowarn", str(patch), cwd=str(ctx.sandbox)
         )

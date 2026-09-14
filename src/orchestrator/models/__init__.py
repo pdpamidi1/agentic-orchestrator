@@ -3,6 +3,7 @@ from .design import ApiContract, ClassStructure, DataModel, Design
 from .impact import Impact, Risk
 from .plan import Plan, TaskSpec
 from .policy import Policy, load_policy
+from .repo_map import Endpoint, RepoMap
 from .spec import AcceptanceCriterion, Ambiguity, Spec, UserStory
 from .state import Budget, NodeStatus, RunState, RunStatus
 from .trace import Kind, TraceEvent
@@ -16,6 +17,7 @@ __all__ = [
     "ClassStructure",
     "DataModel",
     "Design",
+    "Endpoint",
     "Finding",
     "GateOutcome",
     "GateStatus",
@@ -25,6 +27,7 @@ __all__ = [
     "NodeStatus",
     "Plan",
     "Policy",
+    "RepoMap",
     "Risk",
     "RunState",
     "RunStatus",

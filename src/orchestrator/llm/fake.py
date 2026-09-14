@@ -248,12 +248,172 @@ CANNED: dict[str, dict[str, Any]] = {
 }
 
 
-class FakeClient:
-    """Canned structured output keyed by schema name. Unknown schema -> ValueError (an agent Retry)."""
+BROWNFIELD_SPEC: dict[str, Any] = {
+    "run_id": "fake",
+    "summary": "Click analytics for the existing URL shortener: publish click events, aggregate stats.",
+    "stories": [
+        {
+            "id": "US1",
+            "as_a": "owner",
+            "i_want": "click counts per short code",
+            "so_that": "I see what works",
+        },
+        {
+            "id": "US2",
+            "as_a": "compliance officer",
+            "i_want": "no raw IPs stored",
+            "so_that": "we stay lawful",
+        },
+    ],
+    "acceptance_criteria": [
+        {
+            "id": "AC1",
+            "given": "a redirect",
+            "when": "GET /{short_code}",
+            "then": "a url.clicked event is published",
+        },
+        {
+            "id": "AC2",
+            "given": "clicks",
+            "when": "GET /api/v1/urls/{short_code}/stats",
+            "then": "200 aggregate",
+        },
+        {
+            "id": "AC3",
+            "given": "a click",
+            "when": "it is persisted",
+            "then": "only a salted SHA-256 of the IP",
+        },
+        {"id": "AC4", "given": "an unknown code", "when": "GET .../stats", "then": "404"},
+    ],
+    "non_goals": ["dashboards", "auth"],
+    "ambiguities": [],
+    "assumptions": ["Kafka topic url.clicked; 90-day retention on click_events"],
+}
+BROWNFIELD_PLAN: dict[str, Any] = {
+    "run_id": "fake",
+    "spec_version": 1,
+    "tasks": [
+        {
+            "id": "B1",
+            "title": "Migration: click_events and click_stats tables",
+            "impact_level": "HIGH",
+            "allowed_files": ["alembic/versions/002_click_events.py", "tests/**"],
+            "data_model_slice": ["click_events", "click_stats"],
+            "acceptance_criteria_ids": ["AC3"],
+            "definition_of_done": ["migration applies", "no raw IP column"],
+            "risk_notes": "protected: alembic/** (schema.migration)",
+        },
+        {
+            "id": "B2",
+            "title": "Dependency: aiokafka producer/consumer",
+            "impact_level": "HIGH",
+            "allowed_files": ["pyproject.toml"],
+            "definition_of_done": ["dependency declared"],
+            "risk_notes": "protected: pyproject.toml (dependency.major_version)",
+        },
+        {
+            "id": "B3",
+            "title": "Publish url.clicked on redirect with salted IP hash",
+            "depends_on": ["B1", "B2"],
+            "allowed_files": ["src/**", "tests/**"],
+            "contract_slice": ["redirect"],
+            "class_structure": ["shortener.analytics.ClickPublisher"],
+            "acceptance_criteria_ids": ["AC1", "AC3"],
+            "definition_of_done": ["event published; redirect latency unchanged"],
+        },
+        {
+            "id": "B4",
+            "title": "Stats endpoint over click_stats",
+            "depends_on": ["B3"],
+            "allowed_files": ["src/**", "tests/**", "openapi.yaml"],
+            "contract_slice": ["getStats"],
+            "class_structure": ["shortener.api.StatsController"],
+            "acceptance_criteria_ids": ["AC2", "AC4"],
+            "definition_of_done": ["200/404 covered by tests"],
+        },
+    ],
+    "rationale": "schema and dependency first (both need approval), then publisher, then the read model",
+}
+BROWNFIELD_DESIGN: dict[str, Any] = {
+    **CANNED["Design"],
+    "api": {
+        "openapi_yaml": CANNED["Design"]["api"]["openapi_yaml"],
+        "operations": [
+            *CANNED["Design"]["api"]["operations"],
+            {
+                "method": "GET",
+                "path": "/api/v1/urls/{short_code}/stats",
+                "operation_id": "getStats",
+                "responses": {200: "ClickStats", 404: "Problem"},
+            },
+        ],
+    },
+    "data": {
+        "tables": [
+            *CANNED["Design"]["data"]["tables"],
+            {
+                "name": "click_events",
+                "columns": [
+                    {"name": "id", "type": "bigserial"},
+                    {"name": "short_code", "type": "varchar(16)"},
+                    {"name": "clicked_at", "type": "timestamptz"},
+                    {"name": "ip_hash", "type": "char(64)", "notes": "salted sha256; raw IP never stored"},
+                ],
+            },
+            {
+                "name": "click_stats",
+                "columns": [
+                    {"name": "short_code", "type": "varchar(16)"},
+                    {"name": "total_clicks", "type": "bigint"},
+                    {"name": "last_clicked_at", "type": "timestamptz", "nullable": True},
+                ],
+                "constraints": ["PRIMARY KEY (short_code)"],
+            },
+        ],
+        "migrations": ["002_click_events"],
+        "evolution_notes": "additive only; click_events retained 90 days",
+    },
+}
+BROWNFIELD_IMPACT: dict[str, Any] = {
+    "run_id": "fake",
+    "impacted_packages": ["shortener.api", "shortener.repo"],
+    "new_packages": ["shortener.analytics"],
+    "impacted_endpoints": ["GET /{short_code}", "GET /api/v1/urls/{short_code}/stats"],
+    "data_flows": ["redirect -> url.clicked (kafka) -> analytics consumer -> click_stats"],
+    "risks": [
+        {
+            "id": "R1",
+            "description": "publishing on the redirect hot path adds latency",
+            "likelihood": "medium",
+            "severity": "high",
+            "mitigation": "fire-and-forget with bounded queue",
+            "detection": "p99 redirect latency",
+        }
+    ],
+}
+# per-scenario overrides on top of the greenfield canned set
+SCENARIOS: dict[str, dict[str, dict[str, Any]]] = {
+    "brownfield": {
+        "Spec": BROWNFIELD_SPEC,
+        "Plan": BROWNFIELD_PLAN,
+        "Design": BROWNFIELD_DESIGN,
+        "Impact": BROWNFIELD_IMPACT,
+    },
+}
+# which failure the fake executor plants on its first attempt: scope (.env) or pii (raw IP persisted)
+PLANTED: dict[str, str] = {"greenfield": "scope", "brownfield": "pii"}
 
-    def __init__(self, overrides: Mapping[str, Mapping[str, Any]] | None = None) -> None:
+
+class FakeClient:
+    """Canned structured output keyed by schema name, with per-scenario overrides.
+    Unknown schema -> ValueError (an agent Retry)."""
+
+    def __init__(
+        self, overrides: Mapping[str, Mapping[str, Any]] | None = None, scenario: str | None = None
+    ) -> None:
         self.canned: dict[str, dict[str, Any]] = {k: dict(v) for k, v in CANNED.items()}
-        for name, data in (overrides or {}).items():
+        for name, data in {**SCENARIOS.get(scenario or "", {}), **(overrides or {})}.items():
             self.canned[name] = dict(data)
         self.calls: list[str] = []
 

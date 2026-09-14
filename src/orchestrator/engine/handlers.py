@@ -9,6 +9,7 @@ Node-kind handlers: how each kind of node in workflow.yaml is executed.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from ..agents.catalog import AGENTS
@@ -89,28 +90,36 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor) -> dict[str, Any]:
                             if pv.classification == "protected" and pv.required_action
                         }
                     verdict = pe.check_scope(r.files_changed, t.allowed_files, approved)
+                    ctx.approvals |= approved  # the run-level gates see the same approvals
+                    # write boundary: secrets, banned patterns and PII in what this task wrote
+                    contents = await asyncio.to_thread(_read_all, ctx.sandbox, r.files_changed)
+                    findings = verdict.findings + pe.scan(contents)
                     ctx.emit(
                         Kind.POLICY_DECISION,
                         task_id=t.id,
                         actor="policy",
-                        status="OK" if verdict.ok else "VIOLATION",
+                        status="OK" if not findings else "VIOLATION",
                         payload={
-                            "findings": [f.model_dump() for f in verdict.findings],
+                            "findings": [f.model_dump() for f in findings],
+                            "rules": sorted({f.rule for f in findings}),
                             "approved_actions": sorted(approved),
                         },
                     )
-                    if not verdict.ok:
+                    if findings:
                         await git.revert(r.commit_sha)
                         ctx.emit(
                             Kind.ROLLED_BACK,
                             node_id=node.id,
                             task_id=t.id,
                             actor="orchestrator",
-                            payload={"commit": r.commit_sha, "reason": "change control violation"},
+                            payload={
+                                "commit": r.commit_sha,
+                                "reason": "policy violation at the write boundary",
+                            },
                         )
                         return Retry(
-                            f"task {t.id} violated change control",
-                            {"task": t.id, "findings": [f.model_dump() for f in verdict.findings]},
+                            f"task {t.id} violated policy: {', '.join(sorted({f.rule for f in findings}))}",
+                            {"task": t.id, "findings": [f.model_dump() for f in findings]},
                         )
                     cs.commits[t.id] = r.commit_sha
                     cs.files_changed += r.files_changed
@@ -150,3 +159,12 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor) -> dict[str, Any]:
         "gate": gate_handler,
         "input": input_handler,
     }
+
+
+def _read_all(root: Path, files: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for f in files:
+        p = root / f
+        if p.is_file():
+            out[f] = p.read_text(encoding="utf-8", errors="replace")
+    return out

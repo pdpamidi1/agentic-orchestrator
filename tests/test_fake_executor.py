@@ -23,7 +23,7 @@ async def test_fake_executor_writes_module_test_and_release_files(ctx: RunContex
     plan, design = Plan.model_validate(CANNED["Plan"]), Design.model_validate(CANNED["Design"])
     git = GitSandbox(ctx.sandbox)
     await git.ensure_repo()
-    ex = FakeExecutor(plant_scope_violation=False)
+    ex = FakeExecutor(plant=None)
 
     r1 = await ex.execute(ctx, plan.tasks[0], design, None)
     assert isinstance(r1, Done) and r1.commit_sha

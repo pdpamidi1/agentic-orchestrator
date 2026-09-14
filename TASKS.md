@@ -21,7 +21,7 @@ Status legend: [ ] todo · [~] in progress · [x] done
       `runs/cache/changesets/greenfield/`. Verify `--replay` reproduces the run without a key.
 
 ## Day 2 — scenarios, metrics, docs
-- [ ] **T8 Brownfield**: `repo_map` producer (walk `src/`, package graph, endpoints, tables) put into context at intake;
+- [x] **T8 Brownfield** (offline record + replay proven; live recording waits for T6's key): `repo_map` producer (walk `src/`, package graph, endpoints, tables) put into context at intake;
       `impact` node runs; two high-impact task approvals fire (`schema.migration`, `dependency.major_version`);
       compliance gate blocks a raw-IP field on attempt 1. Record + replay.
 - [ ] **T9 Ambiguous**: spec with >= 5 ambiguities; `sdlc answer` produces spec v2; assert `NODE_INVALIDATED` set equals

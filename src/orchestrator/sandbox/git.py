@@ -33,23 +33,28 @@ class GitSandbox:
         if not (self.root / ".git").exists():
             self.root.mkdir(parents=True, exist_ok=True)
             await self._git("init", "-q")
+            await self._git("add", "-A")  # a seeded workspace is the baseline, not an agent change
             await self._git("commit", "--allow-empty", "-q", "-m", "chore: initial (agentic-sdlc)")
         exclude = self.root / ".git" / "info" / "exclude"
         await asyncio.to_thread(exclude.parent.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread(exclude.write_text, "\n".join(self.EXCLUDES) + "\n", encoding="utf-8")
 
+    BASE_TAG = "sdlc/base"  # where the run branch forked: gates diff the whole run against it
+
     async def start_run_branch(self, branch: str) -> None:
         rc, _ = await self._git("checkout", "-q", "-b", branch)
-        if rc != 0:
+        if rc == 0:
+            await self._git("tag", "-f", self.BASE_TAG, "HEAD")
+        else:
             await self._git("checkout", "-q", branch)
 
     async def head(self) -> str:
         _, out = await self._git("rev-parse", "HEAD")
         return out.strip()
 
-    async def base_ref(self) -> str:
-        rc, out = await self._git("merge-base", "HEAD", "main")
-        return out.strip() if rc == 0 else "HEAD~0"
+    async def run_base(self) -> str:
+        rc, out = await self._git("rev-parse", "-q", "--verify", f"{self.BASE_TAG}^{{commit}}")
+        return out.strip() if rc == 0 else await self.head()
 
     async def changed_files(self, base: str = "HEAD") -> list[str]:
         _, out = await self._git("diff", "--name-only", base)
@@ -65,9 +70,9 @@ class GitSandbox:
                 total += int(parts[0]) + int(parts[1])
         return total
 
-    async def changed_file_contents(self) -> dict[str, str]:
+    async def changed_file_contents(self, base: str = "HEAD") -> dict[str, str]:
         out: dict[str, str] = {}
-        for f in await self.changed_files():
+        for f in await self.changed_files(base):
             p = self.root / f
             if p.is_file():
                 try:

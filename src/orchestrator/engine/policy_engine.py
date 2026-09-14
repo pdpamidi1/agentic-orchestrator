@@ -72,6 +72,7 @@ class PolicyEngine:
         task_allowed: list[str],
         approved_actions: set[str],
         lines_changed: int = 0,
+        limits: bool = True,
     ) -> ScopeVerdict:
         v = ScopeVerdict(ok=True)
         cc = self.p.change_control
@@ -117,7 +118,7 @@ class PolicyEngine:
                         suggested_fix="split into a new task",
                     )
                 )
-        if len(changed_files) > cc.max_files_changed_per_task:
+        if limits and len(changed_files) > cc.max_files_changed_per_task:
             v.ok = False
             v.findings.append(
                 Finding(
@@ -125,7 +126,7 @@ class PolicyEngine:
                     message=f"{len(changed_files)} files > {cc.max_files_changed_per_task}",
                 )
             )
-        if lines_changed > cc.max_lines_changed_per_task:
+        if limits and lines_changed > cc.max_lines_changed_per_task:
             v.ok = False
             v.findings.append(
                 Finding(

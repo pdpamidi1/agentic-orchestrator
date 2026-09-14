@@ -93,7 +93,7 @@ class ClaudeCodeCliExecutor:
         ]
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "ANTHROPIC_API_KEY", "JAVA_HOME")}
         git = GitSandbox(ctx.sandbox)
-        base = await git.base_ref()
+        base = await git.head()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,

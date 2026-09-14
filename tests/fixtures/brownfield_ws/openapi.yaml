@@ -1,0 +1,11 @@
+openapi: 3.1.0
+info: {title: shortener, version: "0.3.0"}
+paths:
+  /api/v1/urls:
+    post:
+      operationId: createShortUrl
+      responses: {"201": {description: ShortUrl}, "400": {description: Problem}, "409": {description: Problem}, "422": {description: ValidationError}}
+  /{short_code}:
+    get:
+      operationId: redirect
+      responses: {"302": {description: redirect}, "404": {description: Problem}, "410": {description: Problem}, "422": {description: ValidationError}}

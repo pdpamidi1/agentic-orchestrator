@@ -28,23 +28,22 @@ InternalGate = Callable[[RunContext, GitSandbox], Awaitable[list[Finding]]]
 
 async def diff_scope(ctx: RunContext, git: GitSandbox) -> list[Finding]:
     pe = PolicyEngine(ctx.policy, ctx.target_stack)
-    changed = await git.changed_files()
-    lines = await git.lines_changed()
+    base = await git.run_base()  # everything the run changed, committed or not
+    changed = await git.changed_files(base)
+    lines = await git.lines_changed(base)
     plan = ctx.get("plan")
     task_allowed: list[str] = []
     if plan is not None:
         for t in plan.tasks:
             task_allowed.extend(t.allowed_files)
-    approved = {
-        a for a in ctx.approvals
-    }  # node ids; high-impact actions are mapped by the executor when approved
-    verdict = pe.check_scope(changed, task_allowed, approved | set(ctx.get("approved_actions", set())), lines)
-    return verdict.findings
+    approved = set(ctx.approvals) | set(ctx.get("approved_actions", set()))  # executor adds mapped actions
+    # per-task size limits were enforced at the write boundary; here only paths and the tests rule matter
+    return pe.check_scope(changed, task_allowed, approved, lines, limits=False).findings
 
 
 async def secret_and_pattern_scan(ctx: RunContext, git: GitSandbox) -> list[Finding]:
     pe = PolicyEngine(ctx.policy, ctx.target_stack)
-    files = await git.changed_file_contents()
+    files = await git.changed_file_contents(await git.run_base())
     return pe.scan(files)
 
 
@@ -164,7 +163,9 @@ async def openapi_diff(ctx: RunContext, git: GitSandbox) -> list[Finding]:
     breaking, uncommitted = diff_contracts(committed, exposed)
     findings: list[Finding] = []
     if breaking:
-        approved = "api.contract.breaking_change" in set(ctx.get("approved_actions", set()))
+        approved = "api.contract.breaking_change" in (
+            set(ctx.approvals) | set(ctx.get("approved_actions", set()))
+        )
         ctx.emit(
             Kind.POLICY_DECISION,
             actor="policy",

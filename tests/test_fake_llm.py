@@ -60,7 +60,7 @@ def test_mode_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         OrchestratorService(settings(tmp_path, llm="auto", anthropic_api_key="k"))._mode(False) == "anthropic"
     )
     with pytest.raises(RuntimeError, match="requires ANTHROPIC_API_KEY"):
-        OrchestratorService(settings(tmp_path, llm="anthropic"))._runner("anthropic", False)
+        OrchestratorService(settings(tmp_path, llm="anthropic"))._runner("anthropic", False, "greenfield")
 
 
 async def test_greenfield_reaches_approval_design_offline(

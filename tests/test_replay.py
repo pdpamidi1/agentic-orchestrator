@@ -38,7 +38,7 @@ async def test_recorded_patches_replay_into_an_identical_tree(tmp_path: Path, ct
     cache = tmp_path / "changesets"
     git = GitSandbox(ctx.sandbox)
     await git.ensure_repo()
-    rec = RecordingExecutor(FakeExecutor(plant_scope_violation=False), cache)
+    rec = RecordingExecutor(FakeExecutor(plant=None), cache)
     for t in plan.tasks[:2]:
         assert isinstance(await rec.execute(ctx, t, design, {"attempt": 1}), Done)
     assert sorted(p.name for p in (cache / ctx.scenario).glob("*")) == [

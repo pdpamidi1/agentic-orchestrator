@@ -27,6 +27,9 @@ sdlc metrics <run_id>
 sdlc graph | pbcopy                         # mermaid of the DAG
 ```
 Live: `cp .env.example .env`, set `ANTHROPIC_API_KEY`, then `sdlc run --scenario greenfield --record`.
+Brownfield offline: add `SDLC_WORKSPACE=tests/fixtures/brownfield_ws` and `sdlc run --scenario brownfield`; the impact
+node runs on the repo map, the migration and dependency tasks each pause for approval, and the compliance scan
+catches a raw-IP field on attempt 1.
 Offline golden run: start the API with `SDLC_LLM=fake SDLC_TARGET_STACK=python`, run with `--record` and approve
 twice; the run is now in `runs/cache/` and `sdlc run --scenario greenfield --replay` completes it with no key.
 
