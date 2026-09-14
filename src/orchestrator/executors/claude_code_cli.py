@@ -117,9 +117,14 @@ class ClaudeCodeCliExecutor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            out, err = await asyncio.wait_for(
-                proc.communicate(), timeout=ctx.policy.budgets.node_timeout_seconds
-            )
+            try:
+                out, err = await asyncio.wait_for(
+                    proc.communicate(), timeout=ctx.policy.budgets.node_timeout_seconds
+                )
+            except (TimeoutError, asyncio.CancelledError):
+                proc.kill()  # no orphaned agent keeps editing the sandbox after we stop waiting
+                await proc.wait()
+                raise
         except TimeoutError:
             return Errored("claude code timeout", transient=True)
         except FileNotFoundError:

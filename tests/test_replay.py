@@ -4,6 +4,7 @@ recorded fake run replays end to end (the offline golden run)."""
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from test_fake_llm import settings
@@ -111,3 +112,25 @@ async def test_offline_golden_run_records_then_replays_to_completion(
         0,
     )
     assert m.e2e_latency_seconds is not None and st.nodes["validation"] == NodeStatus.PASSED
+
+
+async def test_recording_executor_reuses_a_recorded_task(tmp_path: Path, ctx: RunContext) -> None:
+    class MustNotRun:
+        async def execute(self, *a: Any, **k: Any) -> Done:
+            raise AssertionError("live executor called although a recorded patch exists")
+
+    plan, design = Plan.model_validate(CANNED["Plan"]), Design.model_validate(CANNED["Design"])
+    cache = tmp_path / "changesets"
+    await GitSandbox(ctx.sandbox).ensure_repo()
+    first = RecordingExecutor(FakeExecutor(plant=None), cache)
+    assert isinstance(await first.execute(ctx, plan.tasks[0], design, None), Done)
+
+    other = RunContext(
+        run_id="r2", scenario=ctx.scenario, policy=ctx.policy, sandbox=tmp_path / "sb2", trace=ctx.trace
+    )
+    await GitSandbox(other.sandbox).ensure_repo()
+    reused = await RecordingExecutor(MustNotRun(), cache).execute(other, plan.tasks[0], design, None)
+    assert isinstance(reused, Done) and "replayed" in reused.notes
+    assert (other.sandbox / "src/shortener/t1.py").exists()
+    ev = [e for e in ctx.trace.events("r2") if e.kind == Kind.EXECUTOR_CALL]
+    assert ev and ev[-1].status == "REUSED" and ev[-1].payload["patch"] == "T1.attempt1.patch"

@@ -151,3 +151,30 @@ async def test_skip_outcome(graph, ctx, state, store):  # type: ignore[no-untype
     r = Runner(graph, hs, store, sleep=no_sleep)
     st = await r.run(ctx, state)
     assert st.nodes["a"] == NodeStatus.SKIPPED
+
+
+async def test_executor_node_timeout_scales_with_the_plan(graph, ctx, state, store):  # type: ignore[no-untyped-def]
+    import asyncio
+
+    from orchestrator.engine.runner import Runner
+    from orchestrator.models.plan import Plan
+
+    ctx.policy = ctx.policy.model_copy(
+        update={"budgets": ctx.policy.budgets.model_copy(update={"node_timeout_seconds": 1})}
+    )
+    tasks = [
+        {"id": f"t{i}", "title": "x", "allowed_files": ["src/**"], "definition_of_done": ["d"]}
+        for i in range(3)
+    ]
+    ctx.put("plan", Plan.model_validate({"run_id": "r1", "spec_version": 1, "tasks": tasks}), "b")
+    impl, agent = graph.nodes["impl"], graph.nodes["a"]
+    assert Runner._timeout(impl, ctx) == 3.0 and Runner._timeout(agent, ctx) == 1.0
+
+    async def slow(node, ctx):  # type: ignore[no-untyped-def]
+        await asyncio.sleep(1.5)
+        return Success({"changeset": "cs"})
+
+    r = Runner(graph, {"executor": slow, "agent": slow}, store, sleep=no_sleep)
+    assert isinstance(await r._execute(impl, ctx, state), Success)  # 1.5 s < 3 tasks x 1 s
+    out = await r._execute(agent, ctx, state)
+    assert isinstance(out, Retry) and "timeout" in out.reason  # an agent gets the plain budget

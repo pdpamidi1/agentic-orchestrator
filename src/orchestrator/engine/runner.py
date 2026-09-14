@@ -213,7 +213,7 @@ class Runner:
             ctx.emit(Kind.ATTEMPT_STARTED, node_id=node.id, attempt=attempt, actor=node.agent or node.kind)
             started = time.monotonic()
             try:
-                last = await asyncio.wait_for(handler(node, ctx), timeout=pol.budgets.node_timeout_seconds)
+                last = await asyncio.wait_for(handler(node, ctx), timeout=self._timeout(node, ctx))
             except TimeoutError:
                 last = Retry("node timeout")
             except Exception as e:  # handler bugs are attempts, not crashes
@@ -349,6 +349,16 @@ class Runner:
         return False
 
     # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _timeout(node: NodeDef, ctx: RunContext) -> float:
+        """node_timeout_seconds bounds one unit of work: a node attempt, or for the executor node one task
+        (the executor bounds each task itself), so the node budget scales with the plan's task count."""
+        base = float(ctx.policy.budgets.node_timeout_seconds)
+        if node.kind != "executor":
+            return base
+        tasks = getattr(ctx.get("plan"), "tasks", None)  # tests stub the plan with plain values
+        return base * max(1, len(tasks)) if tasks else base
+
     def _budget_trip(self, state: RunState, ctx: RunContext) -> str | None:
         b = ctx.policy.budgets
         elapsed = (datetime.now(UTC) - state.budget.started_at).total_seconds() / 60

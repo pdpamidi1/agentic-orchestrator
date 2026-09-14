@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
@@ -26,6 +27,11 @@ import json, pathlib, sys
 pathlib.Path("../claude_args.txt").write_text("\\n".join(sys.argv[1:]))
 mode = pathlib.Path("../fake_claude_mode")
 mode = mode.read_text().strip() if mode.exists() else "done"
+if mode == "hang":
+    import time
+
+    time.sleep(30)
+    sys.exit(0)
 if mode == "crash":
     print(json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": True, "num_turns": 25,
                       "total_cost_usd": 0.5}))
@@ -129,3 +135,21 @@ def test_gate_contract_for_java_lists_the_maven_gates_and_the_springdoc_dump() -
     assert "`./mvnw -q -Pit verify`" in text and "-Dtest=ArchitectureTest" in text and "(advisory)" in text
     assert "target/openapi.json" in text and "src/main/resources/openapi.yaml" in text
     assert "src/test/java/sdlc/ArchitectureTest.java" in text
+
+
+async def test_timeout_kills_the_headless_process(tmp_path: Path) -> None:
+    ctx, _, ex = await setup(tmp_path)
+    task, design = task_and_design()
+    fast = POLICY.model_copy(
+        update={"budgets": POLICY.budgets.model_copy(update={"node_timeout_seconds": 1})}
+    )
+    ctx.policy = fast
+    (tmp_path / "fake_claude_mode").write_text("hang")
+    r = await ex.execute(ctx, task, design, None)
+    assert isinstance(r, Errored) and r.transient and "timeout" in r.reason
+    proc = await asyncio.create_subprocess_exec(
+        "pgrep", "-f", str(tmp_path / "claude"), stdout=asyncio.subprocess.PIPE
+    )
+    out, _ = await proc.communicate()
+    left = out.decode().strip()
+    assert left == "", f"orphaned headless claude still running: {left}"

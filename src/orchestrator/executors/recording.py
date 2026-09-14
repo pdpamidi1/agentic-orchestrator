@@ -13,6 +13,7 @@ from ..models import Design, TaskSpec
 from ..models.trace import Kind
 from ..sandbox.git import GitSandbox
 from .base import CodeExecutor, Done, ExecResult
+from .replay import apply_recorded
 
 
 class RecordingExecutor:
@@ -24,9 +25,25 @@ class RecordingExecutor:
     ) -> ExecResult:
         git = GitSandbox(ctx.sandbox)
         before = await git.head()
+        attempt = (feedback or {}).get("attempt", 0) + 1  # same rule ReplayExecutor uses to pick the file
+        # record once: a task already recorded for this scenario is replayed instead of re-run live, so a
+        # run that died after task N costs only tasks N+1.. next time (policy checks still run on the result)
+        patch = self.cache_dir / ctx.scenario / f"{task.id}.attempt{attempt}.patch"  # exact attempt only:
+        if patch.exists():  # the task's *latest* patch may be the attempt the policy engine rejected
+            reused = await apply_recorded(ctx, task, patch)
+            if isinstance(reused, Done):
+                ctx.emit(
+                    Kind.EXECUTOR_CALL,
+                    task_id=task.id,
+                    attempt=attempt,
+                    actor="recorder",
+                    status="REUSED",
+                    payload={"patch": patch.name, "commit": reused.commit_sha},
+                )
+                return reused
+            await git.reset_working_tree()  # the patch no longer applies: fall through to the live executor
         result = await self.inner.execute(ctx, task, design, feedback)
         if isinstance(result, Done):
-            attempt = (feedback or {}).get("attempt", 0) + 1  # same rule ReplayExecutor uses to pick the file
             folder = self.cache_dir / ctx.scenario
             exact = folder / f"{task.id}.attempt{attempt}.patch"
             await git.export_patch(before, exact)
