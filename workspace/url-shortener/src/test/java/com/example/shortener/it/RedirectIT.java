@@ -1,3 +1,14 @@
+/*
+ * RedirectIT.java — GET /{short_code} end to end against PostgreSQL and Redis.
+ *
+ * Layer: test (integration). Pins the read endpoint's observable contract: 302 with Location equal
+ * to the stored long_url (forwarded verbatim, fragment included), Cache-Control: private and an
+ * empty body for generated codes, custom aliases and not-yet-expired links (AC-7); 404
+ * problem+json of type short-code-not-found for an unknown code (AC-8); 410 problem+json of type
+ * short-code-expired for an expired row (AC-9); no Location header on errors (AC-16). Technique:
+ * Spring Boot test on Testcontainers Postgres/Redis via AbstractIntegrationTest with a JDK
+ * HttpClient that does not follow redirects. Requires Docker; run with ./mvnw -Pit verify.
+ */
 package com.example.shortener.it;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -14,11 +25,26 @@ import org.junit.jupiter.api.Test;
  * {@code GET /{short_code}} end to end: 302 with {@code Location} = stored {@code long_url} and
  * {@code Cache-Control: private} (AC-7), 404 for an unknown code (AC-8), 410 for an expired code
  * (AC-9); every error is {@code application/problem+json} (AC-16).
+ *
+ * <p>Fixture strategy: shared application context and containers from {@link
+ * AbstractIntegrationTest}. Live links are created through the API ({@code createShortCode} /
+ * {@code post}); the expired link is inserted directly with the repository because the API rejects
+ * past expiries. Each test starts with an empty table and cache, so every first GET is a cache miss
+ * served from Postgres.
+ *
+ * <p>Removing this class would leave the redirect path unverified over real HTTP: header forwarding
+ * by the servlet container, the empty 302 body and the 404/410 rendering through the global handler
+ * are only approximated by the MockMvc unit tests.
  */
 class RedirectIT extends AbstractIntegrationTest {
 
   // --- 302 (AC-7) ------------------------------------------------------------------------------
 
+  /**
+   * Given a code created for a URL with query string and fragment, when requested, then the answer
+   * is 302 with {@code Location} equal to the URL byte for byte, {@code Cache-Control: private} and
+   * an empty body (AC-7).
+   */
   @Test
   void knownCodeRedirectsWithLocationAndPrivateCacheControl() {
     String longUrl = "https://example.com/some/path?x=1&y=2#frag";
@@ -32,6 +58,10 @@ class RedirectIT extends AbstractIntegrationTest {
     assertThat(response.body()).isEmpty();
   }
 
+  /**
+   * Given a link created with {@code custom_alias = aliasIT}, when {@code /aliasIT} is requested,
+   * then it redirects to the alias' target with the private cache header.
+   */
   @Test
   void customAliasRedirectsToItsLongUrl() {
     HttpResponse<String> created =
@@ -45,6 +75,10 @@ class RedirectIT extends AbstractIntegrationTest {
     assertThat(header(response, "Cache-Control")).isEqualTo("private");
   }
 
+  /**
+   * Given a link expiring one hour from now, when requested before that, then it still redirects
+   * (302 with the stored URL) rather than answering 410.
+   */
   @Test
   void unexpiredCodeRedirectsUntilItsExpiry() {
     String longUrl = uniqueLongUrl();
@@ -61,6 +95,11 @@ class RedirectIT extends AbstractIntegrationTest {
 
   // --- 404 (AC-8) ------------------------------------------------------------------------------
 
+  /**
+   * Given a code present in neither cache nor database, when requested, then the answer is a 404
+   * RFC 9457 problem whose type ends in {@code short-code-not-found} and carries no {@code
+   * Location} header (AC-8, AC-16).
+   */
   @Test
   void unknownCodeIs404ProblemJson() {
     HttpResponse<String> response = get("/doesNotExist");
@@ -72,6 +111,11 @@ class RedirectIT extends AbstractIntegrationTest {
 
   // --- 410 (AC-9) ------------------------------------------------------------------------------
 
+  /**
+   * Given a row inserted directly with {@code expires_at} one day in the past, when its code is
+   * requested, then the answer is a 410 problem whose type ends in {@code short-code-expired} and
+   * carries no {@code Location} header (AC-9, AC-16).
+   */
   @Test
   void expiredCodeIs410ProblemJson() {
     Instant now = Instant.now();

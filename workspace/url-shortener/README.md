@@ -13,6 +13,68 @@ operation-by-operation and status-code-by-status-code against the running applic
 live document at `/v3/api-docs` (JSON), `/v3/api-docs.yaml` and Swagger UI at
 `/swagger-ui.html`.
 
+## Quick start on a new machine
+
+The whole project is self-contained: a Maven wrapper, Flyway migrations and Testcontainers-based tests. You need:
+
+| Prerequisite | Why | Check |
+|---|---|---|
+| Git | clone the repository | `git --version` |
+| JDK 25 (Temurin, GraalVM or OpenJDK) | build and run; `./mvnw` downloads Maven itself | `java -version` prints `25.x` |
+| Docker Engine (or Docker Desktop) | Postgres + Redis for running, Testcontainers for `-Pit verify` | `docker version` |
+| Network access to Maven Central and Docker Hub on the first build | dependencies and base images | |
+
+```bash
+# 1. clone (this project lives inside the agentic-orchestrator repository)
+git clone https://github.com/<your-org>/agentic-orchestrator.git
+cd agentic-orchestrator/workspace/url-shortener
+
+# 2. compile and run the unit tests (no Docker needed; ~1 minute on first run while Maven downloads)
+./mvnw -q test
+
+# 3. run the full verification the pipeline's gates run: formatting, architecture test, unit + integration tests
+#    (integration tests start Postgres and Redis containers via Testcontainers; needs Docker)
+./mvnw -q spotless:check
+./mvnw -q -Dtest=ArchitectureTest test
+./mvnw -q -Pit verify
+
+# 4a. run the application with the one-command stack from the orchestrator repository (recommended)
+cd ../..                     # repository root
+make shortener-up            # Postgres :5433, Redis :6380, app :8081 (builds this project's Dockerfile)
+make shortener-logs          # wait for "Started UrlShortenerApplication"
+
+# 4b. or run it standalone against your own Postgres and Redis (see "Running locally" below)
+cd workspace/url-shortener
+SHORTENER_DB_URL=jdbc:postgresql://localhost:5432/shortener SHORTENER_DB_USERNAME=shortener \
+SHORTENER_DB_PASSWORD=shortener SHORTENER_REDIS_HOST=localhost ./mvnw spring-boot:run
+
+# 5. try it (port 8081 with the compose stack, 8080 standalone)
+curl -s -X POST localhost:8081/api/v1/urls -H 'content-type: application/json' \
+     -d '{"long_url":"https://example.com/a/very/long/path"}'
+#   -> 201 {"short_url":"http://localhost:8081/100001","short_code":"100001",...}
+curl -si localhost:8081/100001        # 302, Location: https://example.com/a/very/long/path
+curl -si localhost:8081/nope          # 404 application/problem+json
+open http://localhost:8081/swagger-ui.html
+
+# 6. look at the data (compose stack)
+cd ../.. && make shortener-psql       # select short_code, long_url, code_source, expires_at from urls;
+make shortener-redis                  # keys shortener:*   /   get shortener:url:100001
+make shortener-down
+```
+
+Troubleshooting:
+
+- `./mvnw` fails to download Maven: set `MAVEN_OPTS` proxy settings or pre-populate `~/.m2`; the wrapper reads
+  `.mvn/wrapper/maven-wrapper.properties`.
+- Integration tests fail with "Could not find a valid Docker environment": Docker is not running or your user
+  cannot access the socket; unit tests still run with `./mvnw test`.
+- Port already in use: the compose stack uses 5433/6380/8081 precisely to avoid the default ports; override
+  `SERVER_PORT` when running standalone.
+- Redis down at runtime is not an error: the read path serves from Postgres and the write path falls back to the
+  database sequence (`code_source = db_sequence`); see [docs/operations.md](docs/operations.md).
+
+Design rationale, ADRs and the layering rules: [docs/DESIGN.md](docs/DESIGN.md).
+
 ## Endpoints
 
 ### `POST /api/v1/urls` — `createShortUrl`
@@ -92,8 +154,9 @@ mapping (column `urls.code_source`):
 
 Both counters are base62-encoded after adding a configurable seed offset, so generated codes are
 always at least six characters and never restart from `a`. A `custom_alias` is stored as
-supplied; its `code_source` records the counter that would otherwise have been used and carries
-no further meaning. Clients can treat `db_sequence` as a signal that the write side ran
+supplied and bypasses both counters; its `code_source` is always `redis` (a fixed marker in
+`UrlWriteService`, unrelated to Redis health) and carries no further meaning. For generated codes,
+clients can treat `db_sequence` as a signal that the write side ran
 degraded at that moment. See [`docs/operations.md`](docs/operations.md) for the outage
 behaviour and the accepted counter gaps.
 

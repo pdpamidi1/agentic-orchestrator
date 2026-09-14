@@ -1,3 +1,16 @@
+/*
+ * UrlWriteServiceTest.java — unit tests for short-link creation
+ *
+ * Layer: test. Pins UrlWriteService with Mockito mocks of UrlMappingRepository and
+ * ShortCodeAllocator and a fixed Clock; the persisted UrlMapping is captured from saveAndFlush
+ * and inspected field by field. Covers: the generated-code path with code_source redis (AC-1,
+ * AC-10), expiry stored as a UTC instant, custom alias used verbatim without touching the
+ * allocator, base URL normalisation, the alias conflict both via pre-check and via the primary-key
+ * violation on flush (AC-3, message never leaks the constraint name), no deduplication of
+ * identical long URLs (AC-4), the db_sequence fallback recorded as-is (AC-11), propagation of a
+ * total allocator failure, the semantic checks beyond Bean Validation, @Transactional on create,
+ * and the constructor guards.
+ */
 package com.example.shortener.write;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -38,20 +51,42 @@ import org.springframework.transaction.annotation.Transactional;
 /**
  * {@link UrlWriteService} with a mocked repository and allocator: success (AC-1), alias conflict
  * (AC-3), no deduplication (AC-4), recorded {@code code_source} for both counters (AC-10, AC-11).
+ *
+ * <p>The allocator is mocked, so the Redis-vs-sequence decision itself is not exercised here (see
+ * {@code ShortCodeAllocatorTest}); these tests only check that whatever the allocator reports is
+ * persisted and echoed faithfully. Because the mocked repository's {@code saveAndFlush} does not
+ * enforce a primary key, conflicts are simulated by stubbing {@code existsByShortCode} or by making
+ * {@code saveAndFlush} throw {@link DataIntegrityViolationException}. Real database behaviour is
+ * covered by {@code CreateShortUrlIT}.
  */
 class UrlWriteServiceTest {
 
+  /** The fixed "now" the service stamps into {@code created_at} and compares expiries against. */
   private static final Instant NOW = Instant.parse("2026-09-14T10:15:30Z");
+
+  /** A valid long URL used in most requests. */
   private static final String LONG_URL = "https://example.com/some/path";
+
+  /** Base URL handed to the service; {@code short_url} must be this plus {@code /} plus code. */
   private static final String BASE_URL = "http://localhost:8080";
 
+  /** Mocked repository; conflicts are simulated through its stubs. */
   private final UrlMappingRepository repository = mock(UrlMappingRepository.class);
+
+  /** Mocked allocator; returns whatever {@link AllocatedCode} a test needs. */
   private final ShortCodeAllocator allocator = mock(ShortCodeAllocator.class);
+
+  /** Service under test with the explicit base URL and a clock fixed at {@link #NOW}. */
   private final UrlWriteService service =
       new UrlWriteService(repository, allocator, BASE_URL, Clock.fixed(NOW, ZoneOffset.UTC));
 
   // --- success (AC-1, AC-10) -------------------------------------------------------------------
 
+  /**
+   * Without an alias the allocated Redis code becomes the short code; the response and the saved
+   * row carry the same values, {@code created_at} is the clock's now, {@code created_by} is null,
+   * and no alias pre-check is performed.
+   */
   @Test
   void persistsAllocatedRedisCodeAndReturnsShortUrlFromBaseUrl() {
     when(allocator.allocate()).thenReturn(new AllocatedCode("100001", CodeSource.REDIS));
@@ -74,6 +109,10 @@ class UrlWriteServiceTest {
     verify(repository, never()).existsByShortCode(any());
   }
 
+  /**
+   * An {@code expiration_date} with a +02:00 offset is stored and echoed as the equivalent UTC
+   * instant.
+   */
   @Test
   void persistsExpiryAsInstantAndEchoesItInTheResponse() {
     OffsetDateTime expiry = OffsetDateTime.of(2030, 1, 1, 12, 0, 0, 0, ZoneOffset.ofHours(2));
@@ -86,6 +125,10 @@ class UrlWriteServiceTest {
     assertThat(savedMapping().getExpiresAt()).isEqualTo(expected);
   }
 
+  /**
+   * A free custom alias is used verbatim as the short code, recorded with the nominal {@code
+   * CUSTOM_ALIAS_CODE_SOURCE}, and the allocator is never consulted (no counter value spent).
+   */
   @Test
   void usesCustomAliasAsShortCodeWithoutAllocatingACode() {
     when(repository.existsByShortCode("promo2024")).thenReturn(false);
@@ -103,6 +146,10 @@ class UrlWriteServiceTest {
     verifyNoInteractions(allocator);
   }
 
+  /**
+   * The Spring constructor takes the base URL from {@code ShortenerProperties}; one or several
+   * trailing slashes are stripped by either constructor so the short URL has exactly one slash.
+   */
   @Test
   void buildsShortUrlFromConfiguredPropertiesWithoutTrailingSlash() {
     ShortenerProperties properties =
@@ -120,6 +167,10 @@ class UrlWriteServiceTest {
 
   // --- alias conflict (AC-3) -------------------------------------------------------------------
 
+  /**
+   * An alias the pre-check reports as taken raises {@link AliasAlreadyExistsException} naming it;
+   * no insert is attempted and no counter value is spent.
+   */
   @Test
   void takenAliasIsRejectedByPreCheckAndNothingIsPersisted() {
     when(repository.existsByShortCode("promo2024")).thenReturn(true);
@@ -133,6 +184,11 @@ class UrlWriteServiceTest {
     verifyNoInteractions(allocator);
   }
 
+  /**
+   * When the pre-check passes but the flush hits the primary key (a concurrent writer won), the
+   * failure is still {@link AliasAlreadyExistsException} and the driver's constraint name is not
+   * part of the client-facing message.
+   */
   @Test
   void primaryKeyViolationOnFlushIsRejectedAsConflict() {
     when(repository.existsByShortCode("promo2024")).thenReturn(false);
@@ -145,6 +201,10 @@ class UrlWriteServiceTest {
         .hasMessageNotContaining("pk_urls");
   }
 
+  /**
+   * The same flush-time translation applies to a generated code (for example one handed out by both
+   * counters, see docs/operations.md 2.3): the client sees a 409 naming the code.
+   */
   @Test
   void generatedCodeCollisionOnFlushIsRejectedAsConflictToo() {
     when(allocator.allocate()).thenReturn(new AllocatedCode("100001", CodeSource.REDIS));
@@ -158,6 +218,10 @@ class UrlWriteServiceTest {
 
   // --- no deduplication (AC-4) -----------------------------------------------------------------
 
+  /**
+   * Posting the same long URL three times allocates three distinct codes and inserts three rows
+   * with that URL; no lookup by long URL or alias pre-check is ever attempted.
+   */
   @Test
   void repostingTheSameLongUrlAllocatesANewDistinctCodeEveryTime() {
     when(allocator.allocate())
@@ -185,6 +249,10 @@ class UrlWriteServiceTest {
 
   // --- db_sequence fallback (AC-11) ------------------------------------------------------------
 
+  /**
+   * When the allocator reports {@code DB_SEQUENCE} (Redis was down), that source is persisted in
+   * the row and rendered as {@code "db_sequence"} in the response; nothing else changes.
+   */
   @Test
   void persistsDbSequenceCodeSourceWhenTheAllocatorFellBack() {
     when(allocator.allocate()).thenReturn(new AllocatedCode("1Xy9zQ", CodeSource.DB_SEQUENCE));
@@ -200,6 +268,10 @@ class UrlWriteServiceTest {
     assertThat(saved.getCreatedBy()).isNull();
   }
 
+  /**
+   * A failure of both counters (the allocator throws) propagates unchanged, so it becomes a 500,
+   * and no row is written.
+   */
   @Test
   void allocatorFailurePropagatesAndNothingIsPersisted() {
     when(allocator.allocate()).thenThrow(new IllegalStateException("both counters down"));
@@ -212,6 +284,11 @@ class UrlWriteServiceTest {
 
   // --- semantic checks beyond Bean Validation --------------------------------------------------
 
+  /**
+   * URLs that the DTO regex might accept but that are not absolute http(s) URLs with a host (wrong
+   * scheme, empty authority, space in the host, missing scheme, blank) are rejected with {@code
+   * DETAIL_INVALID_LONG_URL} before any counter or database access.
+   */
   @ParameterizedTest
   @ValueSource(
       strings = {
@@ -231,6 +308,7 @@ class UrlWriteServiceTest {
     verifyNoInteractions(allocator, repository);
   }
 
+  /** A URL above 2048 characters is rejected with {@code DETAIL_LONG_URL_TOO_LONG} early. */
   @Test
   void overlongLongUrlIsRejected() {
     String url = "https://example.com/" + "a".repeat(2048);
@@ -241,6 +319,7 @@ class UrlWriteServiceTest {
     verifyNoInteractions(allocator, repository);
   }
 
+  /** The scheme check is case-insensitive and the URL is stored without case normalisation. */
   @Test
   void upperCaseSchemeWithHostIsAccepted() {
     when(allocator.allocate()).thenReturn(new AllocatedCode("100009", CodeSource.REDIS));
@@ -249,6 +328,10 @@ class UrlWriteServiceTest {
         .isEqualTo("HTTP://Example.com");
   }
 
+  /**
+   * An expiry equal to the service clock's now, or one second before it, is rejected with {@code
+   * DETAIL_EXPIRY_NOT_IN_FUTURE} before any counter or database access.
+   */
   @Test
   void expiryAtOrBeforeNowIsRejected() {
     OffsetDateTime atNow = NOW.atOffset(ZoneOffset.UTC);
@@ -262,6 +345,10 @@ class UrlWriteServiceTest {
     verifyNoInteractions(allocator, repository);
   }
 
+  /**
+   * A malformed alias (too short, hyphen, space, over 32 characters) is rejected with {@code
+   * DETAIL_INVALID_ALIAS} before the availability pre-check hits the repository.
+   */
   @ParameterizedTest
   @ValueSource(strings = {"ab", "bad-alias", "with space", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q"})
   void malformedAliasIsRejectedWithoutTouchingTheRepository(String alias) {
@@ -273,6 +360,7 @@ class UrlWriteServiceTest {
 
   // --- construction / wiring -------------------------------------------------------------------
 
+  /** {@code create} is annotated {@code @Transactional} so a lost flush race rolls back cleanly. */
   @Test
   void createIsTransactional() throws NoSuchMethodException {
     assertThat(
@@ -282,6 +370,10 @@ class UrlWriteServiceTest {
         .isTrue();
   }
 
+  /**
+   * Every constructor argument and the {@code create} request are null-checked, and a base URL that
+   * is blank after normalisation ({@code " / "}) is rejected with {@link IllegalArgumentException}.
+   */
   @Test
   void rejectsMissingCollaborators() {
     Clock clock = Clock.systemUTC();
@@ -298,6 +390,12 @@ class UrlWriteServiceTest {
         .isThrownBy(() -> new UrlWriteService(repository, allocator, " / ", clock));
   }
 
+  /**
+   * Captures the single {@link UrlMapping} passed to {@code saveAndFlush}, failing if the service
+   * did not save exactly once.
+   *
+   * @return the entity the service tried to persist
+   */
   private UrlMapping savedMapping() {
     ArgumentCaptor<UrlMapping> captor = ArgumentCaptor.forClass(UrlMapping.class);
     verify(repository).saveAndFlush(captor.capture());

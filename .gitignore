@@ -11,3 +11,4 @@ runs/sdlc.db
 .env.*
 .env *
 !.env.example
+workspace/**/target/

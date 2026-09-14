@@ -1,3 +1,15 @@
+/*
+ * OpenApiContractIT.java — parity between the committed openapi.yaml and the running application.
+ *
+ * Layer: test (integration). Pins AC-15's "committed OpenAPI document matches the implemented
+ * endpoints": the YAML that springdoc generates from the live context (GET /v3/api-docs.yaml) is
+ * compared with src/main/resources/openapi.yaml path by path, operation by operation and status
+ * code by status code (plus operationId, request-body media types, parameters, response media
+ * types and headers, response schema references, component schema property names and required
+ * lists). A second test pins the committed document's exact content independently of the app.
+ * Technique: Spring Boot test on Testcontainers (inherited; the database is only needed to boot),
+ * SnakeYAML parsing, hand-written structural diff. Requires Docker; run with ./mvnw -Pit verify.
+ */
 package com.example.shortener.it;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -23,12 +35,30 @@ import org.yaml.snakeyaml.Yaml;
  * context is compared with the committed one operation by operation, status code by status code
  * (plus media types, response headers, parameters, request bodies and schema properties); any drift
  * fails the build with the list of differences.
+ *
+ * <p>Fixture strategy: the shared default-profile application from {@link AbstractIntegrationTest}
+ * (both surfaces registered, so both operations appear in the live document). The committed file is
+ * read from the classpath, the live one over HTTP; both are parsed with SnakeYAML into nested maps
+ * and walked by the private {@code compare*} helpers, which collect human-readable drift lines
+ * instead of failing at the first difference. Descriptions, examples, {@code info} and {@code
+ * servers} are intentionally not compared, so wording may change without touching this test.
+ *
+ * <p>Removing this class would let the committed contract and the code drift silently: a new status
+ * code, a renamed JSON property or a dropped response header would no longer fail the build, and
+ * the README's promise that the file cannot drift would be false.
  */
 class OpenApiContractIT extends AbstractIntegrationTest {
 
+  /** Classpath name of the committed contract (from src/main/resources). */
   private static final String COMMITTED_DOCUMENT = "openapi.yaml";
+
+  /** springdoc's YAML endpoint; the same content the -Pit build dumps to target/openapi.yaml. */
   private static final String API_DOCS_PATH = "/v3/api-docs.yaml";
 
+  /**
+   * Given the committed and the live document, when their paths and component schemas are compared
+   * structurally, then the list of drift messages is empty (AC-15).
+   */
   @Test
   void committedDocumentMatchesTheRunningApplication() {
     Map<String, Object> committed = committedDocument();
@@ -46,6 +76,14 @@ class OpenApiContractIT extends AbstractIntegrationTest {
         .isEmpty();
   }
 
+  /**
+   * Given only the committed document, when inspected, then it describes exactly {@code POST
+   * /api/v1/urls} ({@code createShortUrl}: 201 JSON, 400/409/500 problem+json, JSON request body)
+   * and {@code GET /{short_code}} ({@code redirectToLongUrl}: 302 with Location and Cache-Control
+   * headers and no body, 404/410/500 problem+json), and the three component schemas carry the
+   * contract's snake_case property names. This pins the README's endpoint tables independently of
+   * what springdoc happens to generate.
+   */
   @Test
   void committedDocumentDescribesExactlyTheTwoOperations() {
     Map<String, Object> paths = map(committedDocument().get("paths"));
@@ -95,6 +133,11 @@ class OpenApiContractIT extends AbstractIntegrationTest {
   // Documents
   // ---------------------------------------------------------------------------------------------
 
+  /**
+   * Loads and parses the committed contract from the classpath.
+   *
+   * @return the top-level YAML object; fails the test if the resource is missing
+   */
   private static Map<String, Object> committedDocument() {
     ClassPathResource resource = new ClassPathResource(COMMITTED_DOCUMENT);
     assertThat(resource.exists()).as("committed %s on the classpath", COMMITTED_DOCUMENT).isTrue();
@@ -107,6 +150,11 @@ class OpenApiContractIT extends AbstractIntegrationTest {
     }
   }
 
+  /**
+   * Fetches and parses the document springdoc generates from the running application.
+   *
+   * @return the top-level YAML object; fails the test unless the endpoint answers 200
+   */
   private Map<String, Object> liveDocument() {
     HttpResponse<String> response = get(API_DOCS_PATH);
     assertThat(response.statusCode()).as("GET %s", API_DOCS_PATH).isEqualTo(200);
@@ -117,6 +165,14 @@ class OpenApiContractIT extends AbstractIntegrationTest {
   // Comparison
   // ---------------------------------------------------------------------------------------------
 
+  /**
+   * Compares the {@code paths} objects: every path and HTTP method must exist on both sides; for
+   * pairs present on both, delegates to {@link #compareOperation}.
+   *
+   * @param committed {@code paths} of the committed document
+   * @param live {@code paths} of the live document
+   * @param drift accumulator for human-readable differences
+   */
   private static void comparePaths(
       Map<String, Object> committed, Map<String, Object> live, List<String> drift) {
     for (String path : union(committed.keySet(), live.keySet())) {
@@ -146,6 +202,16 @@ class OpenApiContractIT extends AbstractIntegrationTest {
     }
   }
 
+  /**
+   * Compares one operation: operationId, request-body media types and {@code required} flag,
+   * parameter set (in/name/required), and for every status code present on either side the media
+   * types, header names and per-media-type schema object.
+   *
+   * @param operation label such as {@code "POST /api/v1/urls"} used in drift messages
+   * @param committed the committed operation object
+   * @param live the live operation object
+   * @param drift accumulator for human-readable differences
+   */
   private static void compareOperation(
       String operation,
       Map<String, Object> committed,
@@ -203,6 +269,15 @@ class OpenApiContractIT extends AbstractIntegrationTest {
     }
   }
 
+  /**
+   * Compares {@code components.schemas}: the set of schema names, and for each schema present on
+   * both sides its property names and {@code required} list (types, formats and patterns are not
+   * compared).
+   *
+   * @param committed committed schemas by name
+   * @param live live schemas by name
+   * @param drift accumulator for human-readable differences
+   */
   private static void compareSchemas(
       Map<String, Object> committed, Map<String, Object> live, List<String> drift) {
     compareKeys("component schemas", committed.keySet(), live.keySet(), drift);
@@ -225,6 +300,14 @@ class OpenApiContractIT extends AbstractIntegrationTest {
     }
   }
 
+  /**
+   * Records a drift line when two key collections differ as sorted sets (order-insensitive).
+   *
+   * @param what label for the drift message
+   * @param committed keys from the committed document
+   * @param live keys from the live document
+   * @param drift accumulator
+   */
   private static void compareKeys(
       String what, Collection<String> committed, Collection<String> live, List<String> drift) {
     Set<String> documented = new TreeSet<>(committed);
@@ -234,12 +317,26 @@ class OpenApiContractIT extends AbstractIntegrationTest {
     }
   }
 
+  /**
+   * Records a drift line when two scalar or nested values are not {@code equals} (null-safe).
+   *
+   * @param what label for the drift message
+   * @param committed value from the committed document
+   * @param live value from the live document
+   * @param drift accumulator
+   */
   private static void compareValue(String what, Object committed, Object live, List<String> drift) {
     if (committed == null ? live != null : !committed.equals(live)) {
       drift.add(what + ": documented " + committed + " but application exposes " + live);
     }
   }
 
+  /**
+   * Reduces an OpenAPI {@code parameters} list to comparable {@code in:name:required=...} tokens.
+   *
+   * @param parameters the raw list, or anything else (treated as no parameters)
+   * @return the tokens in document order
+   */
   private static Set<String> parameterNames(Object parameters) {
     Set<String> names = new LinkedHashSet<>();
     if (parameters instanceof List<?> list) {
@@ -251,17 +348,37 @@ class OpenApiContractIT extends AbstractIntegrationTest {
     return names;
   }
 
+  /**
+   * Sorted union of two key sets, so both documents are walked in one deterministic pass.
+   *
+   * @param first keys of one side
+   * @param second keys of the other side
+   * @return all keys, sorted
+   */
   private static Set<String> union(Set<String> first, Set<String> second) {
     Set<String> union = new TreeSet<>(first);
     union.addAll(second);
     return union;
   }
 
+  /**
+   * Null-tolerant view of a YAML node as a map; anything that is not a map becomes an empty map so
+   * missing sections compare as "nothing" instead of throwing.
+   *
+   * @param value any parsed YAML node
+   * @return the map, or an empty immutable map
+   */
   @SuppressWarnings("unchecked")
   private static Map<String, Object> map(Object value) {
     return value instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
   }
 
+  /**
+   * Null-tolerant view of a YAML node as a list of strings (used for {@code required}).
+   *
+   * @param value any parsed YAML node
+   * @return the items as strings, or an empty list
+   */
   private static List<String> list(Object value) {
     List<String> result = new ArrayList<>();
     if (value instanceof List<?> l) {

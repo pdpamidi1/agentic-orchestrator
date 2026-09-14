@@ -1,3 +1,14 @@
+/*
+ * CreateShortUrlIT.java — POST /api/v1/urls end to end against PostgreSQL and Redis.
+ *
+ * Layer: test (integration). Pins the write endpoint's observable contract: 201 with the exact
+ * response keys, short_url built from the configured base URL, a persisted row without creator
+ * (AC-1), custom_alias used verbatim as the code (AC-3 happy path), 400 problem+json with nothing
+ * persisted for twelve kinds of invalid input (AC-2, AC-5, AC-6, AC-16), 409 on a taken alias with
+ * the existing row unchanged (AC-3) and distinct codes for the same long_url (AC-4). Technique:
+ * Spring Boot test on Testcontainers Postgres/Redis via AbstractIntegrationTest, JDK HttpClient,
+ * repository checks for persistence. Requires Docker; run with ./mvnw -Pit verify (failsafe).
+ */
 package com.example.shortener.it;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -19,14 +30,34 @@ import org.junit.jupiter.params.provider.MethodSource;
  * persisted row (AC-1, AC-2), 400 problem+json with nothing persisted (AC-5, AC-6, AC-16), 409 on a
  * taken alias with the existing mapping unchanged (AC-3) and distinct codes for a repeated {@code
  * long_url} (AC-4).
+ *
+ * <p>Fixture strategy: shared application context and containers from {@link
+ * AbstractIntegrationTest}; the {@code urls} table is emptied before each test, which is what makes
+ * the "nothing persisted" assertion ({@code repository.count() == 0}) meaningful. Requests are
+ * built with {@code createRequest} or as literal JSON for the malformed cases; persistence is
+ * verified through the autowired repository rather than through a second HTTP call.
+ *
+ * <p>Removing this class would leave the write path unverified against a real database: the
+ * primary-key conflict path, transactional rollback on 400/409 and the {@code code_source} column
+ * round trip are not reachable from the MockMvc unit tests.
  */
 class CreateShortUrlIT extends AbstractIntegrationTest {
 
+  /** Shape of any short code: the migration's {@code urls_short_code_format_chk} constraint. */
   private static final Pattern SHORT_CODE = Pattern.compile("^[0-9a-zA-Z]{3,32}$");
+
+  /** A valid target used where the test does not need a unique URL. */
   private static final String VALID_URL = "https://example.com/landing?campaign=it";
 
   // --- 201 (AC-1) ------------------------------------------------------------------------------
 
+  /**
+   * Given a valid {@code long_url} and an expiry one day ahead, when posted, then the response is
+   * 201 {@code application/json} with exactly the five contract keys, a well-formed generated code,
+   * {@code short_url = BASE_URL/<code>}, the same value in the {@code Location} header, {@code
+   * code_source = redis}; and the {@code urls} row holds the URL, the expiry, a creation timestamp,
+   * a {@code null} creator and the same code source (AC-1).
+   */
   @Test
   void createsShortUrlAndPersistsRowWithoutCreator() {
     Instant expiry = Instant.now().plus(1, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS);
@@ -56,6 +87,10 @@ class CreateShortUrlIT extends AbstractIntegrationTest {
     assertThat(row.getCodeSource().wireValue()).isEqualTo(body.get("code_source"));
   }
 
+  /**
+   * Given a request without {@code expiration_date}, when posted, then the 201 body still contains
+   * the {@code expires_at} key with a JSON {@code null} and the row's {@code expires_at} is NULL.
+   */
   @Test
   void linkWithoutExpiryHasNullExpiresAt() {
     HttpResponse<String> response = post(URLS_PATH, createRequest(VALID_URL, null, null));
@@ -70,6 +105,10 @@ class CreateShortUrlIT extends AbstractIntegrationTest {
 
   // --- custom alias (AC-2) ---------------------------------------------------------------------
 
+  /**
+   * Given {@code custom_alias = promoIT2026}, when posted, then the alias is the {@code short_code}
+   * verbatim, {@code short_url} ends with it and the row is stored under that key.
+   */
   @Test
   void customAliasBecomesTheShortCode() {
     HttpResponse<String> response = post(URLS_PATH, createRequest(VALID_URL, "promoIT2026", null));
@@ -85,6 +124,13 @@ class CreateShortUrlIT extends AbstractIntegrationTest {
 
   // --- 400 (AC-5, AC-6, AC-16) -----------------------------------------------------------------
 
+  /**
+   * Invalid request bodies, each paired with a display name: wrong or missing scheme, blank or
+   * absent {@code long_url}, over-long URL, alias too short / too long / with forbidden characters,
+   * past or unparseable {@code expiration_date}, truncated JSON and a JSON array.
+   *
+   * @return (description, raw body) pairs consumed by the parameterized 400 test below
+   */
   static Stream<Arguments> invalidRequests() {
     return Stream.of(
         Arguments.of("non-http scheme", createRequest("ftp://example.com/file", null, null)),
@@ -105,6 +151,14 @@ class CreateShortUrlIT extends AbstractIntegrationTest {
         Arguments.of("JSON array instead of object", "[\"https://example.com\"]"));
   }
 
+  /**
+   * Given each invalid body from {@link #invalidRequests()}, when posted, then the answer is a 400
+   * RFC 9457 problem with an {@code https://} type URI and the {@code urls} table stays empty
+   * (AC-2, AC-5, AC-6, AC-16).
+   *
+   * @param description human-readable case name (shown in the test report)
+   * @param body the raw request body
+   */
   @ParameterizedTest(name = "{0}")
   @MethodSource("invalidRequests")
   void invalidRequestIs400ProblemJsonAndPersistsNothing(String description, String body) {
@@ -117,6 +171,12 @@ class CreateShortUrlIT extends AbstractIntegrationTest {
 
   // --- 409 (AC-3) ------------------------------------------------------------------------------
 
+  /**
+   * Given alias {@code takenIT} already mapped to one URL, when a second request tries to map it to
+   * another URL, then the answer is a 409 problem of type {@code alias-already-exists}, the stored
+   * row still has the original URL, creation time and code source, and the table holds exactly one
+   * row (AC-3).
+   */
   @Test
   void takenAliasIs409AndLeavesTheExistingMappingUnchanged() {
     String original = "https://example.com/original";
@@ -138,6 +198,10 @@ class CreateShortUrlIT extends AbstractIntegrationTest {
 
   // --- no deduplication (AC-4) -----------------------------------------------------------------
 
+  /**
+   * Given the same {@code long_url} posted twice without alias, when both succeed, then the two
+   * codes differ and both rows exist: identical targets are never deduplicated (AC-4).
+   */
   @Test
   void repeatedLongUrlGetsDistinctShortCodes() {
     String longUrl = uniqueLongUrl();
