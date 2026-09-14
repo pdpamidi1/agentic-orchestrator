@@ -36,11 +36,16 @@ TABLE_RES = [
 JAVA_PKG = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
 JAVA_IMPORT = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)\s*;", re.M)
 # Spring MVC method-level mappings; group 1 is the verb (or "Request"), group 2 the path literal.
-JAVA_MAPPING = re.compile(r"@(Get|Post|Put|Delete|Patch|Request)Mapping\(\s*(?:value\s*=\s*)?\"([^\"]*)\"")
-# Class-level `@RequestMapping("...")` immediately followed by the class declaration: the path prefix.
-JAVA_CLASS_MAPPING = re.compile(
-    r"@RequestMapping\(\s*(?:value\s*=\s*)?\"([^\"]*)\"\s*\)\s*(?:public\s+)?class"
+# A mapping's path is optional (`@PostMapping(consumes = ...)` inherits the class prefix) and is either a
+# string literal (group 2) or a constant reference such as `PATH` / `UrlWriteController.PATH` (group 3),
+# resolved against `static final String NAME = "..."` declared in the same file.
+JAVA_MAPPING = re.compile(
+    r"@(Get|Post|Put|Delete|Patch|Request)Mapping\s*(?:\(\s*(?:(?:value|path)\s*=\s*)?"
+    r"(?:\"([^\"]*)\"|(?:[A-Z]\w*\.)?([A-Z_][A-Z0-9_]*))?)?"
 )
+JAVA_STRING_CONSTANT = re.compile(r"static\s+final\s+String\s+([A-Z_][A-Z0-9_]*)\s*=\s*\"([^\"]*)\"")
+JAVA_TYPE_DECL = re.compile(r"\b(?:class|interface|record|enum)\s+\w+")
+JAVA_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
 
 
 def _files(root: Path, suffix: str) -> list[Path]:
@@ -148,11 +153,20 @@ def _java(src: Path) -> tuple[list[str], dict[str, set[str]], list[Endpoint]]:
             pkg = imp.rsplit(".", 1)[0]
             if pkg in packages and pkg != here:
                 imports.setdefault(here, set()).add(pkg)
-        prefix = JAVA_CLASS_MAPPING.search(text)
-        base = prefix.group(1) if prefix else ""
-        for kind, path in JAVA_MAPPING.findall(text):
-            if kind == "Request" and path == base:
-                continue  # the class-level prefix itself, already folded into `base`
+        if "/test/" in j.as_posix():
+            continue  # test controllers (e.g. /throw/* fixtures) are not the application's endpoints
+        code = JAVA_COMMENT.sub("", text)  # Javadoc mentions "class" and mapping names too
+        constants = dict(JAVA_STRING_CONSTANT.findall(code))  # NAME -> literal, for `path = PATH`
+        decl = JAVA_TYPE_DECL.search(code)
+        body_at = decl.start() if decl else len(code)
+        base = ""
+        for m in JAVA_MAPPING.finditer(code):
+            kind, literal, const = m.groups()
+            path = literal or constants.get(const or "", "")
+            if m.start() < body_at:
+                if kind == "Request":
+                    base = path  # class-level prefix, folded into every method mapping below
+                continue
             endpoints.append(
                 Endpoint(method=kind.upper() if kind != "Request" else "ANY", path=base + path, module=here)
             )
