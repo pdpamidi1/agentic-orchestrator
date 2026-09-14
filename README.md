@@ -52,6 +52,8 @@ sdlc run --scenario greenfield              #   pauses at approval_design like a
 sdlc brief <run_id> approval_design         #   the design/plan/cost/changes brief a human decides on (also printed by run/answer)
 sdlc approve <run_id> approval_design       #   attempt 1 writes .env -> VIOLATION + revert; attempt 2 clean;
                                             #   then pauses on the HIGH release task
+sdlc resume <run_id>                        #   after an API restart: continue a run that was RUNNING when its
+                                            #   process died (paused/halted runs: approve or answer, as before)
 sdlc approve <run_id> implementation        #   gates -> validation -> release_readiness -> approval_release
 sdlc approve <run_id> approval_design
 sdlc metrics <run_id>
