@@ -5,6 +5,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import pytest
+
 from orchestrator.engine.arch_contract import (
     CONTRACT_PATH,
     JAVA_CONTRACT_PATH,
@@ -188,3 +190,31 @@ async def test_java_contract_is_written_for_the_java_stack(tmp_path: Path) -> No
     ctx.put("design", layered_design("Controller -> Service -> Repository"), "architecture")
     assert await write_architecture_contract(ctx, git, "implementation") is True
     assert (ctx.sandbox / JAVA_CONTRACT_PATH).exists() and not (ctx.sandbox / CONTRACT_PATH).exists()
+
+
+@pytest.mark.skipif(shutil.which("javac") is None, reason="no JDK on this machine")
+def test_java_architecture_contract_compiles(tmp_path: Path) -> None:
+    """javac against tiny JUnit stubs: the generated file must be valid Java (escapes, braces, imports)."""
+    import subprocess
+
+    stubs = tmp_path / "org" / "junit" / "jupiter" / "api"
+    stubs.mkdir(parents=True)
+    (stubs / "Test.java").write_text("package org.junit.jupiter.api;\npublic @interface Test {}\n")
+    (stubs / "Assertions.java").write_text(
+        "package org.junit.jupiter.api;\npublic final class Assertions {\n"
+        "  public static void assertTrue(boolean c, String m) {}\n}\n"
+    )
+    src = tmp_path / "sdlc" / "ArchitectureTest.java"
+    src.parent.mkdir()
+    src.write_text(
+        render_architecture_test_java(layered_design("Controller -> Service -> Repository -> Domain"))
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    res = subprocess.run(
+        ["javac", "-d", str(out), str(stubs / "Test.java"), str(stubs / "Assertions.java"), str(src)],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, res.stderr
+    assert (out / "sdlc" / "ArchitectureTest.class").exists()

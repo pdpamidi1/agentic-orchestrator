@@ -1,0 +1,403 @@
+{
+  "schema": "Plan",
+  "output": {
+    "run_id": "greenfield-94f39a2a",
+    "version": 1,
+    "previous_version": null,
+    "spec_version": 2,
+    "tasks": [
+      {
+        "id": "T1",
+        "title": "Bootstrap Spring Boot 4 / Java 25 Maven project, profiles config and build gates (pom, it profile, springdoc dump)",
+        "depends_on": [],
+        "parallel_group": null,
+        "impact_level": "HIGH",
+        "allowed_files": [
+          "pom.xml",
+          "src/main/java/com/example/shortener/UrlShortenerApplication.java",
+          "src/main/java/com/example/shortener/config/ShortenerProperties.java",
+          "src/main/resources/application.yml",
+          "src/main/resources/application-read.yml",
+          "src/main/resources/application-write.yml",
+          "src/test/java/com/example/shortener/config/ShortenerPropertiesTest.java"
+        ],
+        "contract_slice": [],
+        "data_model_slice": [],
+        "class_structure": [
+          "com.example.shortener.UrlShortenerApplication",
+          "com.example.shortener.config.ShortenerProperties"
+        ],
+        "acceptance_criteria_ids": [
+          "AC-15",
+          "AC-14"
+        ],
+        "definition_of_done": [
+          "pom.xml declares Java 25 / Spring Boot 4 with spring-boot-starter-web, validation, data-jpa, data-redis, flyway-core, postgresql driver, springdoc-openapi-starter-webmvc-ui, and test scope: spring-boot-starter-test, testcontainers (postgresql, junit-jupiter) plus a Redis container dependency",
+          "pom.xml defines a `it` Maven profile that binds maven-failsafe-plugin (verify) for **/*IT.java AND runs spring-boot-maven-plugin start/stop around integration-test with springdoc-openapi-maven-plugin writing target/openapi.json (or target/openapi.yaml)",
+          "surefire runs only unit tests (**/*Test.java) so `./mvnw -q test` never needs Docker",
+          "spotless-maven-plugin configured so `./mvnw -q spotless:check` passes on committed sources",
+          "ShortenerProperties exposes base-url (default http://localhost:8080), redis counter batch size (default 1000), default cache TTL (24h per AMB-9) and counter seed offset (AMB-11)",
+          "application.yml holds shared config; application-read.yml / application-write.yml document the read/write deployment profiles; no secrets or credentials literals beyond local defaults",
+          "ShortenerPropertiesTest asserts the documented defaults without booting a database",
+          "`./mvnw -q -DskipTests compile`, `./mvnw -q test` and `./mvnw -q -Dtest=ArchitectureTest test` pass with the provisioned mvnw and sdlc/ArchitectureTest.java untouched"
+        ],
+        "risk_notes": "Touches protected pom.xml and application*.yml (dependency + config surface). Spring Boot 4 / Java 25 coordinates and the springdoc maven plugin wiring are the highest-risk items; a wrong `it` profile breaks the contract gate for every later task. ArchitectureTest is orchestrator-provisioned and its package rules are unknown - keep the com.example.shortener package layering conventional.",
+        "rollback_note": "Revert pom.xml and src/main/resources/application*.yml plus the two new java files; repo returns to the provisioned-wrapper-only state."
+      },
+      {
+        "id": "T2",
+        "title": "Flyway migration for urls table + counter sequence, JPA entity and repository",
+        "depends_on": [
+          "T1"
+        ],
+        "parallel_group": "foundation",
+        "impact_level": "HIGH",
+        "allowed_files": [
+          "src/main/resources/db/migration/V1__create_urls_table.sql",
+          "src/main/java/com/example/shortener/domain/UrlMapping.java",
+          "src/main/java/com/example/shortener/domain/CodeSource.java",
+          "src/main/java/com/example/shortener/domain/UrlMappingRepository.java",
+          "src/test/java/com/example/shortener/domain/UrlMappingTest.java",
+          "src/test/java/com/example/shortener/domain/MigrationScriptTest.java"
+        ],
+        "contract_slice": [],
+        "data_model_slice": [
+          "urls.short_code (varchar(32) PK)",
+          "urls.long_url (varchar(2048) not null)",
+          "urls.created_at (timestamptz not null)",
+          "urls.expires_at (timestamptz null)",
+          "urls.created_by (varchar null, always null in this scenario)",
+          "urls.code_source (varchar not null, 'redis'|'db_sequence')",
+          "sequence url_code_seq (fallback counter)"
+        ],
+        "class_structure": [
+          "com.example.shortener.domain.UrlMapping",
+          "com.example.shortener.domain.CodeSource",
+          "com.example.shortener.domain.UrlMappingRepository"
+        ],
+        "acceptance_criteria_ids": [
+          "AC-1",
+          "AC-11",
+          "AC-15"
+        ],
+        "definition_of_done": [
+          "V1__create_urls_table.sql creates the urls table with short_code primary key, long_url, created_at, expires_at, created_by (nullable), code_source, plus an index supporting expiry lookups and a Postgres sequence url_code_seq seeded past the AMB-11 offset",
+          "UrlMapping is a JPA entity mapped 1:1 to the migration columns; CodeSource enum has REDIS('redis') and DB_SEQUENCE('db_sequence')",
+          "UrlMappingRepository extends a Spring Data JPA repository with existsByShortCode and findByShortCode, and a native query nextval('url_code_seq')",
+          "MigrationScriptTest asserts the migration file exists, is named V1__*, and contains every required column/sequence (no container needed)",
+          "UrlMappingTest covers entity expiry helper logic (isExpired at/after expires_at, never expired when null)",
+          "`./mvnw -q test` and `./mvnw -q -Dtest=ArchitectureTest test` pass"
+        ],
+        "risk_notes": "Touches the protected **/db/migration/** path; the schema is the source of truth for every later task and changing it after integration tests exist means a new versioned migration. created_by must stay nullable and unpopulated (non-goal / PII avoidance).",
+        "rollback_note": "Delete the V1 migration and the domain package; no other task has run against the schema yet, so no follow-up migration is needed."
+      },
+      {
+        "id": "T3",
+        "title": "Request/response DTOs, validation rules and problem+json global exception handler",
+        "depends_on": [
+          "T1"
+        ],
+        "parallel_group": "foundation",
+        "impact_level": "MEDIUM",
+        "allowed_files": [
+          "src/main/java/com/example/shortener/api/dto/CreateUrlRequest.java",
+          "src/main/java/com/example/shortener/api/dto/CreateUrlResponse.java",
+          "src/main/java/com/example/shortener/api/error/AliasAlreadyExistsException.java",
+          "src/main/java/com/example/shortener/api/error/ShortCodeNotFoundException.java",
+          "src/main/java/com/example/shortener/api/error/ShortCodeExpiredException.java",
+          "src/main/java/com/example/shortener/api/error/InvalidUrlException.java",
+          "src/main/java/com/example/shortener/api/error/GlobalExceptionHandler.java",
+          "src/test/java/com/example/shortener/api/dto/CreateUrlRequestValidationTest.java",
+          "src/test/java/com/example/shortener/api/error/GlobalExceptionHandlerTest.java"
+        ],
+        "contract_slice": [
+          "createShortUrl",
+          "redirectToLongUrl"
+        ],
+        "data_model_slice": [
+          "CreateUrlRequest{long_url, custom_alias?, expiration_date?}",
+          "CreateUrlResponse{short_url, short_code, long_url, expires_at?, code_source}",
+          "ProblemDetail{type,title,status,detail,instance}"
+        ],
+        "class_structure": [
+          "com.example.shortener.api.dto.CreateUrlRequest",
+          "com.example.shortener.api.dto.CreateUrlResponse",
+          "com.example.shortener.api.error.GlobalExceptionHandler",
+          "com.example.shortener.api.error.AliasAlreadyExistsException",
+          "com.example.shortener.api.error.ShortCodeNotFoundException",
+          "com.example.shortener.api.error.ShortCodeExpiredException",
+          "com.example.shortener.api.error.InvalidUrlException"
+        ],
+        "acceptance_criteria_ids": [
+          "AC-2",
+          "AC-5",
+          "AC-6",
+          "AC-16"
+        ],
+        "definition_of_done": [
+          "CreateUrlRequest uses snake_case JSON names (long_url, custom_alias, expiration_date) with Bean Validation: long_url @NotBlank, max 2048, http/https-only pattern; custom_alias optional pattern [0-9a-zA-Z]{3,32}; expiration_date parsed as ISO-8601 OffsetDateTime and required to be in the future",
+          "GlobalExceptionHandler is a @RestControllerAdvice extending ResponseEntityExceptionHandler that returns application/problem+json ProblemDetail for 400 (validation + malformed ISO-8601/unreadable body), 404, 409, 410 and unhandled 500 with a consistent body (type/title/status/detail/instance) and no stack traces or internal details leaked",
+          "CreateUrlRequestValidationTest covers valid input, ftp scheme, >2048 chars, bad alias charset, alias length 2 and 33, malformed and past expiration_date",
+          "GlobalExceptionHandlerTest asserts status, Content-Type application/problem+json and body fields for each mapped exception",
+          "`./mvnw -q test`, `./mvnw -q -Dtest=ArchitectureTest test` and `./mvnw -q -DskipTests compile` pass"
+        ],
+        "risk_notes": "The error contract shape fixed here is consumed by the OpenAPI document in T7; drift causes a contract gate failure. Problem details must never echo secrets or PII.",
+        "rollback_note": "Delete the api/dto and api/error packages plus their tests; nothing else depends on them yet."
+      },
+      {
+        "id": "T4",
+        "title": "Base62 short-code generation: batched Redis INCRBY counter with Postgres-sequence fallback",
+        "depends_on": [
+          "T2",
+          "T3"
+        ],
+        "parallel_group": null,
+        "impact_level": "MEDIUM",
+        "allowed_files": [
+          "src/main/java/com/example/shortener/codegen/Base62Codec.java",
+          "src/main/java/com/example/shortener/codegen/CounterSource.java",
+          "src/main/java/com/example/shortener/codegen/RedisBatchCounterSource.java",
+          "src/main/java/com/example/shortener/codegen/DbSequenceCounterSource.java",
+          "src/main/java/com/example/shortener/codegen/ShortCodeAllocator.java",
+          "src/main/java/com/example/shortener/codegen/AllocatedCode.java",
+          "src/test/java/com/example/shortener/codegen/Base62CodecTest.java",
+          "src/test/java/com/example/shortener/codegen/ShortCodeAllocatorTest.java",
+          "src/test/java/com/example/shortener/codegen/RedisBatchCounterSourceTest.java"
+        ],
+        "contract_slice": [],
+        "data_model_slice": [
+          "AllocatedCode{code, codeSource}",
+          "redis key: shortener:counter (global INCRBY batch)",
+          "sequence url_code_seq"
+        ],
+        "class_structure": [
+          "com.example.shortener.codegen.Base62Codec",
+          "com.example.shortener.codegen.CounterSource",
+          "com.example.shortener.codegen.RedisBatchCounterSource",
+          "com.example.shortener.codegen.DbSequenceCounterSource",
+          "com.example.shortener.codegen.ShortCodeAllocator",
+          "com.example.shortener.codegen.AllocatedCode"
+        ],
+        "acceptance_criteria_ids": [
+          "AC-10",
+          "AC-11"
+        ],
+        "definition_of_done": [
+          "RedisBatchCounterSource reserves a range via a single INCRBY <batchSize> (default 1000) on a global key and hands out values from the local range; exhausting the range triggers the next INCRBY; restart gaps are accepted (AMB-10)",
+          "ShortCodeAllocator returns AllocatedCode with CodeSource.REDIS normally and falls back to DbSequenceCounterSource (nextval url_code_seq) with CodeSource.DB_SEQUENCE when Redis throws/times out, logging the degradation without leaking connection strings",
+          "Counter values are offset by the configured seed so every generated base62 code is at least 3 characters (AMB-11)",
+          "Base62CodecTest covers round-trip encoding, alphabet [0-9a-zA-Z], and minimum length after offset; ShortCodeAllocatorTest uses a mocked Redis source to assert fallback path and code_source values; RedisBatchCounterSourceTest asserts exactly one INCRBY per batch and strictly increasing, unique values under concurrent allocation",
+          "`./mvnw -q test` and `./mvnw -q -Dtest=ArchitectureTest test` pass"
+        ],
+        "risk_notes": "Concurrency correctness (uniqueness across threads/instances) and the Redis-failure detection path are subtle; a too-broad catch could mask real bugs, a too-narrow one breaks AC-11.",
+        "rollback_note": "Delete the codegen package and its tests; T5 is the only consumer and has not been built yet."
+      },
+      {
+        "id": "T5",
+        "title": "Write path: POST /api/v1/urls service + profile-gated controller",
+        "depends_on": [
+          "T2",
+          "T3",
+          "T4"
+        ],
+        "parallel_group": "http-paths",
+        "impact_level": "MEDIUM",
+        "allowed_files": [
+          "src/main/java/com/example/shortener/write/UrlWriteService.java",
+          "src/main/java/com/example/shortener/write/UrlWriteController.java",
+          "src/test/java/com/example/shortener/write/UrlWriteServiceTest.java",
+          "src/test/java/com/example/shortener/write/UrlWriteControllerTest.java"
+        ],
+        "contract_slice": [
+          "createShortUrl"
+        ],
+        "data_model_slice": [
+          "urls insert {short_code, long_url, created_at, expires_at, created_by=null, code_source}",
+          "CreateUrlRequest",
+          "CreateUrlResponse"
+        ],
+        "class_structure": [
+          "com.example.shortener.write.UrlWriteService",
+          "com.example.shortener.write.UrlWriteController"
+        ],
+        "acceptance_criteria_ids": [
+          "AC-1",
+          "AC-3",
+          "AC-4",
+          "AC-5",
+          "AC-10",
+          "AC-11",
+          "AC-14"
+        ],
+        "definition_of_done": [
+          "UrlWriteController is annotated @Profile(\"!read\") so it registers under the default and write profiles and is absent under the read profile (AC-14), maps POST /api/v1/urls with operationId createShortUrl, validates the body with @Valid and returns 201 with CreateUrlResponse",
+          "UrlWriteService persists a row with created_by left null, uses custom_alias as short_code when supplied, otherwise the allocated base62 code, and records code_source; duplicate alias (pre-check plus DataIntegrityViolation on the PK) raises AliasAlreadyExistsException -> 409 problem+json",
+          "Re-posting an existing long_url without an alias always allocates a new distinct code (no deduplication, AC-4)",
+          "short_url is composed from the configured base URL (default http://localhost:8080) plus the short code",
+          "UrlWriteServiceTest (mocked repository/allocator) covers success, alias conflict, no-dedup, and db_sequence fallback persistence; UrlWriteControllerTest is a @WebMvcTest with the global exception handler asserting 201 payload and 400/409 problem+json responses and that no row is persisted on validation failure",
+          "`./mvnw -q test`, `./mvnw -q -Dtest=ArchitectureTest test` pass"
+        ],
+        "risk_notes": "Profile predicate must be exactly the agreed semantics ('read' instance -> 404 on POST); a wrong annotation silently breaks AC-14 and the contract gate (endpoint present/absent mismatch).",
+        "rollback_note": "Delete the write package and its tests; read path and schema are unaffected."
+      },
+      {
+        "id": "T6",
+        "title": "Read path: Redis-cached redirect service + profile-gated GET /{short_code} controller",
+        "depends_on": [
+          "T2",
+          "T3",
+          "T4"
+        ],
+        "parallel_group": "http-paths",
+        "impact_level": "MEDIUM",
+        "allowed_files": [
+          "src/main/java/com/example/shortener/read/UrlCache.java",
+          "src/main/java/com/example/shortener/read/RedisUrlCache.java",
+          "src/main/java/com/example/shortener/read/UrlReadService.java",
+          "src/main/java/com/example/shortener/read/RedirectController.java",
+          "src/test/java/com/example/shortener/read/UrlReadServiceTest.java",
+          "src/test/java/com/example/shortener/read/RedisUrlCacheTest.java",
+          "src/test/java/com/example/shortener/read/RedirectControllerTest.java"
+        ],
+        "contract_slice": [
+          "redirectToLongUrl"
+        ],
+        "data_model_slice": [
+          "redis key: shortener:url:{short_code} -> long_url (TTL = min(remaining time to expires_at, default 24h))",
+          "urls.short_code lookup"
+        ],
+        "class_structure": [
+          "com.example.shortener.read.UrlCache",
+          "com.example.shortener.read.RedisUrlCache",
+          "com.example.shortener.read.UrlReadService",
+          "com.example.shortener.read.RedirectController"
+        ],
+        "acceptance_criteria_ids": [
+          "AC-7",
+          "AC-8",
+          "AC-9",
+          "AC-12",
+          "AC-13",
+          "AC-14"
+        ],
+        "definition_of_done": [
+          "RedirectController is annotated @Profile(\"!write\") (registers under default and read profiles, absent under write), maps GET /{short_code} with operationId redirectToLongUrl and returns 302 with Location = long_url and header Cache-Control: private",
+          "UrlReadService checks the cache first and skips the Postgres query on a hit; on a miss it loads from the repository and populates the cache with TTL = remaining time to expires_at, capped by the configured default 24h TTL when expires_at is null (AMB-9)",
+          "Unknown code -> ShortCodeNotFoundException (404 problem+json); expired code -> ShortCodeExpiredException (410 problem+json) and the cache entry is not served after expiry",
+          "Redis failures on get/put are caught, logged as a cache degradation warning (no credentials in the log) and the redirect is served directly from Postgres (AC-13)",
+          "UrlReadServiceTest (mocked cache/repository) proves the repository is never touched on a cache hit, covers miss, expired, not-found and Redis-down bypass; RedisUrlCacheTest asserts TTL computation bounds; RedirectControllerTest is a @WebMvcTest asserting 302 + Location + Cache-Control: private and the 404/410 problem+json bodies",
+          "`./mvnw -q test`, `./mvnw -q -Dtest=ArchitectureTest test` pass"
+        ],
+        "risk_notes": "Cache-hit path must genuinely avoid the datasource (verified by mock interaction) and TTL must never exceed remaining expiry, otherwise stale redirects outlive the link. Profile predicate mistakes break AC-14.",
+        "rollback_note": "Delete the read package and its tests; write path and schema unaffected."
+      },
+      {
+        "id": "T7",
+        "title": "Committed OpenAPI document + Testcontainers integration tests (Postgres, Redis, profiles, contract parity)",
+        "depends_on": [
+          "T5",
+          "T6"
+        ],
+        "parallel_group": null,
+        "impact_level": "MEDIUM",
+        "allowed_files": [
+          "src/main/resources/openapi.yaml",
+          "src/test/java/com/example/shortener/it/AbstractIntegrationTest.java",
+          "src/test/java/com/example/shortener/it/CreateShortUrlIT.java",
+          "src/test/java/com/example/shortener/it/RedirectIT.java",
+          "src/test/java/com/example/shortener/it/CacheAndFallbackIT.java",
+          "src/test/java/com/example/shortener/it/ProfileSeparationIT.java",
+          "src/test/java/com/example/shortener/it/OpenApiContractIT.java"
+        ],
+        "contract_slice": [
+          "createShortUrl",
+          "redirectToLongUrl"
+        ],
+        "data_model_slice": [
+          "urls table (all columns)",
+          "CreateUrlRequest",
+          "CreateUrlResponse",
+          "ProblemDetail"
+        ],
+        "class_structure": [
+          "com.example.shortener.it.AbstractIntegrationTest",
+          "com.example.shortener.it.CreateShortUrlIT",
+          "com.example.shortener.it.RedirectIT",
+          "com.example.shortener.it.CacheAndFallbackIT",
+          "com.example.shortener.it.ProfileSeparationIT",
+          "com.example.shortener.it.OpenApiContractIT"
+        ],
+        "acceptance_criteria_ids": [
+          "AC-1",
+          "AC-2",
+          "AC-3",
+          "AC-4",
+          "AC-6",
+          "AC-7",
+          "AC-8",
+          "AC-9",
+          "AC-11",
+          "AC-12",
+          "AC-13",
+          "AC-14",
+          "AC-15",
+          "AC-16"
+        ],
+        "definition_of_done": [
+          "src/main/resources/openapi.yaml documents exactly the implemented API: createShortUrl (POST /api/v1/urls: 201, 400, 409, all error responses application/problem+json) and redirectToLongUrl (GET /{short_code}: 302 with Location and Cache-Control headers, 404, 410) with schemas matching the DTO JSON names, and no extra or missing operations/status codes",
+          "AbstractIntegrationTest starts Postgres and Redis Testcontainers with @DynamicPropertySource and lets Flyway migrate the schema",
+          "CreateShortUrlIT asserts 201 + short_url shape + persisted row (created_by null, code_source set), 400 problem+json with no row persisted, 409 on taken alias with the existing mapping unchanged, and distinct codes for a repeated long_url",
+          "RedirectIT asserts 302 + Location + Cache-Control: private, 404 for unknown code, 410 for expired code, all errors application/problem+json",
+          "CacheAndFallbackIT proves a cache hit serves the redirect, TTL <= remaining expiry, and that a stopped/unreachable Redis still yields 201 with code_source db_sequence on write and a 302 served from Postgres on read",
+          "ProfileSeparationIT boots with spring.profiles.active=read (POST -> 404) and =write (GET -> 404) and verifies the default profile serves both",
+          "OpenApiContractIT compares the springdoc-generated document from the running context against the committed src/main/resources/openapi.yaml operation-by-operation and status-code-by-status-code and fails on drift",
+          "All IT classes are named *IT so they only run under `./mvnw -q -Pit verify`; `./mvnw -q test` stays container-free and `./mvnw -q -Pit verify` passes"
+        ],
+        "risk_notes": "Highest-effort task: Testcontainers availability, Redis-outage simulation and springdoc/committed-document parity are the main failure modes. If the generated document differs from the handwritten one, the contract gate fails - align the handwritten file with the springdoc dump produced by the it profile.",
+        "rollback_note": "Delete src/main/resources/openapi.yaml and the it test package; unit gates still pass but the contract and integration gates will fail until re-done."
+      },
+      {
+        "id": "T8",
+        "title": "Release artifacts: Dockerfile, CI workflow and README",
+        "depends_on": [
+          "T7"
+        ],
+        "parallel_group": null,
+        "impact_level": "HIGH",
+        "allowed_files": [
+          "Dockerfile",
+          ".github/workflows/ci.yml",
+          "README.md",
+          "docs/operations.md"
+        ],
+        "contract_slice": [
+          "createShortUrl",
+          "redirectToLongUrl"
+        ],
+        "data_model_slice": [],
+        "class_structure": [],
+        "acceptance_criteria_ids": [
+          "AC-14",
+          "AC-15",
+          "AC-16"
+        ],
+        "definition_of_done": [
+          "Dockerfile is a multi-stage build (Maven/JDK 25 build stage using ./mvnw -DskipTests package, slim JRE runtime stage) running the fat jar as a non-root user, exposing 8080, parameterising SPRING_PROFILES_ACTIVE and containing no secrets or hard-coded credentials",
+          ".github/workflows/ci.yml runs on push/pull_request and executes ./mvnw -q -DskipTests compile, ./mvnw -q spotless:check (advisory), ./mvnw -q -Dtest=ArchitectureTest test, ./mvnw -q test and ./mvnw -q -Pit verify, with no secrets inlined",
+          "README.md documents the service, endpoints (POST /api/v1/urls, GET /{short_code}), the read/write/default Spring profile deployment model, configuration properties (base URL, counter batch size, cache TTL), code_source semantics, how to run locally and with Docker, and points at src/main/resources/openapi.yaml",
+          "docs/operations.md records the Redis-outage degradation behaviour and the accepted counter gaps (AMB-10)",
+          "Release gate satisfied: Dockerfile, a .github/workflows workflow, README.md and the committed OpenAPI document all exist; all required gates pass on the whole repository"
+        ],
+        "risk_notes": "Touches protected paths (Dockerfile, .github/workflows/**). CI must not invoke commands the sandbox cannot run and must never reference forbidden files (.env, keys, secrets/**).",
+        "rollback_note": "Delete Dockerfile, .github/workflows/ci.yml, README.md and docs/operations.md; application code and tests remain intact, only the release gate regresses."
+      }
+    ],
+    "invalidated_task_ids": [],
+    "rationale": "Greenfield Java build sequenced so every required gate has an owner and no task is blocked on unfinished contracts. T1 front-loads all protected build/config surface (pom dependencies, the `it` profile with failsafe + springdoc dump, application*.yml profiles) because compile/unit/integration/contract gates all depend on it; getting it wrong later would invalidate everything downstream, hence HIGH. T2 (protected Flyway migration, entity, repository) and T3 (DTO validation rules + problem+json advice) are independent of each other and run in parallel as the data and error contracts. T4 isolates the trickiest algorithmic piece - the batched Redis INCRBY allocator with Postgres-sequence fallback and code_source - so its concurrency and failure-mode tests stand alone. T5 and T6 then implement the two independently deployable HTTP surfaces in parallel, each profile-gated (@Profile(\"!read\") / @Profile(\"!write\")) in separate packages so their allowed_files never overlap. T7 consolidates the contract gate: the committed src/main/resources/openapi.yaml plus Testcontainers ITs (Postgres + Redis) that cover every acceptance criterion end-to-end, including cache hits, Redis-outage degradation on both paths, profile separation, and springdoc-vs-committed-document parity. T8 finishes the release checklist (Dockerfile, CI workflow, README, ops doc) last, when the commands it wires into CI are known-good; it touches protected infra paths so it is HIGH. Every task that changes src/** ships its tests in the same task, each stays well under 15 files, and only allowed/protected paths are touched - the orchestrator-provisioned mvnw and sdlc/ArchitectureTest.java are never listed.  Note: the spec's open ambiguities AMB-9/10/11 are implemented at their documented defaults (24h default cache TTL, gaps allowed on restart, counter seeded so generated codes are >= 3 chars) and are flagged for confirmation rather than silently re-decided."
+  },
+  "usage": {
+    "tokens_in": 6575,
+    "tokens_out": 11542,
+    "cost_usd": 0.32142
+  }
+}

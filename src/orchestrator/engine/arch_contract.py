@@ -112,9 +112,9 @@ import org.junit.jupiter.api.Test;
 class ArchitectureTest {{
 
   static final List<List<String>> CHAINS = List.of({chains});
-  static final Pattern PKG = Pattern.compile("^\\s*package\\s+([\\w.]+)\\s*;", Pattern.MULTILINE);
+  static final Pattern PKG = Pattern.compile("^\\\\s*package\\\\s+([\\\\w.]+)\\\\s*;", Pattern.MULTILINE);
   static final Pattern IMP =
-      Pattern.compile("^\\s*import\\s+(?:static\\s+)?([\\w.]+)\\s*;", Pattern.MULTILINE);
+      Pattern.compile("^\\\\s*import\\\\s+(?:static\\\\s+)?([\\\\w.]+)\\\\s*;", Pattern.MULTILINE);
 
   @Test
   void layeringRules() throws IOException {{
