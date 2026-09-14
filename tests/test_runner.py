@@ -178,3 +178,17 @@ async def test_executor_node_timeout_scales_with_the_plan(graph, ctx, state, sto
     assert isinstance(await r._execute(impl, ctx, state), Success)  # 1.5 s < 3 tasks x 1 s
     out = await r._execute(agent, ctx, state)
     assert isinstance(out, Retry) and "timeout" in out.reason  # an agent gets the plain budget
+
+
+def test_executor_max_attempts_scale_with_the_plan(graph, ctx) -> None:  # type: ignore[no-untyped-def]
+    from orchestrator.engine.runner import Runner
+    from orchestrator.models.plan import Plan
+
+    tasks = [
+        {"id": f"t{i}", "title": "x", "allowed_files": ["src/**"], "definition_of_done": ["d"]}
+        for i in range(4)
+    ]
+    ctx.put("plan", Plan.model_validate({"run_id": "r1", "spec_version": 1, "tasks": tasks}), "b")
+    per_task = ctx.policy.budgets.max_attempts_per_task
+    assert Runner._max_attempts(graph.nodes["impl"], ctx) == per_task * 4
+    assert Runner._max_attempts(graph.nodes["a"], ctx) == per_task

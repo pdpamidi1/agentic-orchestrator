@@ -12,7 +12,7 @@ import pytest
 from orchestrator.engine.context import RunContext
 from orchestrator.engine.graph import Graph
 from orchestrator.engine.handlers import build_handlers
-from orchestrator.engine.outcomes import Retry, Success
+from orchestrator.engine.outcomes import Blocked, Retry, Success
 from orchestrator.executors.base import Done
 from orchestrator.llm.fake import CANNED, FakeClient
 from orchestrator.models import Design, Plan, TaskSpec, load_policy
@@ -111,3 +111,37 @@ async def test_revert_is_conflict_safe(tmp_path: Path) -> None:
     assert await git.changed_files() == [] and (tmp_path / "sb" / "a.txt").read_text() == "two\n"
     await git.revert(b)  # HEAD: plain revert
     assert (tmp_path / "sb" / "a.txt").read_text() == "one\n" and await git.head() != b
+
+
+class AlwaysViolates(OverlapDetector):
+    """Every task writes .env: the same task must be retried per task and then block the node."""
+
+    def __init__(self) -> None:
+        super().__init__(violate="G1")
+
+
+async def test_a_task_that_keeps_failing_blocks_after_its_own_allowance(tmp_path: Path) -> None:
+    ex = AlwaysViolates()
+    ctx = RunContext(
+        run_id="r1",
+        scenario="t",
+        policy=POLICY,
+        sandbox=tmp_path / "sb",
+        trace=InMemorySink(),
+        target_stack="python",
+    )
+    ctx.put("plan", plan_with_group(), "planning")
+    ctx.put("design", Design.model_validate(CANNED["Design"]), "architecture")
+    graph = Graph.load(REPO / "workflow.yaml")
+    handler = build_handlers(FakeClient(), ex, graph)["executor"]
+    node = graph.nodes["implementation"]
+    allowance = POLICY.budgets.max_attempts_per_task
+    outcomes = []
+    for _ in range(allowance):
+        out = await handler(node, ctx)
+        outcomes.append(out)
+        if isinstance(out, Retry):  # what the runner does between attempts
+            ctx.feedback[node.id] = dict(out.feedback, reason=out.reason, attempt=len(outcomes))
+    assert all(isinstance(o, Retry) for o in outcomes[:-1]) and isinstance(outcomes[-1], Blocked)
+    assert outcomes[0].feedback["task_attempts"] == {"G1": 1} and "G1" in outcomes[-1].reason
+    assert ex.order == ["G1"] * allowance  # only the failing task was retried; G2/G3 never started

@@ -206,7 +206,7 @@ class Runner:
             return await handler(node, ctx) if handler else Success()
 
         handler = self.handlers[node.kind]
-        max_attempts = int(node.retries.get("max_attempts", pol.budgets.max_attempts_per_task))
+        max_attempts = self._max_attempts(node, ctx)
         delay = float(pol.retries.initial_delay_seconds)
         last: Outcome = Blocked("no attempts")
         for attempt in range(1, max_attempts + 1):
@@ -349,6 +349,16 @@ class Runner:
         return False
 
     # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _max_attempts(node: NodeDef, ctx: RunContext) -> int:
+        """max_attempts_per_task is per task: the executor node may retry once per task per allowance (the
+        handler blocks a single task that exhausts its own allowance); other nodes get the plain budget."""
+        base = int(node.retries.get("max_attempts", ctx.policy.budgets.max_attempts_per_task))
+        if node.kind != "executor":
+            return base
+        tasks = getattr(ctx.get("plan"), "tasks", None)
+        return base * max(1, len(tasks)) if tasks else base
+
     @staticmethod
     def _timeout(node: NodeDef, ctx: RunContext) -> float:
         """node_timeout_seconds bounds one unit of work: a node attempt, or for the executor node one task

@@ -98,6 +98,7 @@ async def test_done_commits_and_reports_usage(tmp_path: Path) -> None:
     assert "URL shortener" not in prompt  # spec-driven: the raw requirement never reaches the executor
     assert "## Build contract" in prompt and POLICY.gate("unit", "python").cmd in prompt
     assert "tests/test_architecture.py" in prompt and "springdoc" not in prompt  # stack-specific notes
+    assert f"at most {cc.max_turns} tool turns" in prompt
     assert (REPO / cc.system_prompt_file).read_text().strip() in args  # --append-system-prompt content
 
 

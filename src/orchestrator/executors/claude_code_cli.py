@@ -44,6 +44,11 @@ Implement exactly this task inside the current repository. Stack: {stack}.
 ## Build contract — these gates run on the whole repository after all tasks; make them work from task 1
 {gates}
 
+## Turn budget
+You have at most {turns} tool turns in this attempt. Plan the edits first, write whole files, run the
+build once at the end. If the attempt runs out of turns, the next attempt continues on the current tree
+(nothing is reset) with this feedback, so leave the tree in a coherent state as you go.
+
 ## Feedback from the previous attempt — fix these first
 {feedback}
 
@@ -80,6 +85,7 @@ class ClaudeCodeCliExecutor:
             criteria="\n".join(f"- {c}" for c in task.acceptance_criteria_ids) or "(none)",
             dod="\n".join(f"- {d}" for d in task.definition_of_done),
             gates="\n".join(gate_contract(policy, stack)) if policy else "(none)",
+            turns=policy.claude_code.max_turns if policy else "n/a",
             feedback=json.dumps(feedback, indent=2) if feedback else "(none)",
         )
 

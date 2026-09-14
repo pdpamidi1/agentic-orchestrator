@@ -51,6 +51,16 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
         cs: Changeset = ctx.get("changeset") or Changeset(branch=branch)
         feedback = ctx.feedback.get(node.id)
         pe = PolicyEngine(ctx.policy, ctx.target_stack)
+        task_attempts: dict[str, int] = dict((feedback or {}).get("task_attempts", {}))
+
+        def task_failed(t: TaskSpec, reason: str, extra: dict[str, Any]) -> Outcome:
+            """One task's failure is retried per task (policy.budgets.max_attempts_per_task); a task
+            that exhausts its own allowance blocks the node (safe-stop) instead of burning the other
+            tasks' retries."""
+            task_attempts[t.id] = task_attempts.get(t.id, 0) + 1
+            if task_attempts[t.id] >= ctx.policy.budgets.max_attempts_per_task:
+                return Blocked(f"task {t.id} failed {task_attempts[t.id]} times: {reason}")
+            return Retry(reason, {**extra, "task": t.id, "task_attempts": task_attempts})
 
         remaining = {t.id: t for t in plan.tasks if t.id not in cs.commits}
         while remaining:
@@ -125,9 +135,10 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
                                 "reason": "policy violation at the write boundary",
                             },
                         )
-                        return Retry(
+                        return task_failed(
+                            t,
                             f"task {t.id} violated policy: {', '.join(sorted({f.rule for f in findings}))}",
-                            {"task": t.id, "findings": [f.model_dump() for f in findings]},
+                            {"findings": [f.model_dump() for f in findings]},
                         )
                     cs.commits[t.id] = r.commit_sha
                     cs.files_changed += r.files_changed
@@ -135,9 +146,11 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
                     cs.notes[t.id] = r.notes
                     remaining.pop(t.id)
                 elif isinstance(r, BlockedTask):
-                    return Retry(f"task {t.id} blocked: {r.reason}", {"task": t.id, "reason": r.reason})
+                    return task_failed(t, f"task {t.id} blocked: {r.reason}", {"reason": r.reason})
                 elif isinstance(r, Errored):
-                    return Retry(f"task {t.id} errored: {r.reason}") if r.transient else Blocked(r.reason)
+                    if not r.transient:
+                        return Blocked(r.reason)
+                    return task_failed(t, f"task {t.id} errored: {r.reason}", {})
         if ctx.get("changeset") is cs:
             # already in context from an approval pause inside this node; the object carries every commit,
             # so a second put would only bump the version and read as a replan downstream
