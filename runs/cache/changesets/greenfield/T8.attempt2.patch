@@ -1,0 +1,575 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..b415a64
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,117 @@
++# CI for url-shortener (T8, AC-15).
++#
++# Mirrors the governed build gates one-to-one; every step is a plain Maven wrapper
++# invocation so the same commands work locally. Nothing here needs credentials or
++# repository secrets. The integration tests provision PostgreSQL and Redis with
++# Testcontainers on the runner's Docker daemon, and the OpenAPI dump is taken from that
++# same throw-away application.
++name: ci
++
++on:
++  push:
++    branches: ["**"]
++  pull_request:
++
++permissions:
++  contents: read
++
++concurrency:
++  group: ci-${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: true
++
++env:
++  MAVEN_OPTS: -Dmaven.repo.local=${{ github.workspace }}/.m2/repository
++
++jobs:
++  build:
++    name: gates
++    runs-on: ubuntu-latest
++    timeout-minutes: 45
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Set up JDK 25
++        uses: actions/setup-java@v4
++        with:
++          distribution: temurin
++          java-version: "25"
++
++      - name: Cache Maven repository
++        uses: actions/cache@v4
++        with:
++          path: .m2/repository
++          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml', '.mvn/wrapper/maven-wrapper.properties') }}
++          restore-keys: |
++            maven-${{ runner.os }}-
++
++      - name: Make the wrapper executable
++        run: chmod +x mvnw
++
++      # Gate: compile (required)
++      - name: Compile
++        run: ./mvnw -q -B -DskipTests compile
++
++      # Gate: style (advisory) - reported but never fails the build.
++      - name: Style (spotless, advisory)
++        continue-on-error: true
++        run: ./mvnw -q -B spotless:check
++
++      # Gate: architecture (required) - orchestrator-provisioned layering contract.
++      - name: Architecture rules
++        run: ./mvnw -q -B -Dtest=ArchitectureTest test
++
++      # Gate: unit (required) - *Test classes only; container-free.
++      - name: Unit tests
++        run: ./mvnw -q -B test
++
++      # Gate: integration + contract (required) - *IT classes against Testcontainers
++      # PostgreSQL/Redis, plus the springdoc dump written to target/openapi.{json,yaml}.
++      - name: Integration tests and OpenAPI dump
++        run: ./mvnw -q -B -Pit verify
++
++      # Gate: contract (required) - the committed document must equal what the running
++      # application exposes. OpenApiContractIT already compares operations and status
++      # codes; both documents are kept as build artefacts for review.
++      - name: Publish OpenAPI documents
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: openapi
++          if-no-files-found: ignore
++          path: |
++            src/main/resources/openapi.yaml
++            target/openapi.yaml
++            target/openapi.json
++
++      - name: Publish test reports
++        if: failure()
++        uses: actions/upload-artifact@v4
++        with:
++          name: test-reports
++          if-no-files-found: ignore
++          path: |
++            target/surefire-reports/
++            target/failsafe-reports/
++
++  docker:
++    name: docker image
++    needs: build
++    runs-on: ubuntu-latest
++    timeout-minutes: 30
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      # Gate: release - the multi-stage Dockerfile must build from a clean checkout.
++      # The image is only built, never pushed; publishing is a deployment concern.
++      - name: Build image
++        run: docker build --pull -t url-shortener:${{ github.sha }} .
++
++      - name: Image runs as a non-root user
++        run: |
++          user="$(docker run --rm --entrypoint sh url-shortener:${{ github.sha }} -c 'id -un')"
++          echo "container user: ${user}"
++          test "${user}" != "root"
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..7754d46
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,68 @@
++# syntax=docker/dockerfile:1.7
++#
++# url-shortener release image (T8, AC-15).
++#
++# Two stages:
++#   1. build   - JDK 25 + the committed Maven wrapper produce the Spring Boot fat jar
++#                (./mvnw -DskipTests package; tests run in CI, not in the image build).
++#   2. runtime - slim JRE 25 image that only contains the fat jar and runs it as a
++#                dedicated non-root user.
++#
++# No secrets or credentials live in this file or in the image. Database and Redis
++# coordinates are injected at run time through environment variables (see README.md):
++#   SHORTENER_DB_URL, SHORTENER_DB_USERNAME, SHORTENER_DB_PASSWORD,
++#   SHORTENER_REDIS_HOST, SHORTENER_REDIS_PORT, SHORTENER_BASE_URL
++#
++# The deployment surface is selected with SPRING_PROFILES_ACTIVE:
++#   default -> both surfaces (POST /api/v1/urls and GET /{short_code})
++#   read    -> redirect surface only
++#   write   -> creation surface only
++#
++#   docker build -t url-shortener .
++#   docker run --rm -p 8080:8080 -e SPRING_PROFILES_ACTIVE=read url-shortener
++
++# ---------------------------------------------------------------------------------------
++# Stage 1: build
++# ---------------------------------------------------------------------------------------
++FROM eclipse-temurin:25-jdk AS build
++
++WORKDIR /workspace
++
++# Wrapper and build descriptor first so the dependency download layer is cached until
++# pom.xml changes.
++COPY mvnw pom.xml ./
++COPY .mvn .mvn
++RUN chmod +x mvnw \
++    && ./mvnw -q -B -DskipTests dependency:resolve
++
++# Sources last: only this layer is rebuilt on a code change.
++COPY src src
++RUN ./mvnw -q -B -DskipTests package \
++    && mkdir -p /workspace/dist \
++    && cp target/*.jar /workspace/dist/app.jar
++
++# ---------------------------------------------------------------------------------------
++# Stage 2: runtime
++# ---------------------------------------------------------------------------------------
++FROM eclipse-temurin:25-jre-alpine AS runtime
++
++# Deployment surface; override at `docker run -e SPRING_PROFILES_ACTIVE=read|write`.
++ARG SPRING_PROFILES_ACTIVE=default
++ENV SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE} \
++    SERVER_PORT=8080 \
++    JAVA_OPTS="-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
++
++# Dedicated unprivileged user; nothing in the image is writable by it except /tmp.
++RUN addgroup -S shortener \
++    && adduser -S -G shortener -H -s /sbin/nologin shortener
++
++WORKDIR /app
++COPY --from=build --chown=root:root /workspace/dist/app.jar /app/app.jar
++
++USER shortener:shortener
++
++EXPOSE 8080
++
++# Exec form through sh so JAVA_OPTS can be tuned per deployment; `exec` keeps the JVM as
++# PID 1 so container signals reach it and shutdown is graceful.
++ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..2e11052
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,229 @@
++# url-shortener
++
++A small, production-shaped URL shortener: Spring Boot 4 on Java 25, PostgreSQL for the
++mappings, Redis for the short-code counter and the redirect cache.
++
++* `POST /api/v1/urls` turns an absolute `http`/`https` URL into a short link.
++* `GET /{short_code}` redirects to the stored long URL.
++
++The API contract is the committed OpenAPI document at
++[`src/main/resources/openapi.yaml`](src/main/resources/openapi.yaml). It is compared
++operation-by-operation and status-code-by-status-code against the running application by
++`OpenApiContractIT`, so the file and the code cannot drift. A running instance also serves the
++live document at `/v3/api-docs` (JSON), `/v3/api-docs.yaml` and Swagger UI at
++`/swagger-ui.html`.
++
++## Endpoints
++
++### `POST /api/v1/urls` — `createShortUrl`
++
++Request body (`application/json`):
++
++| Field             | Required | Rules                                                                 |
++|-------------------|----------|-----------------------------------------------------------------------|
++| `long_url`        | yes      | absolute `http://` or `https://` URL, not blank, at most 2048 characters |
++| `custom_alias`    | no       | `[0-9a-zA-Z]`, 3 to 32 characters; used verbatim as the short code    |
++| `expiration_date` | no       | RFC 3339 date-time in the future                                      |
++
++Identical long URLs are never deduplicated: every call creates a new mapping.
++
++| Status | Meaning                                                                                        |
++|--------|------------------------------------------------------------------------------------------------|
++| `201`  | Created. Body: `short_url`, `short_code`, `long_url`, `expires_at` (nullable), `code_source`.   |
++| `400`  | Invalid `long_url`, `custom_alias` or `expiration_date`, or unreadable JSON. Nothing persisted. |
++| `409`  | `custom_alias` (or a generated code) already taken. The existing mapping is unchanged.          |
++| `500`  | Unhandled server error.                                                                        |
++
++```bash
++curl -s -X POST http://localhost:8080/api/v1/urls \
++  -H 'Content-Type: application/json' \
++  -d '{"long_url":"https://example.com/docs?page=1","custom_alias":"docs","expiration_date":"2030-01-01T00:00:00Z"}'
++```
++
++```json
++{
++  "short_url": "http://localhost:8080/docs",
++  "short_code": "docs",
++  "long_url": "https://example.com/docs?page=1",
++  "expires_at": "2030-01-01T00:00:00Z",
++  "code_source": "redis"
++}
++```
++
++### `GET /{short_code}` — `redirectToLongUrl`
++
++| Status | Meaning                                                                          |
++|--------|----------------------------------------------------------------------------------|
++| `302`  | `Location` is the stored `long_url`; `Cache-Control: private` on every redirect. |
++| `404`  | Short code unknown in both cache and database.                                   |
++| `410`  | Short code expired (`expires_at` in the past).                                   |
++| `500`  | Unhandled server error.                                                          |
++
++```bash
++curl -si http://localhost:8080/docs | head -n 5
++```
++
++### Error format
++
++Every non-2xx response, including unhandled `500`s, is rendered by one global exception
++handler as RFC 9457 `application/problem+json` with `type`, `title`, `status`, `detail` and
++`instance` (the request path). Internal details such as exception class names or stack
++traces never appear in a body.
++
++```json
++{
++  "type": "about:blank",
++  "title": "Not Found",
++  "status": 404,
++  "detail": "Short code 'nope' is unknown",
++  "instance": "/nope"
++}
++```
++
++## `code_source` semantics
++
++`code_source` says which counter produced a generated short code and is stored with the
++mapping (column `urls.code_source`):
++
++| Value         | Origin                                                                                  |
++|---------------|-----------------------------------------------------------------------------------------|
++| `redis`       | Normal path. The instance reserved a batch of values with one Redis `INCRBY` and handed one out. |
++| `db_sequence` | Redis was unreachable when the code was allocated; the value came from the PostgreSQL sequence `url_code_seq`. |
++
++Both counters are base62-encoded after adding a configurable seed offset, so generated codes are
++always at least six characters and never restart from `a`. A `custom_alias` is stored as
++supplied; its `code_source` records the counter that would otherwise have been used and carries
++no further meaning. Clients can treat `db_sequence` as a signal that the write side ran
++degraded at that moment. See [`docs/operations.md`](docs/operations.md) for the outage
++behaviour and the accepted counter gaps.
++
++## Deployment model: Spring profiles
++
++The two HTTP surfaces are independently registrable, so the read path can be scaled without
++the write path (and vice versa). The surface is chosen with `SPRING_PROFILES_ACTIVE`:
++
++| Profile        | Registers                                        | Not served                          |
++|----------------|--------------------------------------------------|-------------------------------------|
++| _(none)_ / `default` | both surfaces                               | —                                   |
++| `read`         | `GET /{short_code}` only                         | `POST /api/v1/urls` answers `404`   |
++| `write`        | `POST /api/v1/urls` only                         | `GET /{short_code}` answers `404`   |
++
++`read` instances never reserve counter batches from Redis. A typical production layout is many
++`read` replicas behind the public hostname and a few `write` replicas behind the API path.
++Both talk to the same PostgreSQL database and the same Redis. `ProfileSeparationIT` verifies
++the three combinations.
++
++## Configuration
++
++All settings are ordinary Spring properties and can be set as environment variables. Only
++local-development defaults live in `application.yml`; real credentials come from the
++environment (or your secret manager) and are never part of the image or the repository.
++
++| Property                        | Environment variable         | Default                   | Purpose                                                           |
++|---------------------------------|------------------------------|---------------------------|-------------------------------------------------------------------|
++| `shortener.base-url`            | `SHORTENER_BASE_URL`         | `http://localhost:8080`   | Public base URL used to build `short_url` (trailing slash ignored). |
++| `shortener.counter-batch-size`  | `SHORTENER_COUNTER_BATCH_SIZE` | `1000`                  | Counter values reserved per Redis `INCRBY`; unused remainder is lost on restart. |
++| `shortener.cache-ttl`           | `SHORTENER_CACHE_TTL`        | `24h`                     | TTL of cached lookups for never-expiring links, and the upper bound for all others. |
++| `shortener.counter-seed-offset` | `SHORTENER_COUNTER_SEED_OFFSET` | `916132832` (62^5)     | Added to the raw counter before base62 encoding; keeps generated codes at six or more characters. |
++| `spring.datasource.url`         | `SHORTENER_DB_URL`           | local PostgreSQL          | JDBC URL of the `shortener` database.                             |
++| `spring.datasource.username`    | `SHORTENER_DB_USERNAME`      | local dev value           | Database user.                                                    |
++| `spring.datasource.password`    | `SHORTENER_DB_PASSWORD`      | local dev value           | Database credential; supply from the environment.                 |
++| `spring.data.redis.host`        | `SHORTENER_REDIS_HOST`       | `localhost`               | Redis host.                                                       |
++| `spring.data.redis.port`        | `SHORTENER_REDIS_PORT`       | `6379`                    | Redis port.                                                       |
++| `server.port`                   | `SERVER_PORT`                | `8080`                    | HTTP port.                                                        |
++| `spring.profiles.active`        | `SPRING_PROFILES_ACTIVE`     | _(none)_                  | Deployment surface, see above.                                    |
++
++Flyway runs the migrations in `src/main/resources/db/migration` on start-up; the schema is
++`validate`d against the JPA model, never generated.
++
++## Running locally
++
++Prerequisites: JDK 25, Docker (for the databases and the integration tests). Maven is
++provided by the wrapper.
++
++1. Start PostgreSQL and Redis, for example with plain containers:
++
++   ```bash
++   # local development only: trust authentication, no credential to manage
++   docker run -d --name shortener-db -p 5432:5432 \
++     -e POSTGRES_DB=shortener -e POSTGRES_USER=shortener -e POSTGRES_HOST_AUTH_METHOD=trust \
++     postgres:17-alpine
++   docker run -d --name shortener-redis -p 6379:6379 redis:7-alpine
++   ```
++
++   The defaults in `application.yml` match this setup. Any other PostgreSQL 17 and Redis 7
++   work too: export the `SHORTENER_DB_*` and `SHORTENER_REDIS_*` variables from your shell
++   or secret manager before starting the application.
++
++2. Run the application (both surfaces):
++
++   ```bash
++   ./mvnw spring-boot:run
++   # read-only or write-only surface:
++   SPRING_PROFILES_ACTIVE=read  ./mvnw spring-boot:run
++   SPRING_PROFILES_ACTIVE=write ./mvnw spring-boot:run
++   ```
++
++3. Build and test:
++
++   | Command                                        | What it does                                                   |
++   |------------------------------------------------|----------------------------------------------------------------|
++   | `./mvnw -q -DskipTests compile`                | compile                                                        |
++   | `./mvnw -q spotless:check`                     | google-java-format check (`spotless:apply` fixes)              |
++   | `./mvnw -q -Dtest=ArchitectureTest test`       | layering rules (`src/test/java/sdlc/ArchitectureTest.java`)    |
++   | `./mvnw -q test`                               | unit tests (`*Test`), no Docker needed                         |
++   | `./mvnw -q -Pit verify`                        | integration tests (`*IT`) against Testcontainers PostgreSQL and Redis, and the springdoc dump to `target/openapi.yaml` / `target/openapi.json` |
++
++   The same commands, in the same order, form the CI pipeline in
++   [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
++
++## Running with Docker
++
++The [`Dockerfile`](Dockerfile) is a two-stage build: a JDK 25 stage runs
++`./mvnw -DskipTests package`, a slim JRE 25 stage runs the fat jar as the unprivileged
++`shortener` user on port 8080. The image contains no configuration secrets.
++
++```bash
++docker build -t url-shortener .
++
++# combined surface, talking to the containers from "Running locally"
++docker run --rm -p 8080:8080 \
++  -e SHORTENER_DB_URL=jdbc:postgresql://host.docker.internal:5432/shortener \
++  -e SHORTENER_DB_USERNAME=shortener \
++  -e SHORTENER_DB_PASSWORD \
++  -e SHORTENER_REDIS_HOST=host.docker.internal \
++  -e SHORTENER_BASE_URL=http://localhost:8080 \
++  url-shortener
++
++# dedicated surfaces
++docker run --rm -p 8081:8080 -e SPRING_PROFILES_ACTIVE=read  ... url-shortener
++docker run --rm -p 8082:8080 -e SPRING_PROFILES_ACTIVE=write ... url-shortener
++```
++
++`-e SHORTENER_DB_PASSWORD` without a value forwards the variable from the calling shell, so the
++credential never appears on the command line or in the image. `JAVA_OPTS` (default
++`-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError`) can be overridden the same way.
++
++## Project layout
++
++```
++src/main/java/com/example/shortener/
++  api/dto      request / response records (JSON names of the contract)
++  api/error    domain exceptions + GlobalExceptionHandler (problem+json)
++  codegen      Base62Codec, RedisBatchCounterSource, DbSequenceCounterSource, ShortCodeAllocator
++  config       ShortenerProperties (shortener.* namespace)
++  domain       UrlMapping entity, UrlMappingRepository, CodeSource
++  read         RedirectController, UrlReadService, RedisUrlCache      (@Profile("!write"))
++  write        UrlWriteController, UrlWriteService                    (@Profile("!read"))
++src/main/resources/
++  openapi.yaml               committed API contract
++  db/migration               Flyway migrations
++  application*.yml           shared / read / write configuration
++src/test/java/.../it         Testcontainers integration tests (*IT)
++src/test/java/sdlc           orchestrator-provisioned ArchitectureTest
++docs/operations.md           runbook: Redis outage behaviour, counter gaps
++```
++
++Layering is enforced by `ArchitectureTest`: `domain` and `config` are leaves, `read` and
++`write` never depend on each other, only the two Redis boundary classes touch Spring Data
++Redis, and no controller builds an error body.
+diff --git a/docs/operations.md b/docs/operations.md
+new file mode 100644
+index 0000000..edd613a
+--- /dev/null
++++ b/docs/operations.md
+@@ -0,0 +1,137 @@
++# Operations runbook
++
++Operational behaviour of `url-shortener` that is not obvious from the API contract. The
++service has two external dependencies: PostgreSQL (system of record for every mapping, always
++required) and Redis (short-code counter and redirect cache, degradable). This document covers
++what happens when Redis is unavailable and the properties of the short-code counter that
++operators should know about.
++
++## 1. Redis outage: degradation, not failure
++
++Redis is treated as an accelerator on both surfaces. Every Redis failure (connection refused,
++timeout after `spring.data.redis.timeout` = 2s, authentication or protocol error) is handled
++inside the one class that owns Redis on that surface. Controllers and services never catch
++infrastructure exceptions, and clients never see a Redis-related 5xx.
++
++### 1.1 Read surface (`GET /{short_code}`)
++
++Owner: `RedisUrlCache`.
++
++| Situation                              | Behaviour                                                                                  |
++|----------------------------------------|--------------------------------------------------------------------------------------------|
++| `GET shortener:url:{code}` fails       | Treated as a cache miss; the mapping is loaded from PostgreSQL and the redirect is served.  |
++| `SET shortener:url:{code}` fails       | Treated as a no-op; the redirect is still served from the database result.                 |
++| Mapping unknown / expired              | Unchanged: `404` / `410` from the database lookup, exactly as with a healthy cache.         |
++
++Client-visible effect: redirects keep working with `302`, `Location` and `Cache-Control:
++private` (AC-13). Latency rises by the database round trip plus, while Redis is unreachable,
++up to the 2s Redis timeout per request. Database load rises to the full redirect rate because
++no lookup is absorbed by the cache. Size the PostgreSQL connection pool for that case.
++
++Recovery is automatic: the next request after Redis is back writes through again. Entries are
++written with TTL `min(expires_at - now, shortener.cache-ttl)` (default 24h), so nothing stale
++survives an expiry, and an expired mapping is never cached.
++
++### 1.2 Write surface (`POST /api/v1/urls`)
++
++Owners: `RedisBatchCounterSource` (throws) and `ShortCodeAllocator` (decides the fallback).
++
++| Situation                                                    | Behaviour                                                                                  |
++|--------------------------------------------------------------|--------------------------------------------------------------------------------------------|
++| `INCRBY shortener:counter` fails while reserving a new batch | The allocation falls back to `nextval('url_code_seq')` in PostgreSQL. Response `201` with `code_source: "db_sequence"` (AC-11). |
++| Local batch still has unused values                          | No Redis call is needed; codes keep coming from the batch with `code_source: "redis"`.     |
++| Redis counter moved backwards (flush/restore of an old dump)  | The batch is rejected as unsafe (values would collide with persisted codes) and the request falls back to the sequence; see 2.3. |
++| PostgreSQL unavailable                                       | Not degradable. The request fails with `500` problem+json; nothing is persisted.           |
++
++The fallback decision is per allocation: every request first tries Redis again, so the service
++returns to `code_source: "redis"` on its own as soon as Redis answers. There is no circuit
++breaker, which means that during a long outage every write pays the Redis timeout (up to 2s)
++before falling back. If that is unacceptable for an extended incident, point
++`SHORTENER_REDIS_HOST` at a healthy replica or restart the write instances with a shorter
++`spring.data.redis.timeout`.
++
++### 1.3 What to watch
++
++* `WARN ... Redis cache degraded: GET|SET shortener:url:... failed with <ExceptionClass>; serving redirect from database`
++  (read surface, one line per failed command).
++* `WARN ... Primary short-code counter (redis) unavailable: <ExceptionClass>; falling back to db_sequence`
++  (write surface, one line per failed allocation).
++* The share of new rows with `code_source = 'db_sequence'`:
++  `SELECT code_source, count(*) FROM urls WHERE created_at > now() - interval '15 minutes' GROUP BY 1;`
++
++Both warnings deliberately log only the exception class. Driver messages can embed the Redis
++URI and therefore credentials; the full exception is available at `DEBUG` on the owning class
++if needed.
++
++### 1.4 Custom aliases
++
++`custom_alias` requests do not draw from any counter. They are unaffected by a Redis outage and
++still answer `409` when the alias is taken, because uniqueness is enforced by the primary key
++in PostgreSQL, not by the cache.
++
++## 2. Short-code counter: accepted gaps (AMB-10)
++
++Generated codes are base62 encodings of `counter_value + shortener.counter-seed-offset`
++(default 62^5, so codes have at least six characters). The counter itself is designed for
++uniqueness and throughput, not for density. **Gaps in the code sequence are accepted by
++design** (ambiguity AMB-10, resolved with its default: "gaps are acceptable, standard
++approach"). Nothing reclaims unused values, and nothing should: every code that was ever handed
++out may be persisted, so reusing a value could collide with a stored mapping.
++
++### 2.1 Where gaps come from
++
++| Cause                                   | Size of the gap                                                | Frequency                              |
++|-----------------------------------------|----------------------------------------------------------------|----------------------------------------|
++| Write instance restart or crash         | Up to `shortener.counter-batch-size` - 1 values (default 999), the unused remainder of its current batch. | Every restart / deploy of a write instance. |
++| Scale-out                               | Each new instance reserves its own batch, so `n` instances hold up to `n * batch-size` values in flight. | Continuous while running.              |
++| Request fails after allocation          | Exactly one value (for example a `409` race on a generated code, or a rolled-back insert). | Rare.                                  |
++| Fallback to `url_code_seq`              | The Redis batch is untouched; the sequence value is consumed even if the insert later fails (`CACHE 1`, so at most one lost per restart). | Only during Redis outages.             |
++
++With the default batch size, a deploy of ten write replicas can skip up to about ten thousand
++values. At 62^6 possible six-character codes this is irrelevant for capacity; the only
++observable effect is that consecutive short codes are not consecutive numbers, which is also
++desirable (codes are harder to enumerate).
++
++### 2.2 Tuning
++
++* `shortener.counter-batch-size` trades Redis round trips against gap size. `1000` means one
++  `INCRBY` per thousand codes per instance. Lower it (for example `100`) if you restart write
++  instances very often and want smaller gaps; raise it if Redis latency dominates write
++  latency. The integration tests run with `1` so that every allocation is observable.
++* The Redis counter key is `shortener:counter`. It must live in a persistent Redis (AOF or
++  RDB) that is **not** subject to eviction; configure `maxmemory-policy noeviction` or keep the
++  key in a dedicated logical database.
++
++### 2.3 Never reset the counter
++
++* Do not `DEL`, `SET` or restore `shortener:counter` from an old dump. A value lower than one
++  that was already handed out makes the allocator refuse the batch (`IllegalStateException`
++  "moved backwards"), which downgrades every write to the sequence fallback until the key is
++  ahead of the highest issued value again. Only ever move the key **forward**, for example
++  `SET shortener:counter <value higher than any issued>` after a data loss.
++* The two counters are independent ranges that are both offset by the same seed: Redis starts
++  at 1, the sequence at 62^3 = 238,328. A value handed out by the sequence during an outage can
++  therefore be handed out again by Redis once the Redis counter has passed 238,328. The primary
++  key on `urls.short_code` turns such a collision into a `409` for the later request, and the
++  client simply retries. If fallback usage is ever heavy, move the Redis counter forward past
++  the sequence's `last_value` (`SELECT last_value FROM url_code_seq;`) so the ranges no longer
++  meet.
++
++## 3. Deployment surfaces
++
++`SPRING_PROFILES_ACTIVE=read` instances register only the redirect controller and never touch
++`shortener:counter`; `write` instances register only the creation controller; the default
++profile serves both. Unregistered routes answer `404` problem+json (AC-14). Because the two
++surfaces share PostgreSQL and Redis, a write is visible to every read instance immediately
++(cache is read-through, populated on first lookup), and there is no replication lag to
++consider.
++
++## 4. Checklist for a Redis incident
++
++1. Confirm the symptom: `WARN ... Redis cache degraded` / `... falling back to db_sequence`
++   in the logs, `code_source = 'db_sequence'` on new rows.
++2. Check PostgreSQL headroom: connections and CPU carry the full read load during the outage.
++3. Restore Redis **with its persisted data**, or, if the data is lost, set
++   `shortener:counter` to a value above the highest value ever issued before letting write
++   instances reconnect (see 2.3). The URL cache needs no repair; it refills on demand.
++4. Watch the `code_source` mix return to `redis`. No restart of the application is required.

@@ -20,17 +20,22 @@ from ..models.trace import Kind
 from ..models.validation import Finding, GateOutcome, GateStatus, ValidationResult
 from ..sandbox.git import GitSandbox
 from ..sandbox.process import CommandNotAllowed, run_command
+from .arch_contract import CONTRACT_PATH, JAVA_CONTRACT_PATH
 from .context import RunContext
 from .conventions import COMMITTED_OPENAPI, SPRINGDOC_DUMPS
 from .policy_engine import PolicyEngine
+from .provision import MAVEN_WRAPPER_FILES
 
 InternalGate = Callable[[RunContext, GitSandbox], Awaitable[list[Finding]]]
+# files the orchestrator itself writes into the sandbox (engine/provision.py, engine/arch_contract.py);
+# a later regeneration (design change) lands inside the run diff and must not read as an agent change
+PROVISIONED_PATHS = {*MAVEN_WRAPPER_FILES, str(CONTRACT_PATH), str(JAVA_CONTRACT_PATH)}
 
 
 async def diff_scope(ctx: RunContext, git: GitSandbox) -> list[Finding]:
     pe = PolicyEngine(ctx.policy, ctx.target_stack)
     base = await git.run_base()  # everything the run changed, committed or not
-    changed = await git.changed_files(base)
+    changed = [f for f in await git.changed_files(base) if f not in PROVISIONED_PATHS]
     lines = await git.lines_changed(base)
     plan = ctx.get("plan")
     task_allowed: list[str] = []

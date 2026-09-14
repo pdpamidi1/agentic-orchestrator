@@ -50,6 +50,8 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
         await provision_sandbox(ctx, git, node.id)  # baseline the agent may not write (java: mvnw)
         await write_architecture_contract(ctx, git, node.id)  # the gate's test is never agent-authored
         cs: Changeset = ctx.get("changeset") or Changeset(branch=branch)
+        if not cs.commits:  # the baseline the orchestrator just committed is not an agent change
+            await git.set_run_base()
         feedback = ctx.feedback.get(node.id)
         pe = PolicyEngine(ctx.policy, ctx.target_stack)
         task_attempts: dict[str, int] = dict((feedback or {}).get("task_attempts", {}))

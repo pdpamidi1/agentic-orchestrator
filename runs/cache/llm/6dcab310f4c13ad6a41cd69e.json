@@ -1,0 +1,26 @@
+{
+  "schema": "Diagnosis",
+  "output": {
+    "root_cause": "The only failing gate is `scope`, and every finding concerns orchestrator-provisioned bootstrap files rather than anything the implementation tasks authored: `mvnw`, `mvnw.cmd`, `.mvn/wrapper/maven-wrapper.properties` and `src/test/java/sdlc/ArchitectureTest.java`. The plan deliberately excluded these from every TaskSpec.allowed_files (T1 risk_notes: \"the orchestrator-provisioned mvnw and sdlc/ArchitectureTest.java are never listed\"), and no commit in the changeset touches them (files_changed contains none of them). They are being diffed against the run baseline because provisioning happened inside the run branch, while `policy.allowed_paths` does not whitelist the repo-root wrapper files. This is a policy/baseline configuration mismatch, not an implementation or decomposition defect: integration, contract and acceptance gates all PASS and the advisory review recommends APPROVE. It is also not fixable in place \\u2014 deleting or moving the wrapper and the architecture test would break every DoD command (`./mvnw -q test`, `./mvnw -q -Pit verify`, `./mvnw -q -Dtest=ArchitectureTest test`) and the committed .github/workflows/ci.yml, and `src/test/java/sdlc/ArchitectureTest.java` is explicitly protected/untouchable. Widening `policy.allowed_paths` or excluding provisioned files from the scope baseline is itself a protected change requiring human authorization.",
+    "decision": "halt",
+    "feedback": [
+      {
+        "target": "human/policy-owner",
+        "instruction": "Decide on the scope-gate baseline for orchestrator-provisioned bootstrap files. Either (a) add `mvnw`, `mvnw.cmd`, `.mvn/wrapper/**` and `src/test/java/sdlc/**` to `policy.allowed_paths` as provisioned-infra exemptions, or (b) move provisioning of these files into the run baseline commit so the scope diff no longer reports them. Do NOT resolve this by having an agent delete or rewrite the Maven wrapper or ArchitectureTest.java: all task DoD commands and .github/workflows/ci.yml depend on ./mvnw, and ArchitectureTest.java is a protected orchestrator artifact."
+      },
+      {
+        "target": "orchestrator",
+        "instruction": "After the policy/baseline decision is applied, re-run validation only (no code changes required). All other required gates already pass: integration PASSED (131.5s, Testcontainers Postgres+Redis boot clean), contract PASSED, acceptance PASSED."
+      },
+      {
+        "target": "human/reviewer",
+        "instruction": "Advisory items to spot-check before merge, none of which block the scope gate: (1) `codegen/RedisBatchCounterSource.java`, `codegen/ShortCodeAllocator.java` and `read/RedisUrlCache.java` appear a second time in files_changed after the T6 block though they are not in T6/T7 allowed_files \\u2014 confirm which commit touched them and whether the task boundary held; (2) AC-10 cross-instance uniqueness is only proven single-JVM; (3) Dockerfile was never built in the sandbox (T8 note) and is only checked by the CI docker job; (4) the possible-secret static-analysis marker at src/test/java/com/example/shortener/api/error/GlobalExceptionHandlerTest.java:26 should be renamed or explicitly suppressed; (5) AMB-9/AMB-10/AMB-11 were implemented at documented defaults and still need product confirmation."
+      }
+    ]
+  },
+  "usage": {
+    "tokens_in": 19977,
+    "tokens_out": 1791,
+    "cost_usd": 0.14466
+  }
+}

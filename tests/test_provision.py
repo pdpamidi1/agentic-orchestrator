@@ -44,3 +44,28 @@ async def test_python_sandbox_is_not_touched(tmp_path: Path) -> None:
     git = GitSandbox(ctx.sandbox)
     await git.ensure_repo()
     assert await provision_sandbox(ctx, git, "implementation") == [] and not (ctx.sandbox / "mvnw").exists()
+
+
+async def test_orchestrator_baseline_is_outside_the_run_diff(tmp_path: Path) -> None:
+    """After provisioning + the architecture contract the base moves to HEAD, so the run-level scope gate
+    never sees mvnw or ArchitectureTest.java as agent changes; a later regeneration is filtered by path."""
+    from orchestrator.engine.arch_contract import write_architecture_contract
+    from orchestrator.engine.gates import PROVISIONED_PATHS, diff_scope
+    from orchestrator.llm.fake import CANNED
+    from orchestrator.models import Design, Plan
+
+    ctx = ctx_for(tmp_path, "java")
+    git = GitSandbox(ctx.sandbox)
+    await git.ensure_repo()
+    await git.start_run_branch("run/r1")  # tags the base at the empty baseline
+    ctx.put("design", Design.model_validate(CANNED["Design"]), "architecture")
+    ctx.put("plan", Plan.model_validate(CANNED["Plan"]), "planning")
+    await provision_sandbox(ctx, git, "implementation")
+    await write_architecture_contract(ctx, git, "implementation")
+    assert (
+        len(await git.changed_files(await git.run_base())) == 4
+    )  # wrapper x3 + ArchitectureTest, before the move
+    await git.set_run_base()
+    assert await git.changed_files(await git.run_base()) == []
+    assert await diff_scope(ctx, git) == []
+    assert "mvnw" in PROVISIONED_PATHS and "src/test/java/sdlc/ArchitectureTest.java" in PROVISIONED_PATHS

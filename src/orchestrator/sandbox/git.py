@@ -52,6 +52,10 @@ class GitSandbox:
         _, out = await self._git("rev-parse", "HEAD")
         return out.strip()
 
+    async def set_run_base(self) -> None:
+        """Move the base to HEAD: called after the orchestrator commits its own baseline, before any task."""
+        await self._git("tag", "-f", self.BASE_TAG, "HEAD")
+
     async def run_base(self) -> str:
         rc, out = await self._git("rev-parse", "-q", "--verify", f"{self.BASE_TAG}^{{commit}}")
         return out.strip() if rc == 0 else await self.head()

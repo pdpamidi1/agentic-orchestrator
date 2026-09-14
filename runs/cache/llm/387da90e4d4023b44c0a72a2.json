@@ -1,0 +1,103 @@
+{
+  "schema": "Review",
+  "output": {
+    "criteria": [
+      {
+        "id": "AC-1",
+        "verdict": "PASS",
+        "evidence": "Write path implemented in src/main/java/com/example/shortener/write/UrlWriteController.java + UrlWriteService.java; covered by src/test/java/com/example/shortener/write/UrlWriteServiceTest.java, UrlWriteControllerTest.java (201 payload, base-url composition) and src/test/java/com/example/shortener/it/CreateShortUrlIT.java (persisted row, created_by null, code_source set). Base URL default http://localhost:8080 held in config/ShortenerProperties.java (ShortenerPropertiesTest.java)."
+      },
+      {
+        "id": "AC-2",
+        "verdict": "PASS",
+        "evidence": "Bean Validation rules in api/dto/CreateUrlRequest.java (scheme/max-length) asserted by src/test/java/com/example/shortener/api/dto/CreateUrlRequestValidationTest.java (ftp scheme, >2048 chars); 400 problem+json shape asserted in GlobalExceptionHandlerTest.java and no-row-persisted asserted in it/CreateShortUrlIT.java."
+      },
+      {
+        "id": "AC-3",
+        "verdict": "PASS",
+        "evidence": "AliasAlreadyExistsException.java mapped to 409 in api/error/GlobalExceptionHandler.java; conflict path tested in write/UrlWriteServiceTest.java and it/CreateShortUrlIT.java (existing mapping unchanged, per T7 DoD)."
+      },
+      {
+        "id": "AC-4",
+        "verdict": "PASS",
+        "evidence": "No-deduplication behaviour covered by write/UrlWriteServiceTest.java and it/CreateShortUrlIT.java (distinct codes for repeated long_url, per T5/T7 DoD)."
+      },
+      {
+        "id": "AC-5",
+        "verdict": "PASS",
+        "evidence": "custom_alias pattern [0-9a-zA-Z]{3,32} on api/dto/CreateUrlRequest.java; CreateUrlRequestValidationTest.java covers bad charset and lengths 2 and 33 returning 400 problem+json via GlobalExceptionHandler."
+      },
+      {
+        "id": "AC-6",
+        "verdict": "PASS",
+        "evidence": "expiration_date parsed as OffsetDateTime with future constraint (CreateUrlRequest.java); malformed ISO-8601 (HttpMessageNotReadable) and past date cases asserted in CreateUrlRequestValidationTest.java / GlobalExceptionHandlerTest.java and it/CreateShortUrlIT.java."
+      },
+      {
+        "id": "AC-7",
+        "verdict": "PASS",
+        "evidence": "read/RedirectController.java returns 302 + Location + Cache-Control: private; asserted in src/test/java/com/example/shortener/read/RedirectControllerTest.java and it/RedirectIT.java."
+      },
+      {
+        "id": "AC-8",
+        "verdict": "PASS",
+        "evidence": "ShortCodeNotFoundException.java -> 404 in GlobalExceptionHandler.java; asserted in read/RedirectControllerTest.java and it/RedirectIT.java (404 application/problem+json)."
+      },
+      {
+        "id": "AC-9",
+        "verdict": "PASS",
+        "evidence": "ShortCodeExpiredException.java -> 410 in GlobalExceptionHandler.java; expiry helper in domain/UrlMapping.java tested by domain/UrlMappingTest.java; end-to-end 410 in it/RedirectIT.java."
+      },
+      {
+        "id": "AC-10",
+        "verdict": "PASS",
+        "evidence": "codegen/RedisBatchCounterSource.java performs a single INCRBY per batch; src/test/java/com/example/shortener/codegen/RedisBatchCounterSourceTest.java asserts one INCRBY per batch and strictly increasing/unique values under concurrency; code_source='redis' asserted in codegen/ShortCodeAllocatorTest.java and it/CreateShortUrlIT.java. Note: cross-instance uniqueness is argued by the shared Redis key, not exercised by a multi-instance test."
+      },
+      {
+        "id": "AC-11",
+        "verdict": "PASS",
+        "evidence": "codegen/DbSequenceCounterSource.java (nextval url_code_seq from V1__create_urls_table.sql) with fallback logic in ShortCodeAllocator.java; codegen/ShortCodeAllocatorTest.java asserts fallback + CodeSource.DB_SEQUENCE and it/CacheAndFallbackIT.java asserts 201 with code_source db_sequence while Redis is unreachable."
+      },
+      {
+        "id": "AC-12",
+        "verdict": "PASS",
+        "evidence": "read/UrlReadService.java cache-first lookup; read/UrlReadServiceTest.java verifies the repository is never touched on a cache hit; read/RedisUrlCacheTest.java asserts TTL = min(remaining expiry, default) bounds; it/CacheAndFallbackIT.java asserts TTL <= remaining expiry."
+      },
+      {
+        "id": "AC-13",
+        "verdict": "PASS",
+        "evidence": "Redis failures caught and logged in read/RedisUrlCache.java + UrlReadService.java; read/UrlReadServiceTest.java covers the Redis-down bypass and it/CacheAndFallbackIT.java serves 302 from Postgres with Redis unreachable."
+      },
+      {
+        "id": "AC-14",
+        "verdict": "PASS",
+        "evidence": "@Profile(\"!read\") on write/UrlWriteController.java and @Profile(\"!write\") on read/RedirectController.java; src/test/java/com/example/shortener/it/ProfileSeparationIT.java boots read (POST->404), write (GET->404) and default (both)."
+      },
+      {
+        "id": "AC-15",
+        "verdict": "PASS",
+        "evidence": "src/main/resources/db/migration/V1__create_urls_table.sql (asserted by domain/MigrationScriptTest.java), committed src/main/resources/openapi.yaml (parity asserted by it/OpenApiContractIT.java), Testcontainers base class it/AbstractIntegrationTest.java (Postgres+Redis), Dockerfile and README.md present; T8 note records ./mvnw test and -Pit verify passing locally."
+      },
+      {
+        "id": "AC-16",
+        "verdict": "PASS",
+        "evidence": "api/error/GlobalExceptionHandler.java (@RestControllerAdvice, ProblemDetail) with GlobalExceptionHandlerTest.java asserting status + application/problem+json + body fields for 400/404/409/410/500; ITs (CreateShortUrlIT, RedirectIT) re-assert content type end-to-end."
+      }
+    ],
+    "concerns": [
+      "Verification is file/test-name level only: I did not have file contents/line numbers or a gate log in this review payload, so PASS verdicts rest on the declared test names matching the plan DoD. A human should spot-check GlobalExceptionHandler.java, UrlReadService.java and RedisBatchCounterSource.java bodies before merge.",
+      "Allowed-files drift: codegen/RedisBatchCounterSource.java, codegen/ShortCodeAllocator.java and read/RedisUrlCache.java appear a second time in files_changed after the T6 block, but they are not in T6's or T7's allowed_files. Confirm which commit touched them and whether the task boundary was respected.",
+      "AC-10 'unique across concurrent instances' is only proven within a single JVM (RedisBatchCounterSourceTest concurrency test). No multi-instance/multi-allocator IT against one shared Redis counter exists; consider adding two allocator beans sharing the Testcontainers Redis.",
+      "Dockerfile was never actually built in the sandbox (T8 note: 'docker build could not be run'). The non-root user / runtime stage claims are unverified outside CI; the CI docker job is the only check.",
+      "Static-analysis finding at src/test/java/com/example/shortener/api/error/GlobalExceptionHandlerTest.java:26 (possible-secret marker string) was left unaddressed as 'stale'. Low risk since it is a test literal, but it should either be renamed or explicitly suppressed so the signal does not persist.",
+      "AMB-9 (24h default cache TTL), AMB-10 (accepted counter gaps) and AMB-11 (seeded counter for >=3 char codes) are implemented at their defaults and documented in docs/operations.md, but remain formally unanswered ambiguities in spec v2 \u2014 they need product confirmation, not silent acceptance.",
+      "CI adds a docker build/non-root-user job that is beyond T8's stated DoD (which listed compile/spotless/arch/unit/it steps). Minor scope addition; harmless but worth acknowledging.",
+      "PII posture is good (created_by nullable and never populated, no auth data stored); confirm the redirect/degradation logs do not log full long_url at INFO in high volume, as URLs can carry user-identifying query parameters."
+    ],
+    "recommendation": "APPROVE"
+  },
+  "usage": {
+    "tokens_in": 17803,
+    "tokens_out": 4155,
+    "cost_usd": 0.19289
+  }
+}
