@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -26,8 +27,10 @@ pathlib.Path("../claude_args.txt").write_text("\\n".join(sys.argv[1:]))
 mode = pathlib.Path("../fake_claude_mode")
 mode = mode.read_text().strip() if mode.exists() else "done"
 if mode == "crash":
+    print(json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": True, "num_turns": 25,
+                      "total_cost_usd": 0.5}))
     print("boom", file=sys.stderr)
-    sys.exit(2)
+    sys.exit(1)
 if mode == "blocked":
     pathlib.Path("src/stray.py").write_text("oops\\n")
     status = {"status": "BLOCKED", "notes": "needs a dependency"}
@@ -101,8 +104,13 @@ async def test_blocked_resets_the_tree_and_crash_is_a_transient_error(tmp_path: 
     assert await git.changed_files() == []  # the stray file the agent wrote is gone
 
     (tmp_path / "fake_claude_mode").write_text("crash")
-    r = await ex.execute(ctx, task, design, None)
-    assert isinstance(r, Errored) and r.transient and "boom" in r.reason
+    r = await ex.execute(ctx, task, design, {"attempt": 1})
+    assert isinstance(r, Errored) and r.transient and "error_max_turns" in r.reason  # stdout, not just stderr
+    calls = [e for e in ctx.trace.events("r1") if e.kind == Kind.EXECUTOR_CALL]
+    assert calls[-1].status == "ERROR" and calls[-1].payload["subtype"] == "error_max_turns"
+    assert calls[-1].cost_usd == 0.5
+    saved = json.loads((ctx.sandbox.parent / "executor" / f"{task.id}.attempt2.json").read_text())
+    assert saved["exit_code"] == 1 and "error_max_turns" in saved["stdout"] and "boom" in saved["stderr"]
 
 
 async def test_missing_binary_is_not_transient(tmp_path: Path) -> None:

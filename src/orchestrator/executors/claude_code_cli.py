@@ -124,16 +124,51 @@ class ClaudeCodeCliExecutor:
             return Errored("claude code timeout", transient=True)
         except FileNotFoundError:
             return Errored("claude binary not found; use --replay or install Claude Code", transient=False)
+        attempt = (feedback or {}).get("attempt", 0) + 1
+        raw_out, raw_err = out.decode(errors="replace"), err.decode(errors="replace")
+        # keep every attempt's raw result for post-mortems: runs/<id>/executor/<task>.attempt<n>.json
+        await asyncio.to_thread(
+            _write_json,
+            ctx.sandbox.parent / "executor" / f"{task.id}.attempt{attempt}.json",
+            {
+                "task": task.id,
+                "attempt": attempt,
+                "exit_code": proc.returncode,
+                "stdout": raw_out,
+                "stderr": raw_err,
+            },
+        )
         if proc.returncode != 0:
-            return Errored(f"claude exit {proc.returncode}: {err.decode(errors='replace')[-500:]}")
+            # Claude Code reports its failure (e.g. subtype error_max_turns) in the JSON on stdout, not stderr
+            try:
+                failed = json.loads(raw_out or "{}")
+            except json.JSONDecodeError:
+                failed = {}
+            detail = failed.get("subtype") or failed.get("result") or raw_out[-300:] or raw_err[-300:]
+            ctx.emit(
+                Kind.EXECUTOR_CALL,
+                task_id=task.id,
+                attempt=attempt,
+                actor="claude-code",
+                status="ERROR",
+                cost_usd=float(failed.get("total_cost_usd", 0.0) or 0.0),
+                payload={
+                    "exit_code": proc.returncode,
+                    "subtype": failed.get("subtype"),
+                    "turns": failed.get("num_turns"),
+                },
+            )
+            return Errored(f"claude exit {proc.returncode}: {str(detail)[:300]}")
 
-        result = json.loads(out.decode(errors="replace") or "{}")
+        result = json.loads(raw_out or "{}")
         usage = result.get("usage", {})
         cost = float(result.get("total_cost_usd", 0.0))
         ctx.emit(
             Kind.EXECUTOR_CALL,
             task_id=task.id,
+            attempt=attempt,
             actor="claude-code",
+            status="OK",
             tokens_in=usage.get("input_tokens", 0),
             tokens_out=usage.get("output_tokens", 0),
             cost_usd=cost,
@@ -164,3 +199,8 @@ class ClaudeCodeCliExecutor:
             cost_usd=cost,
             notes=reported.get("notes", ""),
         )
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
