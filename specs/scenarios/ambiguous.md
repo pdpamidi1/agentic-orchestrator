@@ -1,1 +1,6 @@
 - Update/optimize to make the URL shortener more reliable and production-ready.
+- Load test for 100 M DAU and 1 B URLs with 2 M writes / Day with below scale orchestration 
+    - Read Repliacs for read scale
+    - Very Hot URLs should have Key salting
+    - Redis cache Eviction use LRU 
+    - Cache should be Cache-Aside (Lazy Loading)
