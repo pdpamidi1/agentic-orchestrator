@@ -40,3 +40,25 @@ def test_command_allowlist(policy) -> None:  # type: ignore[no-untyped-def]
     pe = PolicyEngine(policy, "python")
     assert pe.command_allowed("pytest -q") and pe.command_allowed("git diff")
     assert not pe.command_allowed("curl http://x") and not pe.command_allowed("rm -rf /")
+
+
+def test_glob_double_star_matches_zero_or_more_directories() -> None:
+    """``**/`` must accept a file directly at the glob's leaf level, not only nested ones.
+
+    Regression: fnmatch turned ``**/`` into ``*/`` (at least one directory), so every planner glob of the
+    shape ``src/main/java/**/domain/**/*.java`` rejected ``.../domain/Entity.java`` as a scope violation.
+    """
+    from orchestrator.engine.policy_engine import matches
+
+    leaf = "src/main/java/com/example/shortener/analytics/domain/ClickOutboxEntry.java"
+    assert matches(leaf, ["src/main/java/**/analytics/domain/**/*.java"])
+    assert matches(
+        "src/main/java/com/x/analytics/domain/sub/Deep.java", ["src/main/java/**/domain/**/*.java"]
+    )
+    assert matches("db/migration/V1.sql", ["**/db/migration/**"])  # zero leading directories
+    assert matches("src/main/java/x/RedirectController.java", ["src/main/java/**/*RedirectController.java"])
+    assert matches("src/app/x.py", ["src/*"])  # fnmatch semantics kept: * crosses "/"
+    assert matches("a\\b\\c.txt", ["a/b/*.txt"])  # separators normalised
+    assert not matches("tests/x.py", ["src/**"])
+    assert not matches(".env.local", ["src/**", "tests/**"])
+    assert matches("x.py", ["[!.]*.py"]) and not matches(".x.py", ["[!.]*.py"])

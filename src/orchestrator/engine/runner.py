@@ -36,9 +36,9 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
 from typing import Protocol
 
+from ..models.common import utcnow
 from ..models.state import RUNNABLE, NodeStatus, RunState, RunStatus
 from ..models.trace import Kind
 from .brief import build_brief
@@ -141,6 +141,7 @@ class Runner:
         if state.status in (RunStatus.HALTED, RunStatus.COMPLETED):
             return state
         state.status = RunStatus.RUNNING
+        state.budget.unpause()  # a human wait (approval, answer, halt review) is not run time
         ctx.emit(Kind.RUN_STARTED, payload={"scenario": ctx.scenario, "lineage": ctx.lineage_snapshot()})
         pol = ctx.policy
 
@@ -171,6 +172,8 @@ class Runner:
             paused = False
             for node, outcome in zip(batch, results, strict=True):
                 paused |= await self._apply(node, outcome, ctx, state)
+            if paused and state.status != RunStatus.HALTED:
+                state.budget.pause()  # AWAITING_*: the wall clock stops until a human answers
             await self.store.save(state)
             if state.status == RunStatus.HALTED:
                 return state
@@ -199,6 +202,11 @@ class Runner:
                 actor=approver,
                 payload={"after": state.halt_reason, "lineage": ctx.lineage_snapshot()},
             )
+            if state.halt_reason == "budget.exceeded:wall_clock":
+                # the reviewer decided to go on: like task_attempts below, the wall clock starts afresh
+                state.budget.started_at = utcnow()
+                state.budget.paused_seconds = 0.0
+                state.budget.paused_at = None
             state.halt_reason = None
             fb = ctx.feedback.get(node_id)
             if fb:
@@ -574,7 +582,7 @@ class Runner:
         Cost and tokens are accumulated by ``_apply`` from ``Success`` outcomes.
         """
         b = ctx.policy.budgets
-        elapsed = (datetime.now(UTC) - state.budget.started_at).total_seconds() / 60
+        elapsed = state.budget.elapsed_minutes()
         if state.budget.cost_usd > b.max_cost_usd_per_run:
             return "budget.exceeded:cost"
         if state.budget.tokens_used > b.max_tokens_per_run:
@@ -592,6 +600,7 @@ class Runner:
         """
         state.status = RunStatus.HALTED
         state.halt_reason = reason
+        state.budget.pause()  # the review that follows a safe-stop is human time
         ctx.emit(
             Kind.RUN_HALTED, status="HALTED", payload={"trigger": reason, "lineage": ctx.lineage_snapshot()}
         )

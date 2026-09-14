@@ -64,13 +64,33 @@ class Budget(BaseModel):
     ``tokens_used``/``cost_usd`` accumulate the usage each node's ``Success`` outcome reports (agent and
     executor calls); ``replans`` counts
     ``diagnose -> replan`` routes (bounded by ``max_replans_per_run``); ``started_at`` anchors the wall-clock
-    limit. These are control-loop inputs, not metrics: reporting still derives from trace events.
+    limit. Time spent waiting for a human does not count against it: ``paused_at`` is set whenever the run
+    stops for an approval, an answer or a safe-stop review, and the wait is folded into ``paused_seconds``
+    when the run re-enters the loop. These are control-loop inputs, not metrics: reporting still derives
+    from trace events.
     """
 
     tokens_used: int = 0
     cost_usd: float = 0.0
     replans: int = 0
     started_at: datetime = Field(default_factory=utcnow)
+    paused_at: datetime | None = None  # set while AWAITING_* / HALTED; cleared on re-entry
+    paused_seconds: float = 0.0  # cumulative human wait, excluded from the wall-clock budget
+
+    def pause(self) -> None:
+        """Stop the wall clock: the run is about to wait for a human (idempotent)."""
+        if self.paused_at is None:
+            self.paused_at = utcnow()
+
+    def unpause(self) -> None:
+        """Restart the wall clock, crediting the completed wait to ``paused_seconds``."""
+        if self.paused_at is not None:
+            self.paused_seconds += (utcnow() - self.paused_at).total_seconds()
+            self.paused_at = None
+
+    def elapsed_minutes(self) -> float:
+        """Active wall-clock minutes since ``started_at`` (human waits excluded)."""
+        return ((utcnow() - self.started_at).total_seconds() - self.paused_seconds) / 60
 
 
 class RunState(BaseModel):

@@ -19,7 +19,7 @@ Invariants
 
 from __future__ import annotations
 
-import fnmatch
+import functools
 import re
 from dataclasses import dataclass, field
 
@@ -35,14 +35,49 @@ def matches(path: str, patterns: list[str]) -> bool:
 def _match(path: str, patterns: list[str]) -> bool:
     """Glob match with policy semantics.
 
-    ``fnmatch`` has no ``**``: it treats it like ``*``, which does not cross ``/``-free prefixes the way
-    users expect, so each pattern is also tried with a leading ``**/`` stripped (``**/db/migration/**``
-    then matches ``db/migration/V1.sql`` at the root). Backslashes are normalised so Windows-style paths
-    from a tool still match.
+    ``*`` and ``?`` behave as in ``fnmatch`` (``*`` crosses ``/``, so ``src/*`` is a whole subtree, as
+    every allowlist in ``policy.yaml`` and every planner glob assumes). ``**/`` means "zero or more
+    directories": ``src/main/java/**/domain/**/*.java`` matches a file directly inside ``domain/`` as well
+    as one nested deeper, and ``**/db/migration/**`` matches ``db/migration/V1.sql`` at the root.
+    (``fnmatch`` alone treats ``**/`` as ``*/`` and demands at least one directory, which made every file
+    at a glob's leaf level a false ``task.allowed_files`` violation.) Backslashes are normalised so
+    Windows-style paths from a tool still match.
     """
-    # fnmatch treats ** like *; good enough for path allowlists, and we normalise separators
     p = path.replace("\\", "/")
-    return any(fnmatch.fnmatch(p, pat) or fnmatch.fnmatch(p, pat.replace("**/", "")) for pat in patterns)
+    return any(_glob_re(pat).match(p) is not None for pat in patterns)
+
+
+@functools.lru_cache(maxsize=4096)
+def _glob_re(pattern: str) -> re.Pattern[str]:
+    """Compile one policy glob to a full-match regex (cached; patterns repeat across every check)."""
+    out: list[str] = []
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")  # zero or more directories
+            i += 3
+        elif c == "*":
+            out.append(".*")  # fnmatch semantics: crosses "/"
+            i += 1
+        elif c == "?":
+            out.append(".")
+            i += 1
+        elif c == "[":
+            j = pattern.find("]", i + 1)
+            if j < 0:
+                out.append(re.escape(c))
+                i += 1
+            else:
+                body = pattern[i + 1 : j]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                out.append("[" + body.replace("\\", "\\\\") + "]")
+                i = j + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("(?s:" + "".join(out) + r")\Z")
 
 
 @dataclass(frozen=True)

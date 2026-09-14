@@ -8,6 +8,9 @@ decision). Files under ``runs/<id>/``:
 - ``state.json``               latest ``RunState`` (overwritten on every save)
 - ``artifacts/<name>.v<n>.json`` one file per artifact version; older versions are never deleted
 - ``approvals.jsonl``          append-only human decisions (node, action, APPROVED|REJECTED, who)
+- ``context.json``             the non-artifact half of ``RunContext`` (feedback, answers, approval
+                               tokens, artifact producers, mode flags) so a fresh process can resume
+                               the run (``service.OrchestratorService.load``, TASKS T12)
 
 ``trace.jsonl`` in the same directory is owned by ``trace/sink.py``, not by this store. Methods are
 ``async`` to match the store interface even though the file I/O here is synchronous.
@@ -15,6 +18,7 @@ decision). Files under ``runs/<id>/``:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -48,13 +52,16 @@ class FileStore:
     async def save_artifact(self, run_id: str, name: str, version: int, value: Any) -> Path:
         """Write one artifact version to ``artifacts/<name>.v<version>.json`` and return its path.
 
-        Pydantic models are dumped with their own serialiser; anything else (e.g. the plain-string
-        ``requirement_text``) goes through ``json.dumps`` with ``default=str``. Re-saving an existing
-        version overwrites it with identical content, so the call is idempotent.
+        Pydantic models are dumped with their own serialiser, dataclasses (the executor's ``Changeset``)
+        as their field dict; anything else (e.g. the plain-string ``requirement_text``) goes through
+        ``json.dumps`` with ``default=str``. Re-saving an existing version overwrites it with identical
+        content, so the call is idempotent.
         """
         d = self._dir(run_id) / "artifacts"
         d.mkdir(exist_ok=True)
         p = d / f"{name}.v{version}.json"
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            value = dataclasses.asdict(value)
         body = (
             value.model_dump_json(indent=2)
             if isinstance(value, BaseModel)
@@ -75,6 +82,34 @@ class FileStore:
             f.write(
                 json.dumps({"node_id": node_id, "action": action, "decision": decision, "by": who}) + "\n"
             )
+
+    async def save_context(self, run_id: str, data: dict[str, Any]) -> None:
+        """Overwrite ``context.json`` with the resumable part of the run context (see module doc)."""
+        (self._dir(run_id) / "context.json").write_text(
+            json.dumps(data, indent=2, default=str), encoding="utf-8"
+        )
+
+    async def load_context(self, run_id: str) -> dict[str, Any] | None:
+        """Read ``context.json`` back, or None for a run saved before it existed (trace fallback)."""
+        p = self.runs_dir / run_id / "context.json"
+        if not p.exists():
+            return None
+        data: dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
+        return data
+
+    def latest_artifacts(self, run_id: str) -> dict[str, tuple[int, Path]]:
+        """Artifact name -> (highest saved version, its file) from ``artifacts/<name>.v<n>.json``."""
+        out: dict[str, tuple[int, Path]] = {}
+        d = self.runs_dir / run_id / "artifacts"
+        if not d.is_dir():
+            return out
+        for p in d.glob("*.v*.json"):
+            name, _, rest = p.name[: -len(".json")].rpartition(".v")
+            if not name or not rest.isdigit():
+                continue
+            if name not in out or int(rest) > out[name][0]:
+                out[name] = (int(rest), p)
+        return out
 
     def exists(self, run_id: str) -> bool:
         """True when a ``state.json`` has been saved for ``run_id`` (does not create the directory)."""

@@ -102,5 +102,5 @@ a fixture trace. The contract and architecture gates run against fixture repos u
 runs in CI (T15).
 
 ## Limitations
-See `docs/architecture.md` — sandbox is process+policy (not a container), node-level invalidation, in-memory live-run
-registry until T12, acceptance review advisory by design.
+See `docs/architecture.md` — sandbox is process+policy (not a container), node-level invalidation, live runs are
+reloaded from `runs/<id>` after an API restart (T12; Postgres store is T10), acceptance review advisory by design.

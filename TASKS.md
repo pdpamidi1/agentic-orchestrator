@@ -30,13 +30,14 @@ Status legend: [ ] todo · [~] in progress · [x] done
       `sql/`, `sql/views.sql` metrics must equal `trace/metrics.py` on the same run (test both).
 - [ ] **T11 Run report**: `reports/run_report.py` renders `runs/<id>/run_report.md`: requirement -> plan -> tasks ->
       gates -> approvals -> metrics -> lineage table -> risks/assumptions/limitations. Wire into `release_readiness`.
-- [ ] **T12 Resume**: rebuild `RunContext` from `runs/<id>/artifacts` so `approve`/`answer` work after an API restart.
+- [x] **T12 Resume** (`service.load`: state + typed artifacts + `context.json`, trace fallback for older runs; brownfield-859b9d7f resumed this way after a restart): rebuild `RunContext` from `runs/<id>/artifacts` so `approve`/`answer` work after an API restart.
 - [ ] **T13 Kafka trace mirror** (profile `kafka`): `trace/kafka_sink.py` publishing `TraceEvent`s to `sdlc.trace.events`.
 - [ ] **T14 Docs**: `docs/architecture.md` decisions table with rejected alternatives; README setup; three scenario
       walkthroughs with links to committed run artifacts; limitations and trade-offs.
 - [ ] **T15 CI**: GitHub Actions: lint, test, and a `--replay` golden run for all three scenarios diffed against committed metrics.
 
 ## Stretch
+- [ ] Bound `diagnose -> retry` cycles per run (a fake run whose gates can never pass loops until the wall-clock or cost budget trips; only `replan` is counted today)
 - [ ] Container-isolated executor (docker run with the sandbox mounted) instead of process + path policy
 - [ ] Task-level (not node-level) invalidation using `Plan.invalidated_task_ids`
 - [ ] Approvals web page (FastAPI + htmx) showing pending approvals with the summary artifacts

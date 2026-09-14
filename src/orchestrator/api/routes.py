@@ -6,8 +6,8 @@ the request body with a Pydantic model, delegates to the single module-level ``O
 in this module.
 
 Key invariants:
-- Live runs are held in memory by the service (``svc.runs``); a run started in another process is
-  unknown here, hence the 404 texts. This is a documented prototype limitation (TASKS: resume from store).
+- Live runs are held in memory by the service (``svc.runs``) and, when this process never saw one,
+  rebuilt from ``runs/<id>`` (``svc.live``, TASKS T12); 404 means nothing was ever saved under that id.
 - Human checkpoints (``AWAITING_APPROVAL`` / ``AWAITING_INPUT``) only advance through the approval,
   rejection and answer routes below; nothing in the API auto-approves.
 - Metrics are computed on request from ``runs/<id>/trace.jsonl``; nothing is stored per request.
@@ -85,9 +85,9 @@ async def start_run(body: StartRun, bg: BackgroundTasks) -> dict[str, Any]:
 @router.get("/runs/{run_id}")
 async def get_run(run_id: str) -> dict[str, Any]:
     """Return the full ``RunState`` of a live run as JSON; 404 if this process does not hold the run."""
-    live = svc.runs.get(run_id)
+    live = await svc.live(run_id)
     if not live:
-        raise HTTPException(404, "unknown run (prototype keeps live runs in memory)")
+        raise HTTPException(404, "unknown run")
     return live.state.model_dump(mode="json")
 
 
@@ -142,7 +142,7 @@ def _pending_brief(live: Any) -> dict[str, Any] | None:
 @router.get("/runs/{run_id}/approvals/{node_id}")
 async def approval_brief(run_id: str, node_id: str) -> dict[str, Any]:
     """The detailed brief (design, plan, cost, contract/structure changes) for a pending approval."""
-    live = svc.runs.get(run_id)
+    live = await svc.live(run_id)
     brief = live.ctx.get("approval_brief") if live else None
     if not isinstance(brief, dict) or brief.get("node") != node_id:
         raise HTTPException(404, f"no pending approval brief for {node_id}")
@@ -163,8 +163,8 @@ async def deliver(run_id: str, body: Deliver) -> dict[str, Any]:
     ``RuntimeError`` because ``approval_release`` has not been passed). Side effects: file copy and an
     ``ARTIFACT_WRITTEN`` event with artifact ``delivery``.
     """
-    if run_id not in svc.runs:
-        raise HTTPException(404, "unknown run (prototype keeps live runs in memory)")
+    if await svc.live(run_id) is None:
+        raise HTTPException(404, "unknown run")
     try:
         dest = await svc.deliver(run_id, Path(body.to) if body.to else None)
     except RuntimeError as e:
@@ -195,7 +195,7 @@ async def artifact(run_id: str, name: str) -> Any:
     404 when the run is not in memory or the artifact has not been produced yet. Pydantic artifacts are
     dumped to JSON; plain values (e.g. ``requirement_text``) are returned as-is.
     """
-    live = svc.runs.get(run_id)
+    live = await svc.live(run_id)
     if not live or name not in live.ctx.artifacts:
         raise HTTPException(404)
     a = live.ctx.artifacts[name]

@@ -106,6 +106,9 @@ exposed it is in `runs/`.
 | Replay never found a recorded patch | Relative cache path resolved inside the sandbox | Absolute path for `git apply`; recording promotes only policy-accepted patches and stores granted scope beside them |
 | Scope gate failed on the orchestrator's own files | Run base tag set before the baseline commits | Base moves past provisioning; provisioned paths filtered from the scope diff |
 | Documenter reply truncated at the client's token ceiling | 16k `max_tokens` too small for README+ADRs+runbook | Size budget in the prompt; client retries a truncated reply with a larger budget |
+| Brownfield T2 rolled back for `task.allowed_files` although every file matched the planner's globs | `fnmatch` turns `**/` into `*/`: a file directly at a glob's leaf level (`**/domain/**/*.java` vs `domain/Entity.java`) never matched | Own glob compiler in `policy_engine._match`: `**/` is zero or more directories, `*` keeps fnmatch semantics |
+| Run halted `budget.exceeded:wall_clock` 40 s after resuming: 38 of its 71 minutes were the human reading the design brief | Wall clock ran through every AWAITING_* pause and halt review | `Budget.pause/unpause`: human waits accumulate in `paused_seconds` and are excluded; a resume after a wall-clock halt starts the clock afresh (like the task allowance) |
+| The halted run could not be continued once the API process needed a code fix | Live runs existed only in the process that started them | T12: `service.load` rebuilds a run from `state.json`, the latest typed artifact versions and `context.json` (feedback, answers, approval tokens, producers, mode); runs without `context.json` are replayed from the trace, decision by decision |
 
 Net effect: after these changes the eight tasks, all gates (compile, spotless, architecture, unit, Testcontainers
 integration, contract, release) and delivery completed without manual intervention beyond the approvals, and the
