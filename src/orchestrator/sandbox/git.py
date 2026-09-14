@@ -88,7 +88,13 @@ class GitSandbox:
         return sha.strip()
 
     async def revert(self, sha: str) -> None:
-        await self._git("revert", "--no-edit", sha)
+        rc, out = await self._git("revert", "--no-edit", sha)
+        if rc != 0:  # a later commit touched the same paths: never leave the tree mid-revert
+            await self._git("revert", "--abort")
+            if await self.head() == sha:
+                await self._git("reset", "--hard", f"{sha}~1")
+                return
+            raise RuntimeError(f"cannot revert {sha[:8]}: conflicts and it is not HEAD\n{out[-500:]}")
 
     async def reset_working_tree(self) -> None:
         await self._git("checkout", "--", ".")

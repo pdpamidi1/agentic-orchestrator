@@ -80,9 +80,13 @@ def build_handlers(llm: LLMClient, executor: CodeExecutor, graph: Graph) -> dict
             groups: dict[str, list[TaskSpec]] = {}
             for t in ready:
                 groups.setdefault(t.parallel_group or t.id, []).append(t)
-            batch = next(iter(groups.values()))  # one group at a time; group members run concurrently
-            results = await asyncio.gather(*(executor.execute(ctx, t, design, feedback) for t in batch))
-            for t, r in zip(batch, results, strict=True):
+            batch = next(iter(groups.values()))  # one group at a time
+            # group members share ONE working tree and index, so they run one after another and each result is
+            # judged before the next task starts (a concurrent task's half-written files would otherwise land
+            # in this task's commit and scope check). True parallelism needs per-task worktrees: a stretch
+            # item.
+            for t in batch:
+                r = await executor.execute(ctx, t, design, feedback)
                 if isinstance(r, Done):
                     # an approved HIGH task may touch the protected paths it declared; map the human's
                     # approval onto the high-impact actions those paths require

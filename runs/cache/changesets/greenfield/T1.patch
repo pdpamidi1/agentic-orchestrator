@@ -1,0 +1,540 @@
+diff --git a/pom.xml b/pom.xml
+new file mode 100644
+index 0000000..641fcc7
+--- /dev/null
++++ b/pom.xml
+@@ -0,0 +1,233 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
++  <modelVersion>4.0.0</modelVersion>
++
++  <parent>
++    <groupId>org.springframework.boot</groupId>
++    <artifactId>spring-boot-starter-parent</artifactId>
++    <version>4.0.0</version>
++    <relativePath/>
++  </parent>
++
++  <groupId>com.example</groupId>
++  <artifactId>url-shortener</artifactId>
++  <version>0.1.0-SNAPSHOT</version>
++  <name>url-shortener</name>
++  <description>URL shortener service (Spring Boot 4 / Java 25)</description>
++
++  <properties>
++    <java.version>25</java.version>
++    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
++    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
++
++    <springdoc.version>3.0.0</springdoc.version>
++    <springdoc-maven-plugin.version>1.5</springdoc-maven-plugin.version>
++    <testcontainers-redis.version>2.2.4</testcontainers-redis.version>
++    <spotless.version>2.46.1</spotless.version>
++    <google-java-format.version>1.28.0</google-java-format.version>
++
++    <!-- Port / profile used by the `it` profile to boot the app for the springdoc OpenAPI dump. -->
++    <it.server.port>8080</it.server.port>
++    <it.spring.profiles>openapi</it.spring.profiles>
++  </properties>
++
++  <dependencies>
++    <!-- Web / API -->
++    <dependency>
++      <groupId>org.springframework.boot</groupId>
++      <artifactId>spring-boot-starter-web</artifactId>
++    </dependency>
++    <dependency>
++      <groupId>org.springframework.boot</groupId>
++      <artifactId>spring-boot-starter-validation</artifactId>
++    </dependency>
++    <dependency>
++      <groupId>org.springdoc</groupId>
++      <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
++      <version>${springdoc.version}</version>
++    </dependency>
++
++    <!-- Persistence -->
++    <dependency>
++      <groupId>org.springframework.boot</groupId>
++      <artifactId>spring-boot-starter-data-jpa</artifactId>
++    </dependency>
++    <dependency>
++      <groupId>org.flywaydb</groupId>
++      <artifactId>flyway-core</artifactId>
++    </dependency>
++    <dependency>
++      <groupId>org.flywaydb</groupId>
++      <artifactId>flyway-database-postgresql</artifactId>
++    </dependency>
++    <dependency>
++      <groupId>org.postgresql</groupId>
++      <artifactId>postgresql</artifactId>
++      <scope>runtime</scope>
++    </dependency>
++
++    <!-- Cache / counter -->
++    <dependency>
++      <groupId>org.springframework.boot</groupId>
++      <artifactId>spring-boot-starter-data-redis</artifactId>
++    </dependency>
++
++    <!-- Test -->
++    <dependency>
++      <groupId>org.springframework.boot</groupId>
++      <artifactId>spring-boot-starter-test</artifactId>
++      <scope>test</scope>
++    </dependency>
++    <dependency>
++      <groupId>org.springframework.boot</groupId>
++      <artifactId>spring-boot-testcontainers</artifactId>
++      <scope>test</scope>
++    </dependency>
++    <dependency>
++      <groupId>org.testcontainers</groupId>
++      <artifactId>testcontainers-junit-jupiter</artifactId>
++      <scope>test</scope>
++    </dependency>
++    <dependency>
++      <groupId>org.testcontainers</groupId>
++      <artifactId>testcontainers-postgresql</artifactId>
++      <scope>test</scope>
++    </dependency>
++    <dependency>
++      <groupId>com.redis</groupId>
++      <artifactId>testcontainers-redis</artifactId>
++      <version>${testcontainers-redis.version}</version>
++      <scope>test</scope>
++    </dependency>
++  </dependencies>
++
++  <build>
++    <plugins>
++      <plugin>
++        <groupId>org.springframework.boot</groupId>
++        <artifactId>spring-boot-maven-plugin</artifactId>
++      </plugin>
++
++      <!-- Unit tests only: `./mvnw test` must never need Docker. Integration tests (*IT) belong to failsafe. -->
++      <plugin>
++        <groupId>org.apache.maven.plugins</groupId>
++        <artifactId>maven-surefire-plugin</artifactId>
++        <configuration>
++          <includes>
++            <include>**/*Test.java</include>
++          </includes>
++          <excludes>
++            <exclude>**/*IT.java</exclude>
++          </excludes>
++        </configuration>
++      </plugin>
++
++      <!-- Formatting: `./mvnw spotless:check` (advisory style gate) / `./mvnw spotless:apply`. -->
++      <plugin>
++        <groupId>com.diffplug.spotless</groupId>
++        <artifactId>spotless-maven-plugin</artifactId>
++        <version>${spotless.version}</version>
++        <configuration>
++          <java>
++            <includes>
++              <include>src/main/java/**/*.java</include>
++              <include>src/test/java/**/*.java</include>
++            </includes>
++            <excludes>
++              <!-- Generated by the orchestrator from the design; regenerated, never hand-edited. -->
++              <exclude>src/test/java/sdlc/**/*.java</exclude>
++            </excludes>
++            <googleJavaFormat>
++              <version>${google-java-format.version}</version>
++              <style>GOOGLE</style>
++              <reflowLongStrings>true</reflowLongStrings>
++            </googleJavaFormat>
++            <removeUnusedImports/>
++            <trimTrailingWhitespace/>
++            <endWithNewline/>
++          </java>
++        </configuration>
++      </plugin>
++    </plugins>
++  </build>
++
++  <profiles>
++    <!--
++      Integration profile: `./mvnw -Pit verify`
++        1. pre-integration-test : spring-boot:start boots the application (profile `openapi`, see application.yml)
++        2. integration-test     : failsafe runs **/*IT.java; springdoc-openapi-maven-plugin dumps
++                                  http://localhost:${it.server.port}/v3/api-docs to target/openapi.json
++        3. post-integration-test: spring-boot:stop
++        4. verify               : failsafe:verify fails the build on IT failures
++    -->
++    <profile>
++      <id>it</id>
++      <build>
++        <plugins>
++          <plugin>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-maven-plugin</artifactId>
++            <executions>
++              <execution>
++                <id>start-app-for-it</id>
++                <phase>pre-integration-test</phase>
++                <goals>
++                  <goal>start</goal>
++                </goals>
++                <configuration>
++                  <profiles>
++                    <profile>${it.spring.profiles}</profile>
++                  </profiles>
++                  <arguments>
++                    <argument>--server.port=${it.server.port}</argument>
++                  </arguments>
++                </configuration>
++              </execution>
++              <execution>
++                <id>stop-app-after-it</id>
++                <phase>post-integration-test</phase>
++                <goals>
++                  <goal>stop</goal>
++                </goals>
++              </execution>
++            </executions>
++          </plugin>
++
++          <!-- spring-boot-starter-parent already binds integration-test + verify for failsafe. -->
++          <plugin>
++            <groupId>org.apache.maven.plugins</groupId>
++            <artifactId>maven-failsafe-plugin</artifactId>
++            <configuration>
++              <includes>
++                <include>**/*IT.java</include>
++              </includes>
++            </configuration>
++          </plugin>
++
++          <plugin>
++            <groupId>org.springdoc</groupId>
++            <artifactId>springdoc-openapi-maven-plugin</artifactId>
++            <version>${springdoc-maven-plugin.version}</version>
++            <executions>
++              <execution>
++                <id>dump-openapi</id>
++                <phase>integration-test</phase>
++                <goals>
++                  <goal>generate</goal>
++                </goals>
++                <configuration>
++                  <apiDocsUrl>http://localhost:${it.server.port}/v3/api-docs</apiDocsUrl>
++                  <outputDir>${project.build.directory}</outputDir>
++                  <outputFileName>openapi.json</outputFileName>
++                  <skip>false</skip>
++                </configuration>
++              </execution>
++            </executions>
++          </plugin>
++        </plugins>
++      </build>
++    </profile>
++  </profiles>
++</project>
+diff --git a/src/main/java/com/example/shortener/UrlShortenerApplication.java b/src/main/java/com/example/shortener/UrlShortenerApplication.java
+new file mode 100644
+index 0000000..d63c973
+--- /dev/null
++++ b/src/main/java/com/example/shortener/UrlShortenerApplication.java
+@@ -0,0 +1,16 @@
++package com.example.shortener;
++
++import com.example.shortener.config.ShortenerProperties;
++import org.springframework.boot.SpringApplication;
++import org.springframework.boot.autoconfigure.SpringBootApplication;
++import org.springframework.boot.context.properties.EnableConfigurationProperties;
++
++/** Entry point of the URL shortener service. */
++@SpringBootApplication
++@EnableConfigurationProperties(ShortenerProperties.class)
++public class UrlShortenerApplication {
++
++  public static void main(String[] args) {
++    SpringApplication.run(UrlShortenerApplication.class, args);
++  }
++}
+diff --git a/src/main/java/com/example/shortener/config/ShortenerProperties.java b/src/main/java/com/example/shortener/config/ShortenerProperties.java
+new file mode 100644
+index 0000000..d07aca6
+--- /dev/null
++++ b/src/main/java/com/example/shortener/config/ShortenerProperties.java
+@@ -0,0 +1,62 @@
++package com.example.shortener.config;
++
++import jakarta.validation.Valid;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Positive;
++import jakarta.validation.constraints.PositiveOrZero;
++import java.time.Duration;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.boot.context.properties.bind.DefaultValue;
++import org.springframework.validation.annotation.Validated;
++
++/**
++ * Typed configuration of the shortener, bound from the {@code shortener.*} keys.
++ *
++ * <p>This class is a leaf: it depends on nothing else inside the application.
++ *
++ * <ul>
++ *   <li>{@code shortener.base-url}: public base URL used to build short links (default {@value
++ *       #DEFAULT_BASE_URL}).
++ *   <li>{@code shortener.counter.batch-size}: number of counter values a write node reserves from
++ *       Redis in one round trip (default {@value #DEFAULT_COUNTER_BATCH_SIZE}).
++ *   <li>{@code shortener.counter.seed-offset}: value added to the global counter before encoding so
++ *       the first short codes are never trivially small (AMB-11, default {@value
++ *       #DEFAULT_COUNTER_SEED_OFFSET} = 62^5, i.e. every code is at least 6 base62 characters).
++ *   <li>{@code shortener.cache.default-ttl}: time a resolved mapping stays in the read cache when
++ *       the link carries no explicit expiry (AMB-9, default 24 hours).
++ * </ul>
++ *
++ * @param baseUrl public base URL, without trailing slash
++ * @param counter counter settings
++ * @param cache cache settings
++ */
++@Validated
++@ConfigurationProperties(prefix = "shortener")
++public record ShortenerProperties(
++    @DefaultValue(DEFAULT_BASE_URL) @NotBlank String baseUrl,
++    @DefaultValue @Valid @NotNull Counter counter,
++    @DefaultValue @Valid @NotNull Cache cache) {
++
++  public static final String DEFAULT_BASE_URL = "http://localhost:8080";
++  public static final long DEFAULT_COUNTER_BATCH_SIZE = 1_000L;
++  public static final long DEFAULT_COUNTER_SEED_OFFSET = 916_132_832L;
++  public static final Duration DEFAULT_CACHE_TTL = Duration.ofHours(24);
++
++  /**
++   * Counter allocation settings.
++   *
++   * @param batchSize counter values reserved per Redis round trip
++   * @param seedOffset offset added to the counter before encoding (AMB-11)
++   */
++  public record Counter(
++      @DefaultValue("1000") @Positive long batchSize,
++      @DefaultValue("916132832") @PositiveOrZero long seedOffset) {}
++
++  /**
++   * Read-cache settings.
++   *
++   * @param defaultTtl TTL applied to cached mappings without an explicit expiry (AMB-9)
++   */
++  public record Cache(@DefaultValue("24h") @NotNull Duration defaultTtl) {}
++}
+diff --git a/src/main/resources/application-read.yml b/src/main/resources/application-read.yml
+new file mode 100644
+index 0000000..2a762da
+--- /dev/null
++++ b/src/main/resources/application-read.yml
+@@ -0,0 +1,12 @@
++# Deployment profile `read`: the redirect surface (GET /{code}).
++# Activate with SPRING_PROFILES_ACTIVE=read. Only read-side beans (@Profile("read")) are registered;
++# the write API is not exposed by this deployment.
++# Read nodes are stateless and horizontally scalable; they consult the Redis cache first and fall
++# back to PostgreSQL on a miss, caching the result for shortener.cache.default-ttl (AMB-9).
++
++server:
++  port: ${SHORTENER_READ_PORT:8080}
++
++shortener:
++  cache:
++    default-ttl: ${SHORTENER_CACHE_DEFAULT_TTL:24h}
+diff --git a/src/main/resources/application-write.yml b/src/main/resources/application-write.yml
+new file mode 100644
+index 0000000..f6e7de8
+--- /dev/null
++++ b/src/main/resources/application-write.yml
+@@ -0,0 +1,14 @@
++# Deployment profile `write`: the management surface (create / lookup / delete short links).
++# Activate with SPRING_PROFILES_ACTIVE=write. Only write-side beans (@Profile("write")) are registered;
++# the redirect endpoint is not exposed by this deployment.
++# Write nodes allocate short codes from a global Redis counter in batches of
++# shortener.counter.batch-size and offset every value by shortener.counter.seed-offset (AMB-11).
++
++server:
++  port: ${SHORTENER_WRITE_PORT:8080}
++
++shortener:
++  base-url: ${SHORTENER_BASE_URL:http://localhost:8080}
++  counter:
++    batch-size: ${SHORTENER_COUNTER_BATCH_SIZE:1000}
++    seed-offset: ${SHORTENER_COUNTER_SEED_OFFSET:916132832}
+diff --git a/src/main/resources/application.yml b/src/main/resources/application.yml
+new file mode 100644
+index 0000000..91ad872
+--- /dev/null
++++ b/src/main/resources/application.yml
+@@ -0,0 +1,62 @@
++# Shared configuration for every deployment surface.
++# Deployment-specific overrides live in application-read.yml / application-write.yml (Spring profiles `read` / `write`).
++# No credentials are committed here: every secret is read from the environment, with local-only defaults.
++
++spring:
++  application:
++    name: url-shortener
++  datasource:
++    url: ${SHORTENER_DB_URL:jdbc:postgresql://localhost:5432/shortener}
++    username: ${SHORTENER_DB_USERNAME:shortener}
++    password: ${SHORTENER_DB_PASSWORD:shortener}
++  jpa:
++    open-in-view: false
++    hibernate:
++      ddl-auto: validate
++  flyway:
++    enabled: true
++  data:
++    redis:
++      host: ${SHORTENER_REDIS_HOST:localhost}
++      port: ${SHORTENER_REDIS_PORT:6379}
++
++server:
++  port: 8080
++
++springdoc:
++  api-docs:
++    path: /v3/api-docs
++  swagger-ui:
++    path: /swagger-ui.html
++
++# Typed into com.example.shortener.config.ShortenerProperties; the values below are the documented defaults.
++shortener:
++  base-url: ${SHORTENER_BASE_URL:http://localhost:8080}
++  counter:
++    batch-size: 1000
++    seed-offset: 916132832
++  cache:
++    default-ttl: 24h
++
++---
++# Profile `openapi`: boots the application without any infrastructure so the `it` Maven profile
++# (spring-boot:start + springdoc-openapi-maven-plugin) can dump /v3/api-docs into target/openapi.json.
++# Nothing here may be used for a real deployment; it exists only for the contract gate.
++spring:
++  config:
++    activate:
++      on-profile: openapi
++  flyway:
++    enabled: false
++  jpa:
++    database: postgresql
++    database-platform: org.hibernate.dialect.PostgreSQLDialect
++    hibernate:
++      ddl-auto: none
++    properties:
++      hibernate:
++        boot:
++          allow_jdbc_metadata_access: false
++  datasource:
++    hikari:
++      initialization-fail-timeout: -1
+diff --git a/src/test/java/com/example/shortener/config/ShortenerPropertiesTest.java b/src/test/java/com/example/shortener/config/ShortenerPropertiesTest.java
+new file mode 100644
+index 0000000..1022649
+--- /dev/null
++++ b/src/test/java/com/example/shortener/config/ShortenerPropertiesTest.java
+@@ -0,0 +1,99 @@
++package com.example.shortener.config;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.time.Duration;
++import java.util.Map;
++import org.junit.jupiter.api.Test;
++import org.springframework.boot.context.properties.EnableConfigurationProperties;
++import org.springframework.boot.context.properties.bind.Binder;
++import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
++import org.springframework.boot.test.context.runner.ApplicationContextRunner;
++import org.springframework.context.annotation.Configuration;
++
++/**
++ * AC-14 / AC-15: the documented configuration defaults bind without any infrastructure (no
++ * database, no Redis, no web server).
++ */
++class ShortenerPropertiesTest {
++
++  private static ShortenerProperties bind(Map<String, String> source) {
++    return new Binder(new MapConfigurationPropertySource(source))
++        .bindOrCreate("shortener", ShortenerProperties.class);
++  }
++
++  @Test
++  void ac14_defaultsApplyWhenNothingIsConfigured() {
++    ShortenerProperties props = bind(Map.of());
++
++    assertThat(props.baseUrl()).isEqualTo("http://localhost:8080");
++    assertThat(props.counter().batchSize()).isEqualTo(1000L);
++    assertThat(props.counter().seedOffset()).isEqualTo(916_132_832L);
++    assertThat(props.cache().defaultTtl()).isEqualTo(Duration.ofHours(24));
++  }
++
++  @Test
++  void ac14_defaultConstantsMatchBoundDefaults() {
++    ShortenerProperties props = bind(Map.of());
++
++    assertThat(props.baseUrl()).isEqualTo(ShortenerProperties.DEFAULT_BASE_URL);
++    assertThat(props.counter().batchSize())
++        .isEqualTo(ShortenerProperties.DEFAULT_COUNTER_BATCH_SIZE);
++    assertThat(props.counter().seedOffset())
++        .isEqualTo(ShortenerProperties.DEFAULT_COUNTER_SEED_OFFSET);
++    assertThat(props.cache().defaultTtl()).isEqualTo(ShortenerProperties.DEFAULT_CACHE_TTL);
++  }
++
++  @Test
++  void ac15_explicitValuesOverrideDefaults() {
++    ShortenerProperties props =
++        bind(
++            Map.of(
++                "shortener.base-url", "https://sho.rt",
++                "shortener.counter.batch-size", "250",
++                "shortener.counter.seed-offset", "42",
++                "shortener.cache.default-ttl", "15m"));
++
++    assertThat(props.baseUrl()).isEqualTo("https://sho.rt");
++    assertThat(props.counter().batchSize()).isEqualTo(250L);
++    assertThat(props.counter().seedOffset()).isEqualTo(42L);
++    assertThat(props.cache().defaultTtl()).isEqualTo(Duration.ofMinutes(15));
++  }
++
++  @Test
++  void ac15_partialOverrideKeepsRemainingDefaults() {
++    ShortenerProperties props = bind(Map.of("shortener.counter.batch-size", "10"));
++
++    assertThat(props.counter().batchSize()).isEqualTo(10L);
++    assertThat(props.counter().seedOffset()).isEqualTo(916_132_832L);
++    assertThat(props.baseUrl()).isEqualTo("http://localhost:8080");
++    assertThat(props.cache().defaultTtl()).isEqualTo(Duration.ofHours(24));
++  }
++
++  @Test
++  void ac15_bindsAsConfigurationPropertiesBeanWithoutInfrastructure() {
++    new ApplicationContextRunner()
++        .withUserConfiguration(PropertiesOnly.class)
++        .withPropertyValues("shortener.base-url=https://example.test")
++        .run(
++            context -> {
++              assertThat(context).hasSingleBean(ShortenerProperties.class);
++              ShortenerProperties props = context.getBean(ShortenerProperties.class);
++              assertThat(props.baseUrl()).isEqualTo("https://example.test");
++              assertThat(props.counter().batchSize()).isEqualTo(1000L);
++              assertThat(props.cache().defaultTtl()).isEqualTo(Duration.ofHours(24));
++            });
++  }
++
++  @Test
++  void ac15_rejectsInvalidValues() {
++    new ApplicationContextRunner()
++        .withUserConfiguration(PropertiesOnly.class)
++        .withPropertyValues("shortener.counter.batch-size=0")
++        .run(context -> assertThat(context).hasFailed());
++  }
++
++  @Configuration(proxyBeanMethods = false)
++  @EnableConfigurationProperties(ShortenerProperties.class)
++  static class PropertiesOnly {}
++}

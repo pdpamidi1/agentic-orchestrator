@@ -1,0 +1,1699 @@
+diff --git a/src/main/java/com/example/shortener/api/dto/CreateUrlRequest.java b/src/main/java/com/example/shortener/api/dto/CreateUrlRequest.java
+new file mode 100644
+index 0000000..f6a524e
+--- /dev/null
++++ b/src/main/java/com/example/shortener/api/dto/CreateUrlRequest.java
+@@ -0,0 +1,58 @@
++package com.example.shortener.api.dto;
++
++import com.fasterxml.jackson.annotation.JsonProperty;
++import jakarta.validation.constraints.Future;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.Pattern;
++import jakarta.validation.constraints.Size;
++import java.time.OffsetDateTime;
++
++/**
++ * Request body of {@code POST /api/v1/urls} (operationId {@code createShortUrl}).
++ *
++ * <p>JSON property names are snake_case. Bean Validation enforces the contract (AC-2, AC-5, AC-6):
++ *
++ * <ul>
++ *   <li>{@code long_url}: required, at most {@value #LONG_URL_MAX_LENGTH} characters, absolute
++ *       {@code http} or {@code https} URL.
++ *   <li>{@code custom_alias}: optional, {@code [0-9a-zA-Z]} with length {@value
++ *       #ALIAS_MIN_LENGTH}-{@value #ALIAS_MAX_LENGTH}.
++ *   <li>{@code expiration_date}: optional ISO-8601 date-time with offset; must lie in the future. A
++ *       malformed value is rejected while the body is read, before validation runs.
++ * </ul>
++ *
++ * @param longUrl the destination URL
++ * @param customAlias caller-chosen short code, or {@code null} to have one generated
++ * @param expirationDate moment after which the short link stops resolving, or {@code null} for no
++ *     expiry
++ */
++public record CreateUrlRequest(
++    @JsonProperty("long_url")
++        @NotBlank(message = "must not be blank")
++        @Size(max = LONG_URL_MAX_LENGTH, message = "must be at most 2048 characters")
++        @Pattern(
++            regexp = LONG_URL_PATTERN,
++            flags = Pattern.Flag.CASE_INSENSITIVE,
++            message = "must be an absolute http or https URL")
++        String longUrl,
++    @JsonProperty("custom_alias")
++        @Pattern(regexp = ALIAS_PATTERN, message = "must be 3 to 32 characters from [0-9a-zA-Z]")
++        String customAlias,
++    @JsonProperty("expiration_date") @Future(message = "must be in the future")
++        OffsetDateTime expirationDate) {
++
++  /** Maximum accepted length of {@code long_url}, in characters. */
++  public static final int LONG_URL_MAX_LENGTH = 2048;
++
++  /** Minimum length of {@code custom_alias}. */
++  public static final int ALIAS_MIN_LENGTH = 3;
++
++  /** Maximum length of {@code custom_alias}. */
++  public static final int ALIAS_MAX_LENGTH = 32;
++
++  /** Absolute http/https URL: scheme, {@code ://} and at least one non-whitespace character. */
++  public static final String LONG_URL_PATTERN = "^https?://\\S+$";
++
++  /** Alphanumeric alias of 3 to 32 characters. */
++  public static final String ALIAS_PATTERN = "^[0-9a-zA-Z]{3,32}$";
++}
+diff --git a/src/main/java/com/example/shortener/api/dto/CreateUrlResponse.java b/src/main/java/com/example/shortener/api/dto/CreateUrlResponse.java
+new file mode 100644
+index 0000000..c9b2b49
+--- /dev/null
++++ b/src/main/java/com/example/shortener/api/dto/CreateUrlResponse.java
+@@ -0,0 +1,25 @@
++package com.example.shortener.api.dto;
++
++import com.fasterxml.jackson.annotation.JsonProperty;
++import java.time.OffsetDateTime;
++
++/**
++ * Response body of {@code POST /api/v1/urls} (operationId {@code createShortUrl}), serialised in
++ * snake_case.
++ *
++ * <p>{@code code_source} is the textual value persisted in {@code urls.code_source} ({@code
++ * "redis"} or {@code "db_sequence"}); this package deliberately does not depend on the domain enum
++ * so the API layer stays a leaf.
++ *
++ * @param shortUrl absolute short link (configured base URL plus the short code)
++ * @param shortCode the short code, generated or the custom alias
++ * @param longUrl the destination URL as stored
++ * @param expiresAt expiry moment, or {@code null} when the link does not expire
++ * @param codeSource origin of the short code ({@code "redis"} or {@code "db_sequence"})
++ */
++public record CreateUrlResponse(
++    @JsonProperty("short_url") String shortUrl,
++    @JsonProperty("short_code") String shortCode,
++    @JsonProperty("long_url") String longUrl,
++    @JsonProperty("expires_at") OffsetDateTime expiresAt,
++    @JsonProperty("code_source") String codeSource) {}
+diff --git a/src/main/java/com/example/shortener/api/error/AliasAlreadyExistsException.java b/src/main/java/com/example/shortener/api/error/AliasAlreadyExistsException.java
+new file mode 100644
+index 0000000..9ea0ded
+--- /dev/null
++++ b/src/main/java/com/example/shortener/api/error/AliasAlreadyExistsException.java
+@@ -0,0 +1,23 @@
++package com.example.shortener.api.error;
++
++/**
++ * Thrown when a custom alias or generated short code is already present in the {@code urls} table.
++ * Rendered as {@code 409 Conflict} by {@link GlobalExceptionHandler}.
++ */
++public class AliasAlreadyExistsException extends RuntimeException {
++
++  private final String shortCode;
++
++  /**
++   * @param shortCode the alias / short code that is already taken
++   */
++  public AliasAlreadyExistsException(String shortCode) {
++    super("Short code '" + shortCode + "' is already taken");
++    this.shortCode = shortCode;
++  }
++
++  /** The alias / short code that is already taken. */
++  public String getShortCode() {
++    return shortCode;
++  }
++}
+diff --git a/src/main/java/com/example/shortener/api/error/GlobalExceptionHandler.java b/src/main/java/com/example/shortener/api/error/GlobalExceptionHandler.java
+new file mode 100644
+index 0000000..4926454
+--- /dev/null
++++ b/src/main/java/com/example/shortener/api/error/GlobalExceptionHandler.java
+@@ -0,0 +1,252 @@
++package com.example.shortener.api.error;
++
++import java.net.URI;
++import java.util.Comparator;
++import java.util.stream.Collectors;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.HttpStatusCode;
++import org.springframework.http.ProblemDetail;
++import org.springframework.http.ResponseEntity;
++import org.springframework.http.converter.HttpMessageNotReadableException;
++import org.springframework.validation.FieldError;
++import org.springframework.web.bind.MethodArgumentNotValidException;
++import org.springframework.web.bind.annotation.ExceptionHandler;
++import org.springframework.web.bind.annotation.RestControllerAdvice;
++import org.springframework.web.context.request.ServletWebRequest;
++import org.springframework.web.context.request.WebRequest;
++import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
++
++/**
++ * Single source of every non-2xx response body (AC-16, ADR-008).
++ *
++ * <p>Every error is rendered as an RFC 9457 {@link ProblemDetail} with Content-Type {@code
++ * application/problem+json} and the fields {@code type}, {@code title}, {@code status}, {@code
++ * detail} and {@code instance}. {@code type} is a stable URN of the form {@code
++ * urn:shortener:problem:<slug>}; {@code instance} is the request path. No stack trace, exception
++ * class name, SQL, connection string or other internal identifier is ever written to the body;
++ * unhandled errors are logged server-side with their stack trace and answered with a generic {@code
++ * 500} problem.
++ *
++ * <ul>
++ *   <li>{@code 400}: Bean Validation failures on the request body, unreadable / malformed JSON
++ *       (including malformed ISO-8601 dates) and {@link InvalidUrlException}
++ *   <li>{@code 404}: {@link ShortCodeNotFoundException}
++ *   <li>{@code 409}: {@link AliasAlreadyExistsException}
++ *   <li>{@code 410}: {@link ShortCodeExpiredException}
++ *   <li>{@code 500}: any other {@link Throwable}
++ * </ul>
++ *
++ * <p>Framework exceptions handled by {@link ResponseEntityExceptionHandler} (405, 406, 415, ...)
++ * keep Spring's default title/detail but are normalised to the same {@code type} scheme.
++ */
++@RestControllerAdvice
++public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
++
++  private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
++
++  /** Prefix of every problem {@code type} URN emitted by this handler. */
++  public static final String TYPE_PREFIX = "urn:shortener:problem:";
++
++  public static final URI TYPE_VALIDATION_ERROR = type("validation-error");
++  public static final URI TYPE_MALFORMED_BODY = type("malformed-request-body");
++  public static final URI TYPE_INVALID_URL = type("invalid-url");
++  public static final URI TYPE_NOT_FOUND = type("short-code-not-found");
++  public static final URI TYPE_ALIAS_CONFLICT = type("alias-already-exists");
++  public static final URI TYPE_EXPIRED = type("short-code-expired");
++  public static final URI TYPE_INTERNAL_ERROR = type("internal-error");
++
++  static final String TITLE_VALIDATION_ERROR = "Validation failed";
++  static final String TITLE_MALFORMED_BODY = "Malformed request body";
++  static final String TITLE_INVALID_URL = "Invalid URL";
++  static final String TITLE_NOT_FOUND = "Short code not found";
++  static final String TITLE_ALIAS_CONFLICT = "Alias already exists";
++  static final String TITLE_EXPIRED = "Short code expired";
++  static final String TITLE_INTERNAL_ERROR = "Internal server error";
++
++  static final String DETAIL_MALFORMED_BODY =
++      "The request body could not be read. It must be a JSON object matching the documented"
++          + " schema; date-time fields use ISO-8601 with an offset, e.g. 2030-01-01T00:00:00Z.";
++  static final String DETAIL_INTERNAL_ERROR =
++      "An unexpected error occurred while processing the request.";
++
++  // ---------------------------------------------------------------------------------------------
++  // 400
++  // ---------------------------------------------------------------------------------------------
++
++  /** Bean Validation failures on a {@code @Valid @RequestBody}: one line per rejected field. */
++  @Override
++  protected ResponseEntity<Object> handleMethodArgumentNotValid(
++      MethodArgumentNotValidException ex,
++      HttpHeaders headers,
++      HttpStatusCode status,
++      WebRequest request) {
++    String detail =
++        ex.getBindingResult().getFieldErrors().stream()
++            .sorted(
++                Comparator.comparing(FieldError::getField)
++                    .thenComparing(
++                        FieldError::getDefaultMessage,
++                        Comparator.nullsLast(Comparator.naturalOrder())))
++            .map(fe -> toSnakeCase(fe.getField()) + ": " + safeMessage(fe))
++            .collect(Collectors.joining("; "));
++    if (detail.isBlank()) {
++      detail = "The request body failed validation.";
++    }
++    ProblemDetail body =
++        problem(HttpStatus.BAD_REQUEST, TYPE_VALIDATION_ERROR, TITLE_VALIDATION_ERROR, detail);
++    return handleExceptionInternal(ex, body, headers, HttpStatus.BAD_REQUEST, request);
++  }
++
++  /**
++   * Unreadable body: invalid JSON, wrong JSON type, or a value such as a malformed ISO-8601 {@code
++   * expiration_date} that cannot be converted. The parser message is never echoed.
++   */
++  @Override
++  protected ResponseEntity<Object> handleHttpMessageNotReadable(
++      HttpMessageNotReadableException ex,
++      HttpHeaders headers,
++      HttpStatusCode status,
++      WebRequest request) {
++    ProblemDetail body =
++        problem(
++            HttpStatus.BAD_REQUEST,
++            TYPE_MALFORMED_BODY,
++            TITLE_MALFORMED_BODY,
++            DETAIL_MALFORMED_BODY);
++    return handleExceptionInternal(ex, body, headers, HttpStatus.BAD_REQUEST, request);
++  }
++
++  /** Semantic URL / expiry rejection raised by a service. */
++  @ExceptionHandler(InvalidUrlException.class)
++  public ResponseEntity<Object> handleInvalidUrl(InvalidUrlException ex, WebRequest request) {
++    return respond(
++        problem(HttpStatus.BAD_REQUEST, TYPE_INVALID_URL, TITLE_INVALID_URL, ex.getMessage()),
++        request);
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // 404 / 409 / 410
++  // ---------------------------------------------------------------------------------------------
++
++  @ExceptionHandler(ShortCodeNotFoundException.class)
++  public ResponseEntity<Object> handleShortCodeNotFound(
++      ShortCodeNotFoundException ex, WebRequest request) {
++    return respond(
++        problem(HttpStatus.NOT_FOUND, TYPE_NOT_FOUND, TITLE_NOT_FOUND, ex.getMessage()), request);
++  }
++
++  @ExceptionHandler(AliasAlreadyExistsException.class)
++  public ResponseEntity<Object> handleAliasAlreadyExists(
++      AliasAlreadyExistsException ex, WebRequest request) {
++    return respond(
++        problem(HttpStatus.CONFLICT, TYPE_ALIAS_CONFLICT, TITLE_ALIAS_CONFLICT, ex.getMessage()),
++        request);
++  }
++
++  @ExceptionHandler(ShortCodeExpiredException.class)
++  public ResponseEntity<Object> handleShortCodeExpired(
++      ShortCodeExpiredException ex, WebRequest request) {
++    return respond(problem(HttpStatus.GONE, TYPE_EXPIRED, TITLE_EXPIRED, ex.getMessage()), request);
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // 500
++  // ---------------------------------------------------------------------------------------------
++
++  /**
++   * Last resort: anything not mapped above. The throwable is logged with its stack trace; the
++   * client receives a fixed, generic problem.
++   */
++  @ExceptionHandler(Throwable.class)
++  public ResponseEntity<Object> handleUnexpected(Throwable ex, WebRequest request) {
++    log.error("Unhandled error while processing {}", request.getDescription(false), ex);
++    return respond(
++        problem(
++            HttpStatus.INTERNAL_SERVER_ERROR,
++            TYPE_INTERNAL_ERROR,
++            TITLE_INTERNAL_ERROR,
++            DETAIL_INTERNAL_ERROR),
++        request);
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // Normalisation of everything that leaves this handler
++  // ---------------------------------------------------------------------------------------------
++
++  /**
++   * Applied to every response produced by the base class as well: guarantees {@code instance} is
++   * the request path and {@code type} is never the RFC default {@code about:blank}.
++   */
++  @Override
++  protected ResponseEntity<Object> createResponseEntity(
++      Object body, HttpHeaders headers, HttpStatusCode statusCode, WebRequest request) {
++    if (body instanceof ProblemDetail problem) {
++      normalise(problem, request);
++    }
++    return super.createResponseEntity(body, headers, statusCode, request);
++  }
++
++  private ResponseEntity<Object> respond(ProblemDetail problem, WebRequest request) {
++    normalise(problem, request);
++    return ResponseEntity.status(problem.getStatus()).body(problem);
++  }
++
++  private static void normalise(ProblemDetail problem, WebRequest request) {
++    if (problem.getInstance() == null) {
++      problem.setInstance(instanceOf(request));
++    }
++    if (problem.getType() == null || "about:blank".equals(problem.getType().toString())) {
++      HttpStatus status = HttpStatus.resolve(problem.getStatus());
++      String slug =
++          status == null
++              ? "http-" + problem.getStatus()
++              : status.name().toLowerCase().replace('_', '-');
++      problem.setType(type(slug));
++    }
++  }
++
++  private static ProblemDetail problem(HttpStatus status, URI type, String title, String detail) {
++    ProblemDetail problem = ProblemDetail.forStatusAndDetail(status, detail);
++    problem.setType(type);
++    problem.setTitle(title);
++    return problem;
++  }
++
++  private static URI instanceOf(WebRequest request) {
++    if (request instanceof ServletWebRequest servletRequest) {
++      try {
++        return URI.create(servletRequest.getRequest().getRequestURI());
++      } catch (IllegalArgumentException ignored) {
++        // Fall through: an unparseable path is simply not reported as instance.
++      }
++    }
++    return null;
++  }
++
++  private static URI type(String slug) {
++    return URI.create(TYPE_PREFIX + slug);
++  }
++
++  /** Constraint messages are authored in the DTO and safe to return; never expose anything else. */
++  private static String safeMessage(FieldError error) {
++    String message = error.getDefaultMessage();
++    return message == null || message.isBlank() ? "is invalid" : message;
++  }
++
++  /** Maps a Java property name ({@code longUrl}) to its JSON name ({@code long_url}). */
++  static String toSnakeCase(String property) {
++    StringBuilder out = new StringBuilder(property.length() + 4);
++    for (int i = 0; i < property.length(); i++) {
++      char c = property.charAt(i);
++      if (Character.isUpperCase(c)) {
++        out.append('_').append(Character.toLowerCase(c));
++      } else {
++        out.append(c);
++      }
++    }
++    return out.toString();
++  }
++}
+diff --git a/src/main/java/com/example/shortener/api/error/InvalidUrlException.java b/src/main/java/com/example/shortener/api/error/InvalidUrlException.java
+new file mode 100644
+index 0000000..e250624
+--- /dev/null
++++ b/src/main/java/com/example/shortener/api/error/InvalidUrlException.java
+@@ -0,0 +1,17 @@
++package com.example.shortener.api.error;
++
++/**
++ * Thrown for semantic URL or expiry rejections detected outside Bean Validation (for example a URL
++ * that matches the syntactic pattern but cannot be used). Rendered as {@code 400 Bad Request} by
++ * {@link GlobalExceptionHandler}; the message becomes the problem {@code detail}, so it must be
++ * safe to show to the caller.
++ */
++public class InvalidUrlException extends RuntimeException {
++
++  /**
++   * @param message caller-facing reason for the rejection
++   */
++  public InvalidUrlException(String message) {
++    super(message);
++  }
++}
+diff --git a/src/main/java/com/example/shortener/api/error/ShortCodeExpiredException.java b/src/main/java/com/example/shortener/api/error/ShortCodeExpiredException.java
+new file mode 100644
+index 0000000..f77fe38
+--- /dev/null
++++ b/src/main/java/com/example/shortener/api/error/ShortCodeExpiredException.java
+@@ -0,0 +1,23 @@
++package com.example.shortener.api.error;
++
++/**
++ * Thrown when the resolved mapping's {@code expires_at} lies in the past. Rendered as {@code 410
++ * Gone} by {@link GlobalExceptionHandler}.
++ */
++public class ShortCodeExpiredException extends RuntimeException {
++
++  private final String shortCode;
++
++  /**
++   * @param shortCode the expired short code
++   */
++  public ShortCodeExpiredException(String shortCode) {
++    super("Short code '" + shortCode + "' has expired");
++    this.shortCode = shortCode;
++  }
++
++  /** The expired short code. */
++  public String getShortCode() {
++    return shortCode;
++  }
++}
+diff --git a/src/main/java/com/example/shortener/api/error/ShortCodeNotFoundException.java b/src/main/java/com/example/shortener/api/error/ShortCodeNotFoundException.java
+new file mode 100644
+index 0000000..e741729
+--- /dev/null
++++ b/src/main/java/com/example/shortener/api/error/ShortCodeNotFoundException.java
+@@ -0,0 +1,23 @@
++package com.example.shortener.api.error;
++
++/**
++ * Thrown when a short code exists in neither the cache nor the database. Rendered as {@code 404 Not
++ * Found} by {@link GlobalExceptionHandler}.
++ */
++public class ShortCodeNotFoundException extends RuntimeException {
++
++  private final String shortCode;
++
++  /**
++   * @param shortCode the unknown short code
++   */
++  public ShortCodeNotFoundException(String shortCode) {
++    super("Short code '" + shortCode + "' does not exist");
++    this.shortCode = shortCode;
++  }
++
++  /** The unknown short code. */
++  public String getShortCode() {
++    return shortCode;
++  }
++}
+diff --git a/src/main/java/com/example/shortener/domain/CodeSource.java b/src/main/java/com/example/shortener/domain/CodeSource.java
+new file mode 100644
+index 0000000..70353ca
+--- /dev/null
++++ b/src/main/java/com/example/shortener/domain/CodeSource.java
+@@ -0,0 +1,56 @@
++package com.example.shortener.domain;
++
++import jakarta.persistence.AttributeConverter;
++import jakarta.persistence.Converter;
++
++/**
++ * Where a short code's counter value came from. Persisted in {@code urls.code_source} as the
++ * lower-case {@link #dbValue()} ({@code 'redis'} or {@code 'db_sequence'}), never as the enum
++ * ordinal or name.
++ */
++public enum CodeSource {
++  /** Counter value reserved from the Redis batch counter (normal path). */
++  REDIS("redis"),
++  /** Counter value taken from the Postgres sequence {@code url_code_seq} (Redis fallback). */
++  DB_SEQUENCE("db_sequence");
++
++  private final String dbValue;
++
++  CodeSource(String dbValue) {
++    this.dbValue = dbValue;
++  }
++
++  /** Value stored in the {@code urls.code_source} column. */
++  public String dbValue() {
++    return dbValue;
++  }
++
++  /**
++   * Resolves the persisted column value back to the enum constant.
++   *
++   * @throws IllegalArgumentException if {@code dbValue} is not a known column value
++   */
++  public static CodeSource fromDbValue(String dbValue) {
++    for (CodeSource source : values()) {
++      if (source.dbValue.equals(dbValue)) {
++        return source;
++      }
++    }
++    throw new IllegalArgumentException("Unknown code_source value: " + dbValue);
++  }
++
++  /** JPA converter mapping {@link CodeSource} to its {@link #dbValue()}. */
++  @Converter(autoApply = true)
++  public static class JpaConverter implements AttributeConverter<CodeSource, String> {
++
++    @Override
++    public String convertToDatabaseColumn(CodeSource attribute) {
++      return attribute == null ? null : attribute.dbValue();
++    }
++
++    @Override
++    public CodeSource convertToEntityAttribute(String dbData) {
++      return dbData == null ? null : CodeSource.fromDbValue(dbData);
++    }
++  }
++}
+diff --git a/src/main/java/com/example/shortener/domain/UrlMapping.java b/src/main/java/com/example/shortener/domain/UrlMapping.java
+new file mode 100644
+index 0000000..f8dd8dd
+--- /dev/null
++++ b/src/main/java/com/example/shortener/domain/UrlMapping.java
+@@ -0,0 +1,144 @@
++package com.example.shortener.domain;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Convert;
++import jakarta.persistence.Entity;
++import jakarta.persistence.Id;
++import jakarta.persistence.Table;
++import java.time.Instant;
++import java.util.Objects;
++
++/**
++ * A short code mapped to its long URL. Mapped 1:1 onto the {@code urls} table created by {@code
++ * V1__create_urls_table.sql}.
++ *
++ * <p>{@code created_by} is nullable and always {@code null} in this scenario (no authentication);
++ * the column exists so the schema does not need to change when ownership is introduced.
++ */
++@Entity
++@Table(name = "urls")
++public class UrlMapping {
++
++  /** Maximum length of a short code, as declared by {@code urls.short_code}. */
++  public static final int SHORT_CODE_MAX_LENGTH = 32;
++
++  /** Maximum length of a long URL, as declared by {@code urls.long_url}. */
++  public static final int LONG_URL_MAX_LENGTH = 2048;
++
++  @Id
++  @Column(name = "short_code", length = SHORT_CODE_MAX_LENGTH, nullable = false, updatable = false)
++  private String shortCode;
++
++  @Column(name = "long_url", length = LONG_URL_MAX_LENGTH, nullable = false)
++  private String longUrl;
++
++  @Column(name = "created_at", nullable = false, updatable = false)
++  private Instant createdAt;
++
++  @Column(name = "expires_at")
++  private Instant expiresAt;
++
++  @Column(name = "created_by")
++  private String createdBy;
++
++  @Convert(converter = CodeSource.JpaConverter.class)
++  @Column(name = "code_source", length = 16, nullable = false, updatable = false)
++  private CodeSource codeSource;
++
++  /** JPA only. */
++  protected UrlMapping() {}
++
++  /**
++   * Creates a new mapping without an owner ({@code created_by} stays {@code null}).
++   *
++   * @param shortCode the allocated short code (primary key)
++   * @param longUrl the destination URL
++   * @param createdAt creation instant
++   * @param expiresAt expiry instant, or {@code null} for a link that never expires
++   * @param codeSource where the code's counter value came from
++   */
++  public UrlMapping(
++      String shortCode,
++      String longUrl,
++      Instant createdAt,
++      Instant expiresAt,
++      CodeSource codeSource) {
++    this.shortCode = Objects.requireNonNull(shortCode, "shortCode");
++    this.longUrl = Objects.requireNonNull(longUrl, "longUrl");
++    this.createdAt = Objects.requireNonNull(createdAt, "createdAt");
++    this.expiresAt = expiresAt;
++    this.createdBy = null;
++    this.codeSource = Objects.requireNonNull(codeSource, "codeSource");
++  }
++
++  /**
++   * Whether this mapping is expired at {@code now}.
++   *
++   * <p>A mapping is expired at and after its {@code expires_at} instant (the expiry instant itself
++   * is already expired). A mapping without {@code expires_at} never expires.
++   */
++  public boolean isExpired(Instant now) {
++    Objects.requireNonNull(now, "now");
++    return expiresAt != null && !now.isBefore(expiresAt);
++  }
++
++  /** Whether this mapping carries an explicit expiry. */
++  public boolean hasExpiry() {
++    return expiresAt != null;
++  }
++
++  public String getShortCode() {
++    return shortCode;
++  }
++
++  public String getLongUrl() {
++    return longUrl;
++  }
++
++  public Instant getCreatedAt() {
++    return createdAt;
++  }
++
++  /** Expiry instant, or {@code null} when the link never expires. */
++  public Instant getExpiresAt() {
++    return expiresAt;
++  }
++
++  /** Owner of the mapping; always {@code null} in this scenario. */
++  public String getCreatedBy() {
++    return createdBy;
++  }
++
++  public CodeSource getCodeSource() {
++    return codeSource;
++  }
++
++  @Override
++  public boolean equals(Object o) {
++    if (this == o) {
++      return true;
++    }
++    if (!(o instanceof UrlMapping other)) {
++      return false;
++    }
++    return shortCode != null && shortCode.equals(other.shortCode);
++  }
++
++  @Override
++  public int hashCode() {
++    return Objects.hashCode(shortCode);
++  }
++
++  @Override
++  public String toString() {
++    return "UrlMapping{shortCode='"
++        + shortCode
++        + "', createdAt="
++        + createdAt
++        + ", expiresAt="
++        + expiresAt
++        + ", codeSource="
++        + codeSource
++        + '}';
++  }
++}
+diff --git a/src/main/java/com/example/shortener/domain/UrlMappingRepository.java b/src/main/java/com/example/shortener/domain/UrlMappingRepository.java
+new file mode 100644
+index 0000000..ced4b15
+--- /dev/null
++++ b/src/main/java/com/example/shortener/domain/UrlMappingRepository.java
+@@ -0,0 +1,25 @@
++package com.example.shortener.domain;
++
++import java.util.Optional;
++import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Query;
++
++/** Spring Data JPA access to the {@code urls} table and the fallback counter sequence. */
++public interface UrlMappingRepository extends JpaRepository<UrlMapping, String> {
++
++  /** Name of the Postgres sequence backing {@link #nextCodeSequenceValue()}. */
++  String CODE_SEQUENCE_NAME = "url_code_seq";
++
++  /** Whether a mapping with the given short code already exists. */
++  boolean existsByShortCode(String shortCode);
++
++  /** Looks up a mapping by its short code. */
++  Optional<UrlMapping> findByShortCode(String shortCode);
++
++  /**
++   * Reserves the next value of the fallback counter sequence {@code url_code_seq}. Used by the
++   * short-code allocator when Redis is unavailable ({@link CodeSource#DB_SEQUENCE}).
++   */
++  @Query(value = "SELECT nextval('url_code_seq')", nativeQuery = true)
++  long nextCodeSequenceValue();
++}
+diff --git a/src/main/resources/db/migration/V1__create_urls_table.sql b/src/main/resources/db/migration/V1__create_urls_table.sql
+new file mode 100644
+index 0000000..54c76c7
+--- /dev/null
++++ b/src/main/resources/db/migration/V1__create_urls_table.sql
+@@ -0,0 +1,29 @@
++-- V1: url mappings table and the database fallback counter sequence.
++--
++-- urls: one row per short code. Mapped 1:1 by com.example.shortener.domain.UrlMapping
++-- (Hibernate runs with ddl-auto=validate, so entity and DDL must stay in sync).
++--
++-- url_code_seq: fallback counter used by the short-code allocator when Redis is unavailable
++-- (code_source = 'db_sequence'). It is seeded past the AMB-11 seed offset (62^5 = 916132832,
++-- see shortener.counter.seed-offset) so every value it yields already encodes to at least
++-- 6 base62 characters and never overlaps the trivially small range.
++
++CREATE TABLE urls (
++    short_code   VARCHAR(32)   NOT NULL,
++    long_url     VARCHAR(2048) NOT NULL,
++    created_at   TIMESTAMPTZ   NOT NULL,
++    expires_at   TIMESTAMPTZ   NULL,
++    created_by   VARCHAR(255)  NULL,
++    code_source  VARCHAR(16)   NOT NULL,
++    CONSTRAINT pk_urls PRIMARY KEY (short_code),
++    CONSTRAINT ck_urls_code_source CHECK (code_source IN ('redis', 'db_sequence'))
++);
++
++-- Supports expiry lookups / purges ("WHERE expires_at <= now()"); rows without expiry are skipped.
++CREATE INDEX idx_urls_expires_at ON urls (expires_at) WHERE expires_at IS NOT NULL;
++
++CREATE SEQUENCE url_code_seq
++    AS BIGINT
++    START WITH 916132833
++    INCREMENT BY 1
++    NO CYCLE;
+diff --git a/src/test/java/com/example/shortener/api/dto/CreateUrlRequestValidationTest.java b/src/test/java/com/example/shortener/api/dto/CreateUrlRequestValidationTest.java
+new file mode 100644
+index 0000000..db8348e
+--- /dev/null
++++ b/src/test/java/com/example/shortener/api/dto/CreateUrlRequestValidationTest.java
+@@ -0,0 +1,291 @@
++package com.example.shortener.api.dto;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import jakarta.validation.ConstraintViolation;
++import jakarta.validation.Validation;
++import jakarta.validation.Validator;
++import jakarta.validation.ValidatorFactory;
++import java.time.OffsetDateTime;
++import java.time.ZoneOffset;
++import java.util.Set;
++import java.util.stream.Collectors;
++import org.junit.jupiter.api.AfterAll;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import tools.jackson.core.JacksonException;
++import tools.jackson.databind.JsonNode;
++import tools.jackson.databind.json.JsonMapper;
++
++/**
++ * AC-2 / AC-5 / AC-6: Bean Validation rules of {@link CreateUrlRequest} and the JSON contract of
++ * both DTOs, exercised without a Spring context.
++ */
++class CreateUrlRequestValidationTest {
++
++  private static final String VALID_URL = "https://example.com/some/path?q=1";
++  private static final OffsetDateTime FUTURE = OffsetDateTime.now(ZoneOffset.UTC).plusDays(1);
++  private static final OffsetDateTime PAST = OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(1);
++
++  private static ValidatorFactory factory;
++  private static Validator validator;
++  private static final JsonMapper JSON = JsonMapper.builder().build();
++
++  @BeforeAll
++  static void setUp() {
++    factory = Validation.buildDefaultValidatorFactory();
++    validator = factory.getValidator();
++  }
++
++  @AfterAll
++  static void tearDown() {
++    factory.close();
++  }
++
++  private static Set<String> violatedProperties(CreateUrlRequest request) {
++    return validator.validate(request).stream()
++        .map(ConstraintViolation::getPropertyPath)
++        .map(Object::toString)
++        .collect(Collectors.toSet());
++  }
++
++  // ------------------------------------------------------------------ valid input
++
++  @Test
++  void validRequestWithAllFieldsHasNoViolations() {
++    CreateUrlRequest request = new CreateUrlRequest(VALID_URL, "promo2024", FUTURE);
++
++    assertThat(validator.validate(request)).isEmpty();
++  }
++
++  @Test
++  void validRequestWithOnlyLongUrlHasNoViolations() {
++    CreateUrlRequest request = new CreateUrlRequest("http://example.com", null, null);
++
++    assertThat(validator.validate(request)).isEmpty();
++  }
++
++  @Test
++  void schemeIsCaseInsensitive() {
++    assertThat(validator.validate(new CreateUrlRequest("HTTPS://example.com", null, null)))
++        .isEmpty();
++  }
++
++  // ------------------------------------------------------------------ AC-2: long_url
++
++  @Test
++  void ac2_ftpSchemeIsRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest("ftp://example.com/file", null, null)))
++        .containsExactly("longUrl");
++  }
++
++  @Test
++  void ac2_schemeRelativeAndSchemelessUrlsAreRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest("//example.com", null, null)))
++        .containsExactly("longUrl");
++    assertThat(violatedProperties(new CreateUrlRequest("example.com/path", null, null)))
++        .containsExactly("longUrl");
++    assertThat(violatedProperties(new CreateUrlRequest("javascript:alert(1)", null, null)))
++        .containsExactly("longUrl");
++  }
++
++  @Test
++  void ac2_schemeWithoutHostIsRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest("https://", null, null)))
++        .containsExactly("longUrl");
++  }
++
++  @Test
++  void ac2_urlContainingWhitespaceIsRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest("https://exa mple.com", null, null)))
++        .containsExactly("longUrl");
++  }
++
++  @Test
++  void ac2_blankAndNullLongUrlAreRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest("", null, null))).containsExactly("longUrl");
++    assertThat(violatedProperties(new CreateUrlRequest("   ", null, null)))
++        .containsExactly("longUrl");
++    assertThat(violatedProperties(new CreateUrlRequest(null, null, null)))
++        .containsExactly("longUrl");
++  }
++
++  @Test
++  void ac2_longUrlAbove2048CharactersIsRejected() {
++    String prefix = "https://example.com/";
++    String tooLong = prefix + "a".repeat(2049 - prefix.length());
++    assertThat(tooLong).hasSize(2049);
++
++    assertThat(violatedProperties(new CreateUrlRequest(tooLong, null, null)))
++        .containsExactly("longUrl");
++  }
++
++  @Test
++  void ac2_longUrlOfExactly2048CharactersIsAccepted() {
++    String prefix = "https://example.com/";
++    String maxLength = prefix + "a".repeat(2048 - prefix.length());
++    assertThat(maxLength).hasSize(CreateUrlRequest.LONG_URL_MAX_LENGTH);
++
++    assertThat(validator.validate(new CreateUrlRequest(maxLength, null, null))).isEmpty();
++  }
++
++  // ------------------------------------------------------------------ AC-5: custom_alias
++
++  @Test
++  void ac5_aliasWithCharactersOutsideAlphanumericIsRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, "promo-2024", null)))
++        .containsExactly("customAlias");
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, "promo_2024", null)))
++        .containsExactly("customAlias");
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, "prömo", null)))
++        .containsExactly("customAlias");
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, "pro mo", null)))
++        .containsExactly("customAlias");
++  }
++
++  @Test
++  void ac5_aliasOfLength2IsRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, "ab", null)))
++        .containsExactly("customAlias");
++  }
++
++  @Test
++  void ac5_aliasOfLength33IsRejected() {
++    String alias = "a".repeat(33);
++
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, alias, null)))
++        .containsExactly("customAlias");
++  }
++
++  @Test
++  void ac5_aliasBoundaryLengths3And32AreAccepted() {
++    assertThat(validator.validate(new CreateUrlRequest(VALID_URL, "abc", null))).isEmpty();
++    assertThat(validator.validate(new CreateUrlRequest(VALID_URL, "Z9".repeat(16), null)))
++        .isEmpty();
++  }
++
++  @Test
++  void ac5_emptyAliasIsRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, "", null)))
++        .containsExactly("customAlias");
++  }
++
++  // ------------------------------------------------------------------ AC-6: expiration_date
++
++  @Test
++  void ac6_pastExpirationDateIsRejected() {
++    assertThat(violatedProperties(new CreateUrlRequest(VALID_URL, null, PAST)))
++        .containsExactly("expirationDate");
++  }
++
++  @Test
++  void ac6_futureExpirationDateIsAccepted() {
++    assertThat(validator.validate(new CreateUrlRequest(VALID_URL, null, FUTURE))).isEmpty();
++  }
++
++  @Test
++  void ac6_malformedExpirationDateFailsToDeserialise() {
++    String json =
++        """
++        {"long_url":"https://example.com","expiration_date":"not-a-date"}
++        """;
++
++    assertThatThrownBy(() -> JSON.readValue(json, CreateUrlRequest.class))
++        .isInstanceOf(JacksonException.class);
++  }
++
++  @Test
++  void ac6_dateWithoutOffsetFailsToDeserialise() {
++    String json =
++        """
++        {"long_url":"https://example.com","expiration_date":"2030-01-01T00:00:00"}
++        """;
++
++    assertThatThrownBy(() -> JSON.readValue(json, CreateUrlRequest.class))
++        .isInstanceOf(JacksonException.class);
++  }
++
++  @Test
++  void ac6_iso8601OffsetDateTimeIsParsed() {
++    String json =
++        """
++        {"long_url":"https://example.com","custom_alias":"abc",
++         "expiration_date":"2030-01-01T12:30:00+02:00"}
++        """;
++
++    CreateUrlRequest request = JSON.readValue(json, CreateUrlRequest.class);
++
++    assertThat(request.longUrl()).isEqualTo("https://example.com");
++    assertThat(request.customAlias()).isEqualTo("abc");
++    assertThat(request.expirationDate())
++        .isNotNull()
++        .satisfies(
++            date ->
++                assertThat(date.toInstant())
++                    .isEqualTo(OffsetDateTime.parse("2030-01-01T12:30:00+02:00").toInstant()));
++  }
++
++  // ------------------------------------------------------------------ JSON contract
++
++  @Test
++  void requestUsesSnakeCaseJsonNames() {
++    String json =
++        """
++        {"long_url":"https://example.com","custom_alias":"abc","expiration_date":null}
++        """;
++
++    CreateUrlRequest request = JSON.readValue(json, CreateUrlRequest.class);
++
++    assertThat(request.longUrl()).isEqualTo("https://example.com");
++    assertThat(request.customAlias()).isEqualTo("abc");
++    assertThat(request.expirationDate()).isNull();
++  }
++
++  @Test
++  void requestIgnoresCamelCaseNames() {
++    String json =
++        """
++        {"longUrl":"https://example.com","customAlias":"abc"}
++        """;
++
++    CreateUrlRequest request = JSON.readValue(json, CreateUrlRequest.class);
++
++    assertThat(request.longUrl()).isNull();
++    assertThat(request.customAlias()).isNull();
++  }
++
++  @Test
++  void responseSerialisesInSnakeCaseWithIsoDates() {
++    OffsetDateTime expiresAt = OffsetDateTime.parse("2030-01-01T00:00:00Z");
++    CreateUrlResponse response =
++        new CreateUrlResponse(
++            "http://localhost:8080/abc123", "abc123", "https://example.com", expiresAt, "redis");
++
++    JsonNode node = JSON.readTree(JSON.writeValueAsString(response));
++
++    assertThat(node.get("short_url").asString()).isEqualTo("http://localhost:8080/abc123");
++    assertThat(node.get("short_code").asString()).isEqualTo("abc123");
++    assertThat(node.get("long_url").asString()).isEqualTo("https://example.com");
++    assertThat(node.get("code_source").asString()).isEqualTo("redis");
++    assertThat(node.get("expires_at").isString()).isTrue();
++    assertThat(OffsetDateTime.parse(node.get("expires_at").asString()).toInstant())
++        .isEqualTo(expiresAt.toInstant());
++    assertThat(node.propertyNames())
++        .containsExactlyInAnyOrder(
++            "short_url", "short_code", "long_url", "expires_at", "code_source");
++  }
++
++  @Test
++  void responseWithoutExpiryKeepsExpiresAtNull() {
++    CreateUrlResponse response =
++        new CreateUrlResponse(
++            "http://localhost:8080/abc123", "abc123", "https://example.com", null, "db_sequence");
++
++    JsonNode node = JSON.readTree(JSON.writeValueAsString(response));
++
++    assertThat(node.has("expires_at")).isTrue();
++    assertThat(node.get("expires_at").isNull()).isTrue();
++    assertThat(node.get("code_source").asString()).isEqualTo("db_sequence");
++  }
++}
+diff --git a/src/test/java/com/example/shortener/api/error/GlobalExceptionHandlerTest.java b/src/test/java/com/example/shortener/api/error/GlobalExceptionHandlerTest.java
+new file mode 100644
+index 0000000..c07dc85
+--- /dev/null
++++ b/src/test/java/com/example/shortener/api/error/GlobalExceptionHandlerTest.java
+@@ -0,0 +1,333 @@
++package com.example.shortener.api.error;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.example.shortener.api.dto.CreateUrlRequest;
++import jakarta.validation.Valid;
++import org.hamcrest.Matchers;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.MvcResult;
++import org.springframework.test.web.servlet.ResultActions;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.ResponseStatus;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * AC-2 / AC-5 / AC-6 / AC-16: every mapped exception is rendered by {@link GlobalExceptionHandler}
++ * as {@code application/problem+json} with the consistent field set {@code type}, {@code title},
++ * {@code status}, {@code detail}, {@code instance} and without internal details.
++ *
++ * <p>Uses a standalone MockMvc with a stub controller so that no production controller (T5/T6) is
++ * required.
++ */
++class GlobalExceptionHandlerTest {
++
++  private static final String INTERNAL_SECRET = "jdbc:postgresql://db:5432/shortener?password=s3";
++
++  private MockMvc mvc;
++
++  @BeforeEach
++  void setUp() {
++    mvc =
++        MockMvcBuilders.standaloneSetup(new ThrowingController())
++            .setControllerAdvice(new GlobalExceptionHandler())
++            .build();
++  }
++
++  // ------------------------------------------------------------------ AC-2 / AC-5 / AC-6: 400
++
++  @Test
++  void ac2_invalidLongUrlYields400ValidationProblem() throws Exception {
++    postJson("{\"long_url\":\"ftp://example.com/file\"}")
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:validation-error"))
++        .andExpect(jsonPath("$.title").value("Validation failed"))
++        .andExpect(jsonPath("$.status").value(400))
++        .andExpect(jsonPath("$.detail").value(Matchers.containsString("long_url:")))
++        .andExpect(jsonPath("$.detail").value(Matchers.containsString("http or https")))
++        .andExpect(jsonPath("$.instance").value("/api/v1/urls"));
++  }
++
++  @Test
++  void ac2_blankLongUrlYields400() throws Exception {
++    postJson("{\"long_url\":\"\"}")
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:validation-error"))
++        .andExpect(jsonPath("$.detail").value(Matchers.containsString("long_url:")));
++  }
++
++  @Test
++  void ac2_missingLongUrlYields400() throws Exception {
++    postJson("{}")
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson())
++        .andExpect(
++            jsonPath("$.detail").value(Matchers.containsString("long_url: must not be blank")));
++  }
++
++  @Test
++  void ac2_longUrlAbove2048CharactersYields400() throws Exception {
++    String url = "https://example.com/" + "a".repeat(2049 - "https://example.com/".length());
++
++    postJson("{\"long_url\":\"" + url + "\"}")
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.detail").value(Matchers.containsString("at most 2048")));
++  }
++
++  @Test
++  void ac5_invalidAliasYields400WithSnakeCaseFieldName() throws Exception {
++    postJson("{\"long_url\":\"https://example.com\",\"custom_alias\":\"bad-alias!\"}")
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:validation-error"))
++        .andExpect(jsonPath("$.status").value(400))
++        .andExpect(jsonPath("$.detail").value(Matchers.containsString("custom_alias:")))
++        .andExpect(
++            jsonPath("$.detail").value(Matchers.not(Matchers.containsString("customAlias"))));
++  }
++
++  @Test
++  void ac5_aliasTooShortAndTooLongYield400() throws Exception {
++    postJson("{\"long_url\":\"https://example.com\",\"custom_alias\":\"ab\"}")
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson());
++    postJson("{\"long_url\":\"https://example.com\",\"custom_alias\":\"" + "a".repeat(33) + "\"}")
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson());
++  }
++
++  @Test
++  void ac6_pastExpirationDateYields400() throws Exception {
++    postJson("{\"long_url\":\"https://example.com\",\"expiration_date\":\"2000-01-01T00:00:00Z\"}")
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:validation-error"))
++        .andExpect(jsonPath("$.detail").value("expiration_date: must be in the future"));
++  }
++
++  @Test
++  void ac6_malformedExpirationDateYields400MalformedBodyProblem() throws Exception {
++    postJson("{\"long_url\":\"https://example.com\",\"expiration_date\":\"tomorrow\"}")
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:malformed-request-body"))
++        .andExpect(jsonPath("$.title").value("Malformed request body"))
++        .andExpect(jsonPath("$.status").value(400))
++        .andExpect(jsonPath("$.detail").value(Matchers.containsString("ISO-8601")))
++        .andExpect(jsonPath("$.instance").value("/api/v1/urls"))
++        // Parser internals (class names, source location) must not leak.
++        .andExpect(jsonPath("$.detail").value(Matchers.not(Matchers.containsString("java.time"))))
++        .andExpect(jsonPath("$.detail").value(Matchers.not(Matchers.containsString("Jackson"))));
++  }
++
++  @Test
++  void unreadableJsonBodyYields400MalformedBodyProblem() throws Exception {
++    postJson("{\"long_url\": ")
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:malformed-request-body"))
++        .andExpect(jsonPath("$.status").value(400));
++  }
++
++  @Test
++  void invalidUrlExceptionYields400() throws Exception {
++    mvc.perform(get("/throw/invalid-url"))
++        .andExpect(status().isBadRequest())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:invalid-url"))
++        .andExpect(jsonPath("$.title").value("Invalid URL"))
++        .andExpect(jsonPath("$.status").value(400))
++        .andExpect(jsonPath("$.detail").value("URL host is not allowed"))
++        .andExpect(jsonPath("$.instance").value("/throw/invalid-url"));
++  }
++
++  // ------------------------------------------------------------------ AC-16: 404 / 409 / 410
++
++  @Test
++  void ac16_shortCodeNotFoundYields404() throws Exception {
++    mvc.perform(get("/throw/not-found"))
++        .andExpect(status().isNotFound())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:short-code-not-found"))
++        .andExpect(jsonPath("$.title").value("Short code not found"))
++        .andExpect(jsonPath("$.status").value(404))
++        .andExpect(jsonPath("$.detail").value("Short code 'nope42' does not exist"))
++        .andExpect(jsonPath("$.instance").value("/throw/not-found"));
++  }
++
++  @Test
++  void ac16_aliasAlreadyExistsYields409() throws Exception {
++    mvc.perform(get("/throw/conflict"))
++        .andExpect(status().isConflict())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:alias-already-exists"))
++        .andExpect(jsonPath("$.title").value("Alias already exists"))
++        .andExpect(jsonPath("$.status").value(409))
++        .andExpect(jsonPath("$.detail").value("Short code 'promo2024' is already taken"))
++        .andExpect(jsonPath("$.instance").value("/throw/conflict"));
++  }
++
++  @Test
++  void ac16_shortCodeExpiredYields410() throws Exception {
++    mvc.perform(get("/throw/expired"))
++        .andExpect(status().isGone())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:short-code-expired"))
++        .andExpect(jsonPath("$.title").value("Short code expired"))
++        .andExpect(jsonPath("$.status").value(410))
++        .andExpect(jsonPath("$.detail").value("Short code 'old123' has expired"))
++        .andExpect(jsonPath("$.instance").value("/throw/expired"));
++  }
++
++  // ------------------------------------------------------------------ AC-16: 500
++
++  @Test
++  void ac16_unhandledExceptionYields500WithoutInternalDetails() throws Exception {
++    MvcResult result =
++        mvc.perform(get("/throw/boom"))
++            .andExpect(status().isInternalServerError())
++            .andExpect(problemJson())
++            .andExpect(jsonPath("$.type").value("urn:shortener:problem:internal-error"))
++            .andExpect(jsonPath("$.title").value("Internal server error"))
++            .andExpect(jsonPath("$.status").value(500))
++            .andExpect(
++                jsonPath("$.detail")
++                    .value("An unexpected error occurred while processing the request."))
++            .andExpect(jsonPath("$.instance").value("/throw/boom"))
++            .andReturn();
++
++    String body = result.getResponse().getContentAsString();
++    assertThat(body)
++        .doesNotContain(INTERNAL_SECRET)
++        .doesNotContain("IllegalStateException")
++        .doesNotContain("stackTrace")
++        .doesNotContain("trace")
++        .doesNotContain("exception")
++        .doesNotContain("at com.example");
++  }
++
++  @Test
++  void ac16_unhandledErrorSubclassIsAlsoRenderedAs500() throws Exception {
++    mvc.perform(get("/throw/error"))
++        .andExpect(status().isInternalServerError())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:internal-error"))
++        .andExpect(jsonPath("$.status").value(500));
++  }
++
++  // ------------------------------------------------------------------ AC-16: consistency
++
++  @Test
++  void ac16_everyProblemCarriesExactlyTheDocumentedFields() throws Exception {
++    for (String path :
++        new String[] {
++          "/throw/invalid-url",
++          "/throw/not-found",
++          "/throw/conflict",
++          "/throw/expired",
++          "/throw/boom"
++        }) {
++      mvc.perform(get(path))
++          .andExpect(problemJson())
++          .andExpect(jsonPath("$.type").isString())
++          .andExpect(jsonPath("$.title").isString())
++          .andExpect(jsonPath("$.status").isNumber())
++          .andExpect(jsonPath("$.detail").isString())
++          .andExpect(jsonPath("$.instance").value(path))
++          .andExpect(jsonPath("$.*", Matchers.hasSize(5)));
++    }
++  }
++
++  @Test
++  void ac16_frameworkHandledErrorsUseTheSameTypeSchemeAndInstance() throws Exception {
++    // 405 comes from ResponseEntityExceptionHandler, not from one of our @ExceptionHandler methods.
++    mvc.perform(get("/api/v1/urls"))
++        .andExpect(status().isMethodNotAllowed())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.type").value("urn:shortener:problem:method-not-allowed"))
++        .andExpect(jsonPath("$.status").value(405))
++        .andExpect(jsonPath("$.instance").value("/api/v1/urls"));
++  }
++
++  @Test
++  void problemIsReturnedEvenWhenClientAcceptsOnlyApplicationJson() throws Exception {
++    mvc.perform(get("/throw/not-found").accept(MediaType.APPLICATION_JSON))
++        .andExpect(status().isNotFound())
++        .andExpect(problemJson())
++        .andExpect(jsonPath("$.status").value(404));
++  }
++
++  @Test
++  void toSnakeCaseMapsJavaPropertyNamesToJsonNames() {
++    assertThat(GlobalExceptionHandler.toSnakeCase("longUrl")).isEqualTo("long_url");
++    assertThat(GlobalExceptionHandler.toSnakeCase("customAlias")).isEqualTo("custom_alias");
++    assertThat(GlobalExceptionHandler.toSnakeCase("expirationDate")).isEqualTo("expiration_date");
++    assertThat(GlobalExceptionHandler.toSnakeCase("plain")).isEqualTo("plain");
++  }
++
++  // ------------------------------------------------------------------ helpers
++
++  private ResultActions postJson(String body) throws Exception {
++    return mvc.perform(post("/api/v1/urls").contentType(MediaType.APPLICATION_JSON).content(body));
++  }
++
++  private static org.springframework.test.web.servlet.ResultMatcher problemJson() {
++    return content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON);
++  }
++
++  /** Stub endpoints that raise each mapped exception; replaced by the real controllers in T5/T6. */
++  @RestController
++  static class ThrowingController {
++
++    @PostMapping("/api/v1/urls")
++    @ResponseStatus(HttpStatus.CREATED)
++    String create(@Valid @RequestBody CreateUrlRequest request) {
++      return "created";
++    }
++
++    @GetMapping("/throw/invalid-url")
++    String invalidUrl() {
++      throw new InvalidUrlException("URL host is not allowed");
++    }
++
++    @GetMapping("/throw/not-found")
++    String notFound() {
++      throw new ShortCodeNotFoundException("nope42");
++    }
++
++    @GetMapping("/throw/conflict")
++    String conflict() {
++      throw new AliasAlreadyExistsException("promo2024");
++    }
++
++    @GetMapping("/throw/expired")
++    String expired() {
++      throw new ShortCodeExpiredException("old123");
++    }
++
++    @GetMapping("/throw/boom")
++    String boom() {
++      throw new IllegalStateException("connection failed: " + INTERNAL_SECRET);
++    }
++
++    @GetMapping("/throw/error")
++    String error() {
++      throw new AssertionError("invariant broken: " + INTERNAL_SECRET);
++    }
++  }
++}
+diff --git a/src/test/java/com/example/shortener/domain/MigrationScriptTest.java b/src/test/java/com/example/shortener/domain/MigrationScriptTest.java
+new file mode 100644
+index 0000000..4fee472
+--- /dev/null
++++ b/src/test/java/com/example/shortener/domain/MigrationScriptTest.java
+@@ -0,0 +1,132 @@
++package com.example.shortener.domain;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.io.IOException;
++import java.lang.reflect.Method;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Locale;
++import java.util.regex.Pattern;
++import java.util.stream.Stream;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.springframework.data.jpa.repository.Query;
++
++/**
++ * AC-1 / AC-11 / AC-15: the Flyway migration creating the {@code urls} table and the fallback
++ * sequence exists and declares every column and object the entity and repository rely on. Runs
++ * against the SQL text only; no database or container is needed.
++ */
++class MigrationScriptTest {
++
++  private static final Path MIGRATIONS = Path.of("src/main/resources/db/migration");
++  private static final Path V1 = MIGRATIONS.resolve("V1__create_urls_table.sql");
++
++  /** AMB-11 seed offset (62^5): the sequence must start strictly after it. */
++  private static final long SEED_OFFSET = 916_132_832L;
++
++  private static String sql;
++
++  @BeforeAll
++  static void readMigration() throws IOException {
++    assertThat(V1).as("migration file").isRegularFile();
++    sql = Files.readString(V1);
++  }
++
++  private static String normalised() {
++    return sql.replaceAll("\\s+", " ").toLowerCase(Locale.ROOT);
++  }
++
++  @Test
++  void ac1_migrationIsTheFirstFlywayVersion() throws IOException {
++    assertThat(V1.getFileName().toString()).matches("V1__[A-Za-z0-9_]+\\.sql");
++
++    try (Stream<Path> files = Files.list(MIGRATIONS)) {
++      List<String> names = files.map(p -> p.getFileName().toString()).sorted().toList();
++      assertThat(names).contains("V1__create_urls_table.sql");
++      assertThat(names).allMatch(n -> n.matches("V\\d+(_\\d+)*__[A-Za-z0-9_]+\\.sql"));
++      assertThat(names.stream().filter(n -> n.startsWith("V1__")).count())
++          .as("exactly one V1 migration")
++          .isEqualTo(1);
++    }
++  }
++
++  @Test
++  void ac1_createsUrlsTableWithShortCodePrimaryKey() {
++    String n = normalised();
++
++    assertThat(n).contains("create table urls");
++    assertThat(n).containsPattern("primary key \\(\\s*short_code\\s*\\)");
++    assertThat(n).containsPattern("short_code\\s+varchar\\(32\\)\\s+not null");
++  }
++
++  @Test
++  void ac1_declaresEveryColumnOfTheDataModelSlice() {
++    String n = normalised();
++
++    assertThat(n).containsPattern("long_url\\s+varchar\\(2048\\)\\s+not null");
++    assertThat(n).containsPattern("created_at\\s+timestamptz\\s+not null");
++    assertThat(n).containsPattern("expires_at\\s+timestamptz\\s+null");
++    assertThat(n).containsPattern("created_by\\s+varchar(\\(\\d+\\))?\\s+null");
++    assertThat(n).containsPattern("code_source\\s+varchar(\\(\\d+\\))?\\s+not null");
++  }
++
++  @Test
++  void ac15_codeSourceIsConstrainedToTheEnumDbValues() {
++    String n = normalised();
++
++    assertThat(n).containsPattern("check \\(\\s*code_source in \\(");
++    for (CodeSource source : CodeSource.values()) {
++      assertThat(n).contains("'" + source.dbValue() + "'");
++    }
++  }
++
++  @Test
++  void ac11_createsIndexSupportingExpiryLookups() {
++    String n = normalised();
++
++    assertThat(n).containsPattern("create index \\w+ on urls \\(\\s*expires_at\\s*\\)");
++  }
++
++  @Test
++  void ac15_createsFallbackSequenceSeededPastTheSeedOffset() {
++    String n = normalised();
++    var m = Pattern.compile("create sequence url_code_seq.*?start with (\\d+)").matcher(n);
++
++    assertThat(m.find()).as("CREATE SEQUENCE url_code_seq ... START WITH <n>").isTrue();
++    assertThat(Long.parseLong(m.group(1))).isGreaterThan(SEED_OFFSET);
++    assertThat(n).contains("create sequence url_code_seq");
++  }
++
++  @Test
++  void ac15_repositoryNextvalTargetsTheMigratedSequence() throws NoSuchMethodException {
++    Method next = UrlMappingRepository.class.getMethod("nextCodeSequenceValue");
++    Query query = next.getAnnotation(Query.class);
++
++    assertThat(query).isNotNull();
++    assertThat(query.nativeQuery()).isTrue();
++    assertThat(query.value().toLowerCase(Locale.ROOT))
++        .contains("nextval('" + UrlMappingRepository.CODE_SEQUENCE_NAME + "')");
++    assertThat(normalised()).contains("create sequence " + UrlMappingRepository.CODE_SEQUENCE_NAME);
++  }
++
++  @Test
++  void ac1_repositoryExposesLookupsByShortCode() throws NoSuchMethodException {
++    assertThat(
++            UrlMappingRepository.class.getMethod("existsByShortCode", String.class).getReturnType())
++        .isEqualTo(boolean.class);
++    assertThat(
++            UrlMappingRepository.class.getMethod("findByShortCode", String.class).getReturnType())
++        .isEqualTo(java.util.Optional.class);
++  }
++
++  @Test
++  void ac1_migrationHasNoSecretsOrUnsafeStatements() {
++    String n = normalised();
++
++    assertThat(n).doesNotContain("drop table");
++    assertThat(n).doesNotContain("password");
++  }
++}
+diff --git a/src/test/java/com/example/shortener/domain/UrlMappingTest.java b/src/test/java/com/example/shortener/domain/UrlMappingTest.java
+new file mode 100644
+index 0000000..191c2d3
+--- /dev/null
++++ b/src/test/java/com/example/shortener/domain/UrlMappingTest.java
+@@ -0,0 +1,178 @@
++package com.example.shortener.domain;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.Id;
++import jakarta.persistence.Table;
++import java.lang.reflect.Field;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.Arrays;
++import java.util.Map;
++import java.util.stream.Collectors;
++import org.junit.jupiter.api.Test;
++
++/**
++ * AC-1 / AC-11 / AC-15: entity expiry logic, code-source persistence values and the 1:1 column
++ * mapping, all without a database.
++ */
++class UrlMappingTest {
++
++  private static final Instant CREATED = Instant.parse("2026-09-13T10:00:00Z");
++  private static final Instant EXPIRES = Instant.parse("2026-09-14T10:00:00Z");
++
++  private static UrlMapping mapping(Instant expiresAt) {
++    return new UrlMapping(
++        "abc123", "https://example.com/very/long", CREATED, expiresAt, CodeSource.REDIS);
++  }
++
++  // --- AC-11: expiry -------------------------------------------------------------------------
++
++  @Test
++  void ac11_notExpiredBeforeExpiresAt() {
++    UrlMapping m = mapping(EXPIRES);
++
++    assertThat(m.isExpired(EXPIRES.minusMillis(1))).isFalse();
++    assertThat(m.isExpired(CREATED)).isFalse();
++    assertThat(m.hasExpiry()).isTrue();
++  }
++
++  @Test
++  void ac11_expiredExactlyAtExpiresAt() {
++    UrlMapping m = mapping(EXPIRES);
++
++    assertThat(m.isExpired(EXPIRES)).isTrue();
++  }
++
++  @Test
++  void ac11_expiredAfterExpiresAt() {
++    UrlMapping m = mapping(EXPIRES);
++
++    assertThat(m.isExpired(EXPIRES.plusMillis(1))).isTrue();
++    assertThat(m.isExpired(EXPIRES.plus(Duration.ofDays(365)))).isTrue();
++  }
++
++  @Test
++  void ac11_neverExpiresWithoutExpiresAt() {
++    UrlMapping m = mapping(null);
++
++    assertThat(m.hasExpiry()).isFalse();
++    assertThat(m.getExpiresAt()).isNull();
++    assertThat(m.isExpired(CREATED)).isFalse();
++    assertThat(m.isExpired(Instant.MAX)).isFalse();
++  }
++
++  @Test
++  void ac11_isExpiredRejectsNullNow() {
++    assertThatThrownBy(() -> mapping(EXPIRES).isExpired(null))
++        .isInstanceOf(NullPointerException.class);
++  }
++
++  // --- AC-1: creation state --------------------------------------------------------------------
++
++  @Test
++  void ac1_constructorStoresAllColumnsAndCreatedByIsNull() {
++    UrlMapping m =
++        new UrlMapping("k7Yx2A", "https://example.com/a", CREATED, EXPIRES, CodeSource.DB_SEQUENCE);
++
++    assertThat(m.getShortCode()).isEqualTo("k7Yx2A");
++    assertThat(m.getLongUrl()).isEqualTo("https://example.com/a");
++    assertThat(m.getCreatedAt()).isEqualTo(CREATED);
++    assertThat(m.getExpiresAt()).isEqualTo(EXPIRES);
++    assertThat(m.getCodeSource()).isEqualTo(CodeSource.DB_SEQUENCE);
++    assertThat(m.getCreatedBy()).isNull();
++  }
++
++  @Test
++  void ac1_requiredFieldsAreMandatory() {
++    assertThatThrownBy(() -> new UrlMapping(null, "https://e.com", CREATED, null, CodeSource.REDIS))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new UrlMapping("abc", null, CREATED, null, CodeSource.REDIS))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new UrlMapping("abc", "https://e.com", null, null, CodeSource.REDIS))
++        .isInstanceOf(NullPointerException.class);
++    assertThatThrownBy(() -> new UrlMapping("abc", "https://e.com", CREATED, null, null))
++        .isInstanceOf(NullPointerException.class);
++  }
++
++  @Test
++  void ac1_identityIsTheShortCode() {
++    UrlMapping a = new UrlMapping("same", "https://a.com", CREATED, null, CodeSource.REDIS);
++    UrlMapping b =
++        new UrlMapping("same", "https://b.com", EXPIRES, EXPIRES, CodeSource.DB_SEQUENCE);
++    UrlMapping c = new UrlMapping("other", "https://a.com", CREATED, null, CodeSource.REDIS);
++
++    assertThat(a).isEqualTo(b).hasSameHashCodeAs(b).isNotEqualTo(c);
++    assertThat(a.toString()).contains("same").doesNotContain("https://a.com");
++  }
++
++  // --- AC-15: code source persisted as 'redis' | 'db_sequence' --------------------------------
++
++  @Test
++  void ac15_codeSourceDbValues() {
++    assertThat(CodeSource.REDIS.dbValue()).isEqualTo("redis");
++    assertThat(CodeSource.DB_SEQUENCE.dbValue()).isEqualTo("db_sequence");
++    assertThat(CodeSource.values()).containsExactly(CodeSource.REDIS, CodeSource.DB_SEQUENCE);
++  }
++
++  @Test
++  void ac15_codeSourceRoundTripsThroughDbValue() {
++    for (CodeSource source : CodeSource.values()) {
++      assertThat(CodeSource.fromDbValue(source.dbValue())).isSameAs(source);
++    }
++    assertThatThrownBy(() -> CodeSource.fromDbValue("REDIS"))
++        .isInstanceOf(IllegalArgumentException.class);
++    assertThatThrownBy(() -> CodeSource.fromDbValue("sequence"))
++        .isInstanceOf(IllegalArgumentException.class);
++  }
++
++  @Test
++  void ac15_jpaConverterStoresDbValueNotNameOrOrdinal() {
++    CodeSource.JpaConverter converter = new CodeSource.JpaConverter();
++
++    assertThat(converter.convertToDatabaseColumn(CodeSource.REDIS)).isEqualTo("redis");
++    assertThat(converter.convertToDatabaseColumn(CodeSource.DB_SEQUENCE)).isEqualTo("db_sequence");
++    assertThat(converter.convertToDatabaseColumn(null)).isNull();
++    assertThat(converter.convertToEntityAttribute("redis")).isEqualTo(CodeSource.REDIS);
++    assertThat(converter.convertToEntityAttribute("db_sequence")).isEqualTo(CodeSource.DB_SEQUENCE);
++    assertThat(converter.convertToEntityAttribute(null)).isNull();
++  }
++
++  // --- AC-1: JPA mapping is 1:1 with the migration columns ------------------------------------
++
++  @Test
++  void ac1_entityIsMappedToUrlsTableWithShortCodeAsId() throws NoSuchFieldException {
++    assertThat(UrlMapping.class.isAnnotationPresent(Entity.class)).isTrue();
++    assertThat(UrlMapping.class.getAnnotation(Table.class).name()).isEqualTo("urls");
++
++    Field id = UrlMapping.class.getDeclaredField("shortCode");
++    assertThat(id.isAnnotationPresent(Id.class)).isTrue();
++    assertThat(id.getAnnotation(Column.class).name()).isEqualTo("short_code");
++    assertThat(id.getAnnotation(Column.class).length()).isEqualTo(32);
++  }
++
++  @Test
++  void ac1_columnNamesMatchTheMigration() {
++    Map<String, Column> columns =
++        Arrays.stream(UrlMapping.class.getDeclaredFields())
++            .filter(f -> f.isAnnotationPresent(Column.class))
++            .collect(Collectors.toMap(Field::getName, f -> f.getAnnotation(Column.class)));
++
++    assertThat(columns.keySet())
++        .containsExactlyInAnyOrder(
++            "shortCode", "longUrl", "createdAt", "expiresAt", "createdBy", "codeSource");
++    assertThat(columns.values().stream().map(Column::name))
++        .containsExactlyInAnyOrder(
++            "short_code", "long_url", "created_at", "expires_at", "created_by", "code_source");
++
++    assertThat(columns.get("longUrl").length()).isEqualTo(2048);
++    assertThat(columns.get("longUrl").nullable()).isFalse();
++    assertThat(columns.get("createdAt").nullable()).isFalse();
++    assertThat(columns.get("codeSource").nullable()).isFalse();
++    assertThat(columns.get("expiresAt").nullable()).isTrue();
++    assertThat(columns.get("createdBy").nullable()).isTrue();
++  }
++}
