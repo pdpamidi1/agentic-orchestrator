@@ -24,43 +24,51 @@ The whole project is self-contained: a Maven wrapper, Flyway migrations and Test
 | Docker Engine (or Docker Desktop) | Postgres + Redis for running, Testcontainers for `-Pit verify` | `docker version` |
 | Network access to Maven Central and Docker Hub on the first build | dependencies and base images | |
 
-```bash
-# 1. clone (this project lives inside the agentic-orchestrator repository)
-git clone https://github.com/<your-org>/agentic-orchestrator.git
-cd agentic-orchestrator/workspace/url-shortener
-
-# 2. compile and run the unit tests (no Docker needed; ~1 minute on first run while Maven downloads)
-./mvnw -q test
-
-# 3. run the full verification the pipeline's gates run: formatting, architecture test, unit + integration tests
-#    (integration tests start Postgres and Redis containers via Testcontainers; needs Docker)
-./mvnw -q spotless:check
-./mvnw -q -Dtest=ArchitectureTest test
-./mvnw -q -Pit verify
-
-# 4a. run the application with the one-command stack from the orchestrator repository (recommended)
-cd ../..                     # repository root
-make shortener-up            # Postgres :5433, Redis :6380, app :8081 (builds this project's Dockerfile)
-make shortener-logs          # wait for "Started UrlShortenerApplication"
-
-# 4b. or run it standalone against your own Postgres and Redis (see "Running locally" below)
-cd workspace/url-shortener
-SHORTENER_DB_URL=jdbc:postgresql://localhost:5432/shortener SHORTENER_DB_USERNAME=shortener \
-SHORTENER_DB_PASSWORD=shortener SHORTENER_REDIS_HOST=localhost ./mvnw spring-boot:run
-
-# 5. try it (port 8081 with the compose stack, 8080 standalone)
-curl -s -X POST localhost:8081/api/v1/urls -H 'content-type: application/json' \
-     -d '{"long_url":"https://example.com/a/very/long/path"}'
-#   -> 201 {"short_url":"http://localhost:8081/100001","short_code":"100001",...}
-curl -si localhost:8081/100001        # 302, Location: https://example.com/a/very/long/path
-curl -si localhost:8081/nope          # 404 application/problem+json
-open http://localhost:8081/swagger-ui.html
-
-# 6. look at the data (compose stack)
-cd ../.. && make shortener-psql       # select short_code, long_url, code_source, expires_at from urls;
-make shortener-redis                  # keys shortener:*   /   get shortener:url:100001
-make shortener-down
-```
+1. **Clone** (this project lives inside the agentic-orchestrator repository):
+   ```bash
+   git clone https://github.com/<your-org>/agentic-orchestrator.git
+   cd agentic-orchestrator/workspace/url-shortener
+   ```
+2. **Compile and run the unit tests** — no Docker needed; the first run downloads Maven (~1 min):
+   ```bash
+   ./mvnw -q test
+   ```
+3. **Run the full verification** the pipeline's gates run (integration tests start PostgreSQL, Redis and Kafka
+   through Testcontainers, so Docker must be up; ~10 min):
+   ```bash
+   ./mvnw -q spotless:check                 # formatting
+   ./mvnw -q -Dtest=ArchitectureTest test   # layering rules
+   ./mvnw -q -Pit verify                    # unit + integration + the OpenAPI parity dump
+   ```
+4. **Start it.** Either the one-command stack from the orchestrator repository (recommended):
+   ```bash
+   cd ../..                     # repository root
+   make shortener-up            # PostgreSQL :5433, Redis :6380, Kafka :9094, app :8081
+   make shortener-logs          # wait for "Started UrlShortenerApplication", then Ctrl-C
+   ```
+   …or standalone against your own PostgreSQL and Redis (see [Running locally](#running-locally)), which serves
+   on `:8080`:
+   ```bash
+   cd workspace/url-shortener
+   SHORTENER_DB_URL=jdbc:postgresql://localhost:5432/shortener SHORTENER_DB_USERNAME=shortener \
+   SHORTENER_DB_PASSWORD=shortener SHORTENER_REDIS_HOST=localhost ./mvnw spring-boot:run
+   ```
+5. **Try it** (port 8081 with the compose stack, 8080 standalone):
+   ```bash
+   curl -s -X POST localhost:8081/api/v1/urls -H 'content-type: application/json' \
+        -d '{"long_url":"https://example.com/a/very/long/path"}'
+   #   -> 201 {"short_url":"http://localhost:8081/100001","short_code":"100001",...}
+   curl -si localhost:8081/100001        # -> 302, Location: https://example.com/a/very/long/path
+   curl -si localhost:8081/nope          # -> 404 application/problem+json
+   open http://localhost:8081/swagger-ui.html
+   ```
+6. **Look at the data** (compose stack, from the repository root):
+   ```bash
+   make shortener-psql       # then: select short_code, long_url, code_source, expires_at from urls;
+   make shortener-redis      # then: keys shortener:*   /   get shortener:url:100001
+   make shortener-kafka      # tail the url.clicked topic
+   make shortener-down       # stop everything
+   ```
 
 Troubleshooting:
 
@@ -74,6 +82,36 @@ Troubleshooting:
   database sequence (`code_source = db_sequence`); see [docs/operations.md](docs/operations.md).
 
 Design rationale, ADRs and the layering rules: [docs/DESIGN.md](docs/DESIGN.md).
+
+## Trying the API in Swagger UI
+
+A running instance serves the interactive documentation itself — no file to import, no client to install:
+
+| What | Path | Notes |
+|---|---|---|
+| Swagger UI | `/swagger-ui.html` | `http://localhost:8081/swagger-ui.html` with `make shortener-up`, `http://localhost:8080/swagger-ui.html` standalone or `docker run` |
+| Live document (JSON) | `/v3/api-docs` | generated by springdoc from the beans that are actually registered |
+| Live document (YAML) | `/v3/api-docs.yaml` | the exact content `OpenApiContractIT` compares with the committed [`src/main/resources/openapi.yaml`](src/main/resources/openapi.yaml) |
+
+1. Open Swagger UI on the port your instance uses. Three operations are listed, grouped by tag: **urls**
+   (`createShortUrl`), **redirect** (`redirectToLongUrl`) and **analytics** (`getUrlClickStats`).
+2. Expand `POST /api/v1/urls` → **Try it out** → edit the example body → **Execute**. The response pane shows the
+   `201` body with `short_code` and `code_source`, and the `curl` equivalent it just ran.
+3. Paste that `short_code` into `GET /api/v1/urls/{short_code}/stats` → **Execute** to see the click aggregates
+   (`0` / `null` / `[]` until the link is used, and they lag the redirect by the analytics pipeline's latency).
+4. For `GET /{short_code}`, the browser follows the `302` before Swagger UI can show it, so the response pane
+   reflects the destination rather than the redirect. To inspect the redirect itself use
+   `curl -si localhost:8081/<short_code>`, which shows the `Location` and `Cache-Control: private` headers.
+
+Two things worth knowing:
+
+- **Try it out targets the host you loaded the UI from**, because the UI reads the live document rather than the
+  committed file. The `servers: http://localhost:8080` entry in the committed `openapi.yaml` is just the port the
+  `-Pit` build dumped it on.
+- **The UI reflects the deployment surface.** A `SPRING_PROFILES_ACTIVE=read` instance registers only the redirect
+  controller, so that is the only operation listed (and the other two answer `404`); a `write` instance lists
+  `createShortUrl` and `getUrlClickStats` but not the redirect. See
+  [Deployment model: Spring profiles](#deployment-model-spring-profiles).
 
 ## Endpoints
 
@@ -205,16 +243,18 @@ Every successful redirect is counted, asynchronously and without ever storing a 
 address. The pipeline is a transactional outbox relayed to Kafka and aggregated by an in-process
 consumer; [`docs/analytics.md`](docs/analytics.md) is the detailed reference.
 
-```
-GET /{short_code} ──302──▶ client
-       │  same transaction as the lookup
-       ▼
- click_outbox (PENDING)  ──OutboxPoller (scheduler thread, never a request thread)──▶  Kafka url.clicked
-                                                                                          │
-                                                             ClickEventConsumer ◀─────────┘
-                                                                     │  one transaction: processed_click_event dedupe + upserts
-                                                                     ▼
-                                                  click_stats, click_stats_daily  ──▶  GET /api/v1/urls/{short_code}/stats
+```mermaid
+flowchart TD
+    REQ["GET /&#123;short_code&#125;"] --> R302["302 &rarr; client"]
+    REQ -. "same transaction<br/>as the lookup" .-> OB["click_outbox<br/><i>status PENDING</i>"]
+    OB --> POLL["OutboxPoller<br/><i>scheduler thread, never a request thread;<br/>FOR UPDATE SKIP LOCKED, bounded retries</i>"]
+    POLL --> K(["Kafka topic url.clicked<br/><i>key = short code, idempotency-key header</i>"])
+    K --> CON["ClickEventConsumer<br/><i>one transaction: processed_click_event dedupe + upserts</i>"]
+    CON --> AGG[("click_stats<br/>click_stats_daily")]
+    AGG --> API["GET /api/v1/urls/&#123;short_code&#125;/stats"]
+    OB -. "raw rows older than<br/>analytics.retention.days" .-> PURGE["retention job<br/><i>aggregates are never purged</i>"]
+    classDef store stroke:#6b7280,stroke-width:2px
+    class AGG,K store
 ```
 
 1. **Record** (`analytics.recording`): the redirect inserts one `click_outbox` row in the same

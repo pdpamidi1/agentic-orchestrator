@@ -1,9 +1,9 @@
-# TASKS.md — ordered backlog for Claude Code
+# TASKS.md — ordered backlog for work flow
 
 Work top to bottom. Each item is one commit with tests. Stop and ask when an item needs a policy or design change.
 Status legend: [ ] todo · [~] in progress · [x] done
 
-## Day 1 — make the loop real
+## Agentic orchestrator and Workload Tasks
 - [x] **T1 Bootstrap**: `make install && make test && make lint`. Fix anything the starter left broken (the engine tests in
       `tests/` are the spec for `engine/`). Do not weaken a test to make it pass; fix the engine.
 - [x] **T2 Stub agents (offline loop)**: add `llm/fake.py` (`FakeClient`) returning canned artifacts per schema, and a
@@ -19,8 +19,6 @@ Status legend: [ ] todo · [~] in progress · [x] done
       validates within `max_repairs`. Commit `runs/cache/llm/*.json`.
 - [x] **T7 Claude Code executor** (live greenfield run `greenfield-a37c3044` delivered to `workspace/url-shortener`; 8 recorded task patches replay it without a key): run `implementation` live via `executors/claude_code_cli.py`; record patches to
       `runs/cache/changesets/greenfield/`. Verify `--replay` reproduces the run without a key.
-
-## Day 2 — scenarios, metrics, docs
 - [x] **T8 Brownfield** (offline record + replay proven; live recording waits for T6's key): `repo_map` producer (walk `src/`, package graph, endpoints, tables) put into context at intake;
       `impact` node runs; two high-impact task approvals fire (`schema.migration`, `dependency.major_version`);
       compliance gate blocks a raw-IP field on attempt 1. Record + replay.
@@ -36,8 +34,8 @@ Status legend: [ ] todo · [~] in progress · [x] done
       walkthroughs with links to committed run artifacts; limitations and trade-offs.
 - [ ] **T15 CI**: GitHub Actions: lint, test, and a `--replay` golden run for all three scenarios diffed against committed metrics.
 
-## Stretch
-- [ ] Per-run lock (`runs/<id>/lock`, pid + heartbeat): uvicorn drains in-flight calls on SIGTERM, so a replacement process can load and drive the same run while the old one is still running it (happened 2026-09-14: T7 re-executed)
+## Additional Planned Tasks based on design inputs
+- [ ] Per-run lock (`runs/<id>/lock`, pid + heartbeat): uvicorn drains in-flight calls, so a replacement process can load and drive the same run while the old one is still running it (happened 2026-09-14: T7 re-executed)
 - [ ] Count executor spend in `Budget.cost_usd` (today only agent `Success` outcomes accumulate; a live run's Claude Code tasks never reach `max_cost_usd_per_run`; the trace has the per-task cost on `EXECUTOR_CALL`)
 - [ ] Bound `diagnose -> retry` cycles per run (a fake run whose gates can never pass loops until the wall-clock or cost budget trips; only `replan` is counted today)
 - [ ] Container-isolated executor (docker run with the sandbox mounted) instead of process + path policy

@@ -17,19 +17,96 @@ and analytics are explicit non-goals.
 
 ## Architecture at a glance
 
-```
-                 +-------------------------+        +----------------------------+
- POST /api/v1/urls --> write.UrlWriteController --> write.UrlWriteService --+--> codegen.ShortCodeAllocator
-                 +-------------------------+        +----------------------------+     |  RedisBatchCounterSource
-                                                                                       |  DbSequenceCounterSource
- GET /{code} ------> read.RedirectController ----> read.UrlReadService ----+          |  Base62Codec
-                 +-------------------------+        +----------------------------+     v
-                                                          |   read.RedisUrlCache      domain.UrlMappingRepository
-                                                          v            (cache-aside)        |
-                                                     Redis (cache + counter)          Postgres `urls` (Flyway)
+```mermaid
+flowchart LR
+    POST["POST /api/v1/urls"] --> WC["write.UrlWriteController"]
+    WC --> WS["write.UrlWriteService"]
+    WS --> AL["codegen.ShortCodeAllocator"]
+    AL --> RB["codegen.RedisBatchCounterSource<br/><i>INCRBY, batched</i>"]
+    AL --> DS["codegen.DbSequenceCounterSource<br/><i>fallback</i>"]
+    AL --> B62["codegen.Base62Codec"]
+    WS --> REPO["domain.UrlMappingRepository"]
+    GET["GET /&#123;short_code&#125;"] --> RC["read.RedirectController"]
+    RC --> RS["read.UrlReadService"]
+    RS --> CACHE["read.RedisUrlCache<br/><i>cache-aside</i>"]
+    RS --> REPO
+    RB --> REDIS[("Redis<br/>cache + counter")]
+    CACHE --> REDIS
+    DS --> PG
+    REPO --> PG[("PostgreSQL urls<br/><i>Flyway, source of truth</i>")]
+    classDef store stroke:#6b7280,stroke-width:2px
+    class REDIS,PG store
 ```
 
-Layering rules the code must obey (checked by the generated `src/test/java/sdlc/ArchitectureTest.java`):
+The write surface (`@Profile("!read")`) and the read surface (`@Profile("!write")`) are independently registrable
+from the same artifact; both talk to the same PostgreSQL and Redis (ADR-007).
+
+## Request flows
+
+**Create a short link** — the only place a code is allocated, and the only place Redis can be swapped for the
+database sequence without failing the request (ADR-001, ADR-002, ADR-014).
+
+```mermaid
+flowchart TD
+    REQ["POST /api/v1/urls"] --> V{"long_url, custom_alias and<br/>expiration_date all valid?"}
+    V -- no --> E400["400 problem+json<br/><i>nothing persisted</i>"]
+    V -- yes --> A{"custom_alias given?"}
+    A -- yes --> PRE["use the alias verbatim<br/><i>pre-check that it is free</i>"]
+    A -- no --> ALLOC["ShortCodeAllocator"]
+    ALLOC --> BATCH{"Redis batch value available?"}
+    BATCH -- yes --> CODE["base62(counter + seed offset)<br/>code_source = redis"]
+    BATCH -- "Redis unreachable, or the<br/>counter moved backwards" --> SEQ["nextval(url_code_seq)<br/>code_source = db_sequence"]
+    PRE --> INS
+    CODE --> INS
+    SEQ --> INS
+    INS["INSERT INTO urls"] --> PK{"short_code still free?"}
+    PK -- yes --> R201["201 Created<br/><i>short_url, short_code, expires_at, code_source</i>"]
+    PK -- "DataIntegrityViolation" --> E409["409 Conflict<br/><i>existing mapping unchanged</i>"]
+    classDef degraded stroke:#e08a1e,stroke-width:3px
+    class SEQ degraded
+```
+
+**Follow a short link** — Redis is an accelerator on this path, never a dependency (ADR-005, ADR-006, AMB-6).
+
+```mermaid
+flowchart TD
+    REQ["GET /&#123;short_code&#125;"] --> C{"Redis cache hit?"}
+    C -- hit --> EXP
+    C -- "miss, or Redis down<br/><i>logged and treated as a miss</i>" --> DB{"row in urls?"}
+    DB -- no --> E404["404 problem+json"]
+    DB -- yes --> WT["cache write-through<br/>TTL = min(remaining expiry, cache-ttl)"]
+    WT --> EXP{"expires_at in the past?"}
+    EXP -- yes --> E410["410 Gone"]
+    EXP -- no --> R302["302 Found<br/>Location + Cache-Control: private"]
+    R302 -.-> OB["insert one click_outbox row<br/><i>same transaction — click analytics</i>"]
+    classDef degraded stroke:#e08a1e,stroke-width:3px
+    class DB degraded
+```
+
+## Layering rules
+
+Checked by the generated `src/test/java/sdlc/ArchitectureTest.java` — the orchestrator writes this test from the
+design's layering rules, so the code cannot drift from the picture.
+
+```mermaid
+flowchart TD
+    WEB["<b>web</b><br/>write.UrlWriteController · read.RedirectController<br/><i>the only classes with web annotations</i>"]
+    SVC["<b>service</b><br/>UrlWriteService · UrlReadService<br/><i>map entity &harr; DTO; never catch infrastructure errors</i>"]
+    INF["<b>infrastructure</b><br/>codegen · domain.UrlMappingRepository · read.RedisUrlCache<br/><i>only RedisBatchCounterSource and RedisUrlCache touch Spring Data Redis</i>"]
+    WEB --> SVC --> INF
+    DTO["api.dto · api.error<br/><i>no persistence or Redis types;<br/>GlobalExceptionHandler owns every non-2xx body</i>"]
+    CFG["config<br/><i>leaf: ShortenerProperties depends on nothing</i>"]
+    DOM["domain<br/><i>leaf: knows only JPA and CodeSource</i>"]
+    WEB -.-> DTO
+    SVC -.-> DTO
+    INF -.-> DOM
+    SVC -.-> CFG
+    NOTE["dependencies point downward only<br/>write &#8622; read · no cycles"]
+    classDef leaf stroke:#6b7280,stroke-width:2px
+    classDef note stroke-width:0px
+    class CFG,DOM leaf
+    class NOTE note
+```
 
 - Layer order is web (write, read controllers) -> service (UrlWriteService, UrlReadService) -> infrastructure (codegen, domain repository, RedisUrlCache); dependencies point downward only, never upward.
 - domain must not depend on api.*, write, read or codegen; it knows only JPA and CodeSource.
@@ -49,9 +126,26 @@ Layering rules the code must obey (checked by the generated `src/test/java/sdlc/
 - `GET /{short_code}` (`redirectToLongUrl`): 302 found; Location = stored long_url, Cache-Control: private, 404 short code unknown in cache and database, 410 short code expired (expires_at in the past), 500 unhandled server error rendered as problem+json by the global handler
 
 A parity test (`OpenApiContractIT`) compares the committed document with what the running application exposes
-through springdoc, so the document can never drift from the code.
+through springdoc, so the document can never drift from the code. The same live document backs Swagger UI at
+`/swagger-ui.html` on any running instance — see [Trying the API in Swagger UI](../README.md#trying-the-api-in-swagger-ui).
 
 ## Data model
+
+```mermaid
+erDiagram
+    urls {
+        varchar short_code PK "1-32 chars, base62 or custom alias"
+        varchar long_url "http/https, max 2048"
+        timestamptz created_at
+        timestamptz expires_at "nullable; past value means 410"
+        varchar created_by "nullable, never populated (ADR-017)"
+        varchar code_source "redis or db_sequence, CHECK not ENUM (ADR-011)"
+    }
+    url_code_seq {
+        bigint last_value "fallback counter, ADR-002"
+    }
+```
+
 
 - `urls`: `short_code` varchar(32), `long_url` varchar(2048), `created_at` timestamptz, `expires_at` timestamptz, `created_by` varchar(255), `code_source` varchar(16)
 - `url_code_seq`: `last_value` bigint
@@ -97,12 +191,15 @@ assumptions:
 ## Non-goals
 
 - Authentication and per-user ownership (`created_by` stays nullable and unpopulated, ADR-017).
-- Click analytics and domain events (no Kafka topics, no outbox, ADR-012); the brownfield scenario adds them.
+- Click analytics and domain events (no Kafka topics, no outbox, ADR-012) were out of scope for this release;
+  the later brownfield run added them additively — see [`analytics.md`](analytics.md).
 - Horizontal coordination of the counter beyond one Redis instance.
 
 ## Where to look next
 
+- How to build, run and call it: [`../README.md`](../README.md).
 - Operations, degraded modes and the counter-gap policy: [`operations.md`](operations.md).
+- Click analytics (added by the brownfield run): [`analytics.md`](analytics.md).
 - Individual decision records: [`adr/`](adr/).
 
 ## ADR index

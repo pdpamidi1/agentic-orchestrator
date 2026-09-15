@@ -7,6 +7,26 @@ Turns a requirement into a reviewable engineering outcome by executing an explic
 validation → diagnose/retry/re-plan → documentation → release readiness → approval) with policy guardrails, bounded
 retries, rollback, safe-stop, audit trace, derived metrics and persisted state.
 
+```mermaid
+flowchart LR
+    REQ["requirement"] --> CLR["clarify"] --> PLN["planning"] --> ARCH["architecture"]
+    ARCH --> REV["security_review<br/>risk_analysis"]
+    REV --> AD{{"&#9733; approval_design"}}
+    AD --> IMPL["implementation<br/><i>&#9733; per HIGH task</i>"]
+    IMPL --> GATES["unit_tests · code_review<br/>integration_tests"]
+    GATES --> VAL{"validation"}
+    VAL -- pass --> DOC["documentation"] --> RR["release_readiness"] --> AR{{"&#9733; approval_release"}}
+    VAL -- fail --> DIA["diagnose"]
+    DIA -- retry --> IMPL
+    DIA -- replan --> PLN
+    DIA -- halt --> STOP(["safe-stop"])
+    classDef human stroke:#e08a1e,stroke-width:3px
+    class AD,AR human
+```
+
+&#9733; = the run stops until a human decides. `sdlc graph` renders the live graph from `workflow.yaml`.
+
+- How to run it, end to end: [`docs/running.md`](docs/running.md)  ·  Design and why it is shaped this way: [`docs/design.md`](docs/design.md)
 - Architecture and decisions: [`docs/architecture.md`](docs/architecture.md)
 - The graph: [`workflow.yaml`](workflow.yaml) · Governance: [`policy.yaml`](policy.yaml)
 - Team practice for AI-assisted work: [`CLAUDE.md`](CLAUDE.md), [`.claude/commands/`](.claude/commands), [`TASKS.md`](TASKS.md)
@@ -42,6 +62,8 @@ The delivered url-shortener runs with `make shortener-up` (see below) and has it
 [quick start](workspace/url-shortener/README.md) and [design document](workspace/url-shortener/docs/DESIGN.md).
 
 ## Quick start
+> Step-by-step, with troubleshooting: [`docs/running.md`](docs/running.md).
+
 ```bash
 make install
 make test                                   # engine, policy, metrics tests

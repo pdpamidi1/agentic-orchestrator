@@ -13,6 +13,32 @@ timeout after `spring.data.redis.timeout` = 2s, authentication or protocol error
 inside the one class that owns Redis on that surface. Controllers and services never catch
 infrastructure exceptions, and clients never see a Redis-related 5xx.
 
+```mermaid
+flowchart TD
+    subgraph READ["read surface — GET /&#123;short_code&#125; · owner: RedisUrlCache"]
+        RG["GET or SET shortener:url:&#123;code&#125;"] --> RF{"Redis command failed?"}
+        RF -- no --> RHIT["serve from cache"]
+        RF -- "yes — connection refused,<br/>2s timeout, auth or protocol error" --> RMISS["treat as a cache miss / no-op<br/><i>WARN: Redis cache degraded</i>"]
+        RMISS --> RDB["load the mapping from PostgreSQL"]
+        RDB --> R302["302 + Location + Cache-Control: private<br/><i>unchanged for the client</i>"]
+        RHIT --> R302
+    end
+    subgraph WRITE["write surface — POST /api/v1/urls · owners: RedisBatchCounterSource, ShortCodeAllocator"]
+        WA["allocate a short code"] --> WB{"local batch still has values?"}
+        WB -- yes --> WR["code_source = redis<br/><i>no Redis call needed</i>"]
+        WB -- no --> WI{"INCRBY shortener:counter"}
+        WI -- ok --> WR
+        WI -- "fails, or the counter<br/>moved backwards" --> WS["nextval(url_code_seq)<br/>201 with code_source = db_sequence<br/><i>WARN: falling back to db_sequence</i>"]
+    end
+    PGDOWN["PostgreSQL unavailable"] --> P500["not degradable:<br/>500 problem+json, nothing persisted"]
+    classDef degraded stroke:#e08a1e,stroke-width:3px
+    class RMISS,WS,P500 degraded
+```
+
+Every allocation retries Redis first, so the service returns to `code_source: "redis"` on its own; there is no
+circuit breaker, which is why a long outage costs the Redis timeout per write (see 1.2).
+
+
 ### 1.1 Read surface (`GET /{short_code}`)
 
 Owner: `RedisUrlCache`.

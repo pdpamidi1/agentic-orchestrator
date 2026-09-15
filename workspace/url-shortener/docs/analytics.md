@@ -5,6 +5,35 @@ task T1 (build, dependency and configuration foundation). The values are bound a
 `com.example.shortener.analytics.config.AnalyticsProperties`; `application.yml` repeats them and
 `AnalyticsPropertiesTest` fails if the two drift apart.
 
+## The pipeline in one picture
+
+```mermaid
+flowchart LR
+    RED["redirect<br/><i>request thread</i>"] --> OB["click_outbox<br/>PENDING"]
+    OB --> REL["OutboxPoller<br/><i>every analytics.outbox.poll-interval-ms,<br/>&le; batch-size rows, SKIP LOCKED</i>"]
+    REL --> K(["url.clicked"])
+    K --> CON["ClickEventConsumer<br/><i>dedupe + upsert, one transaction</i>"]
+    CON --> AGG[("click_stats<br/>click_stats_daily")]
+    AGG --> STATS["GET /api/v1/urls/&#123;code&#125;/stats"]
+    classDef store stroke:#6b7280,stroke-width:2px
+    class AGG,K store
+```
+
+A `click_outbox` row moves through exactly these states — nothing on the request thread waits for any of it:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: redirect inserts the row<br/>(same transaction as the lookup)
+    PENDING --> PUBLISHED: broker acknowledges the record
+    PENDING --> PENDING: publish failed, attempts++<br/>next_attempt_at = backoff + jitter
+    PENDING --> FAILED: analytics.retry.max-attempts exhausted
+    PUBLISHED --> [*]: purged after analytics.retention.days
+    FAILED --> [*]: purged after analytics.retention.days
+```
+
+Aggregates (`click_stats`, `click_stats_daily`) are never purged: they outlive the raw rows they were built from.
+
+
 ## Build foundation
 
 | Concern | Decision |
