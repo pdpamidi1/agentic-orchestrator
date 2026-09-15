@@ -1,4 +1,4 @@
-# agentic-orchestrator — governed agentic SDLC engine (Python / FastAPI)
+# Agentic Orchestrator — governed agentic SDLC engine (Python / FastAPI)
 
 > Agents propose; gates verify; humans approve.
 
